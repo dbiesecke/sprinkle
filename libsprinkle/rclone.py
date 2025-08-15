@@ -321,8 +321,14 @@ class RClone:
             raise Exception('error getting remote object. ' + result['error'])
         aboutjson = result['out']
         json_obj = json.loads(aboutjson)
-        logging.debug('free ' + str(json_obj['free']))
-        return json_obj['free']
+        # simple fix for accounts with errors
+        if "free" in json_obj:
+            logging.debug('free ' + str(json_obj['free']))
+            return json_obj['free']
+        else:
+            return 1
+#        return json_obj['free']
+
 
     def get_size(self, remote):
         logging.debug('running about for ' + remote)
@@ -344,8 +350,13 @@ class RClone:
             raise Exception('error getting remote object. ' + result['error'])
         aboutjson = result['out']
         json_obj = json.loads(aboutjson)
-        logging.debug('total ' + str(json_obj['total']))
-        return json_obj['total']
+        # simple fix for accounts with errors
+        if "total" in json_obj:
+            logging.debug('total ' + str(json_obj['total']))
+            return json_obj['total']
+        else:
+            return 1
+        #return json_obj['total']
 
     def sync(self, src, dst, extra_args=[]):
         logging.debug('running sync from ' + src + " to " + dst)
