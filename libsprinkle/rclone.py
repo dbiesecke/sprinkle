@@ -413,7 +413,8 @@ class RClone:
         logging.debug('result: ' + str(result))
         if result['error'] is not '':
             logging.error('error getting remotes objects')
-            raise Exception('error getting remote object. ' + result['error'])
+            #raise Exception('error getting remote object. ' + result['error'])
+            return 1
         aboutjson = result['out']
         json_obj = json.loads(aboutjson)
         # simple fix for accounts with errors
