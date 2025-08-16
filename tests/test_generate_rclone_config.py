@@ -14,7 +14,7 @@ def test_generate_rclone_config(tmp_path):
 
     output = tmp_path / "rclone.conf"
     content = rclone.generate_rclone_config(
-        str(sa_dir), str(output), "drive-id", sample_size=2, start_index=1
+        str(sa_dir), str(output), "drive-id", max_accounts=2, start_index=1
     )
 
     assert output.read_text() == content

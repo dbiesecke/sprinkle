@@ -21,7 +21,7 @@ def generate_rclone_config(
         json_dir,
         output_file,
         root_folder_id,
-        sample_size=None,
+        max_accounts=None,
         prefix="dst",
         start_index=101):
     """Generate an rclone configuration from service account files.
@@ -39,7 +39,7 @@ def generate_rclone_config(
         Path where the generated configuration should be written.
     root_folder_id: str
         Google Drive root folder ID for each remote.
-    sample_size: int, optional
+    max_accounts: int, optional
         Limit the number of JSON files processed.  When ``None`` all
         files are used.
     prefix: str, optional
@@ -56,9 +56,9 @@ def generate_rclone_config(
         raise ValueError("Directory {} not found".format(json_dir))
 
     files = [f for f in os.listdir(json_dir) if f.endswith(".json")]
-    random.shuffle(files)
-    if sample_size is not None:
-        files = files[:sample_size]
+    files = random.sample(files, len(files))
+    if max_accounts is not None:
+        files = files[:max_accounts]
 
     count = start_index - 1
     lines = []
