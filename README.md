@@ -102,6 +102,7 @@ and the command specific help.
     --rclone-sa-count {num}      limit number of service accounts used
     --drive-id {id}              Google Drive folder ID for rclone config
     --rclone-exe {rclone_exe}    rclone executable (default:rclone)
+    --rclone-move                use 'rclone move' instead of 'rclone copy' (default:false)
     --restore-duplicates         restore files if duplicates are found (default:false)
     --retries {num_retries}      number of retries (default:1)
     --show-progress              show progress

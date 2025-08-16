@@ -94,6 +94,7 @@ OPTIONS:
     --rclone-sa-count {num}      limit number of service accounts used
     --drive-id {id}              Google Drive folder ID for rclone config
     --rclone-exe {rclone_exe}    rclone executable (default:rclone)
+    --rclone-move                use 'rclone move' instead of 'rclone copy' (default:false)
     --restore-duplicates         restore files if duplicates are found (default:false)
     --retries {num_retries}      number of retries (default:1)
     --show-progress              show progress
@@ -404,6 +405,7 @@ def read_args(argv):
     global __rclone_retries
     global __show_progress
     global __delete_files
+    global __rclone_move
     global __restore_duplicates
     global __dry_run
     global __smtp_enable
@@ -437,6 +439,7 @@ def read_args(argv):
     __rclone_retries = None
     __show_progress = None
     __delete_files = None
+    __rclone_move = None
     __restore_duplicates = False
     __dry_run = None
     __smtp_enable = None
@@ -478,6 +481,7 @@ def read_args(argv):
                                     "stats=",
                                     "display-unit=",
                                     "rclone-retries=",
+                                    "rclone-move",
                                     "show-progress",
                                     "dry-run",
                                     "delete-files",
@@ -541,6 +545,8 @@ def read_args(argv):
             __show_progress = True
         elif opt in ("--delete-files"):
             __delete_files = True
+        elif opt in ("--rclone-move"):
+            __rclone_move = True
         elif opt in ("--restore-duplicates"):
             __restore_duplicates = True
         elif opt in ("--dry-run"):
@@ -603,12 +609,14 @@ def read_args(argv):
 def configure(config_file):
     global __config
     global __drive_id
+    global __rclone_move
 
     _default_values = {
         "debug": False,
         "dry_run": False,
         "show_progress": False,
         "delete_files": False,
+        "rclone_move": True,
         "restore_duplicates": False,
         "smtp_enable": False,
         "no_cache": False,
@@ -664,6 +672,9 @@ def configure(config_file):
 
     if __delete_files is not None:
         __config['delete_files'] = __delete_files
+
+    if __rclone_move is not None:
+        __config['rclone_move'] = __rclone_move
 
     if __dry_run is not None:
         __config['dry_run'] = __dry_run
