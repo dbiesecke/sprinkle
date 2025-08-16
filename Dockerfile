@@ -30,7 +30,7 @@ RUN pip install .
 RUN curl https://rclone.org/install.sh | bash
 
 # Unprivilegierter Nutzer
-RUN useradd -u 10001 -m -d /home/sprinkle -s /usr/sbin/nologin sprinkle \
+RUN useradd -u 1000 -m -d /home/sprinkle -s /usr/sbin/nologin sprinkle \
     && mkdir -p /config /data \
     && chown -R sprinkle:sprinkle /app /config /data
 
@@ -40,5 +40,5 @@ USER sprinkle
 
 # Standardmäßig zeigt der Container die CLI-Hilfe.
 # Beim Aufruf kannst du hinten die Sprinkle-Subcommands anhängen (ls, backup, …).
-ENTRYPOINT ["/usr/bin/tini", "--", "python", "/app/sprinkle.py", "-c", "/config/sprinkle.conf"]
+ENTRYPOINT ["/usr/bin/tini", "--", "python", "-W","ignore", "/app/sprinkle.py"]
 CMD ["--help"]

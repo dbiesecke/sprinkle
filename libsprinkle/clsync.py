@@ -80,7 +80,14 @@ class ClSync:
         if 'rclone_exe' not in self._config:
             self._rclone = rclone.RClone(rclone_config)
         else:
-            self._rclone = rclone.RClone(rclone_config, self._config['rclone_exe'], self._rclone_retries)
+            self._rclone = rclone.RClone(
+                rclone_config, self._config['rclone_exe'], self._rclone_retries
+            )
+
+        if 'rclone_move' in config:
+            self._rclone_move = config['rclone_move']
+        else:
+            self._rclone_move = False
 
     def get_remotes(self):
         logging.debug('getting rclone remotes')
@@ -96,8 +103,9 @@ class ClSync:
             logging.debug('creating directory ' + remote + directory)
             self._rclone.mkdir(remote, directory)
 
-    def ls(self, file, with_dups=False, regex=None, stop_after_first=False):
+    def ls(self, file, with_dups=False, regex=None):
         logging.debug('lsjson of file: ' + file)
+        stop_after_first=self._config['ls_stop_first']
         if self._config['no_cache'] is False and self._cache is not None:
             logging.debug('serving cached version of file list...')
             self._cache_counter += 1
@@ -146,9 +154,9 @@ class ClSync:
                 if with_dups and tmp_file.is_dir is False and key in files:
                     key = key + ClSync.duplicate_suffix
                 files[key] = tmp_file
+                if stop_after_first and len(files) > 0:
+                    return files
             logging.debug('end of clsync.ls()')
-            if stop_after_first and len(files) > 0:
-                break
         if self._config['no_cache'] is False and self._cache is None:
             self._cache = files
         return files
@@ -485,11 +493,17 @@ class ClSync:
 
     def copy(self, src, dst, remote):
         logging.debug('copy ' + src + ' to ' + remote + dst)
-        self._rclone.copy(src, remote+dst)
+        if self._rclone_move:
+            self._rclone.move(src, remote+dst)
+        else:
+            self._rclone.copy(src, remote+dst)
 
     def copy_new(self, src, dst, no_error=False):
         logging.debug('copy ' + src + ' to ' + dst)
-        self._rclone.copy(src, dst, [], no_error)
+        if self._rclone_move:
+            self._rclone.move(src, dst)
+        else:
+            self._rclone.copy(src, dst, [], no_error)
 
     def move(self, src, dst):
         logging.debug('move ' + src + ' to ' + dst)
