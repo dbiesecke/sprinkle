@@ -21,6 +21,7 @@ import getopt
 import sys
 import traceback
 import os
+import tempfile
 try:
     from filelock import Timeout, FileLock
 except:
@@ -88,6 +89,7 @@ OPTIONS:
     --log-file {file}            logs output to the specified file
     --no-cache                   turn off caching
     --rclone-conf {config file}  rclone configuration (default:None)
+    --rclone-sa-dir {dir}        build rclone config from service accounts
     --rclone-exe {rclone_exe}    rclone executable (default:rclone)
     --restore-duplicates         restore files if duplicates are found (default:false)
     --retries {num_retries}      number of retries (default:1)
@@ -459,6 +461,7 @@ def read_args(argv):
                                     "comp-method=",
                                     "rclone-exe=",
                                     "rclone-conf=",
+                                    "rclone-sa-dir=",
                                     "stats=",
                                     "display-unit=",
                                     "rclone-retries=",
@@ -507,6 +510,14 @@ def read_args(argv):
             __rclone_exe = arg
         elif opt in ("--rclone-conf"):
             __rclone_conf = arg
+        elif opt in ("--rclone-sa-dir"):
+            drive_id = os.environ.get("DRIVE_ID")
+            if drive_id is None:
+                raise Exception("DRIVE_ID environment variable not set")
+            fd, tmp_conf = tempfile.mkstemp(prefix="rclone-", suffix=".conf")
+            os.close(fd)
+            rclone.generate_rclone_config(arg, tmp_conf, drive_id)
+            __rclone_conf = tmp_conf
         elif opt in ("--display-unit"):
             if arg != 'G' and arg != 'M' and arg != 'K' and arg != 'B':
                 logging.error('invalid UNIT ' + arg + ', only [G|M|K|B] accepted')
