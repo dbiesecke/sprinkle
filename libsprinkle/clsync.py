@@ -96,7 +96,7 @@ class ClSync:
             logging.debug('creating directory ' + remote + directory)
             self._rclone.mkdir(remote, directory)
 
-    def ls(self, file, with_dups=False, regex=None):
+    def ls(self, file, with_dups=False, regex=None, stop_after_first=False):
         logging.debug('lsjson of file: ' + file)
         if self._config['no_cache'] is False and self._cache is not None:
             logging.debug('serving cached version of file list...')
@@ -115,7 +115,7 @@ class ClSync:
         files = {}
         md5s = None
         if self._compare_method == 'md5':
-            md5s = self.lsmd5(file)
+            md5s = self.lsmd5(file, stop_after_first)
         for remote in self.get_remotes():
             common.print_line('retrieving file list from: ' + remote + file + '...')
             logging.debug('getting lsjson from ' + remote + file)
@@ -147,11 +147,13 @@ class ClSync:
                     key = key + ClSync.duplicate_suffix
                 files[key] = tmp_file
             logging.debug('end of clsync.ls()')
+            if stop_after_first and len(files) > 0:
+                break
         if self._config['no_cache'] is False and self._cache is None:
             self._cache = files
         return files
 
-    def lsmd5(self, file):
+    def lsmd5(self, file, stop_after_first=False):
         logging.debug('lsjson of file: ' + file)
         if not file.startswith('/'):
             file = '/' + file
@@ -171,6 +173,8 @@ class ClSync:
                 md5 = line.split('  ')[0]
                 filename = line.split('  ')[1]
                 files[file + '/' + filename] = md5
+            if stop_after_first and len(files) > 0:
+                break
         return files
 
     def get_sizes(self):

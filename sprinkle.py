@@ -98,6 +98,7 @@ OPTIONS:
     --retries {num_retries}      number of retries (default:1)
     --show-progress              show progress
     --single-instance            make sure only 1 concurrent instance of sprinkle is running (default:False)
+    --ls-stop-first             stop listing after first remote with files
     """
     return
 
@@ -423,6 +424,7 @@ def read_args(argv):
     global __daemon_mode
     global __daemon_interval
     global __daemon_pidfile
+    global __ls_stop_first
 
     __configfile = None
     __cmd_debug = None
@@ -455,6 +457,7 @@ def read_args(argv):
     __daemon_mode = False
     __daemon_interval = None
     __daemon_pidfile = None
+    __ls_stop_first = None
 
     rclone_sa_dir = None
     rclone_sa_count = None
@@ -491,6 +494,7 @@ def read_args(argv):
                                     "exclude-regex=",
                                     "log-file=",
                                     "single-instance",
+                                    "ls-stop-first",
                                     "check-prereq",
                                     "daemon-type=",
                                     "daemon-mode",
@@ -564,6 +568,8 @@ def read_args(argv):
             __log_file = arg
         elif opt in ("--single-instance"):
             __single_instance = True
+        elif opt in ("--ls-stop-first"):
+            __ls_stop_first = True
         elif opt in ("--check-prereq"):
             __check_prereq = True
         elif opt in ("--daemon-type"):
@@ -611,6 +617,7 @@ def configure(config_file):
         "rclone_retries": '1',
         "log_file": None,
         "single_instance": False,
+        "ls_stop_first": False,
         "check_prereq": False,
         "daemon_type": 'interval',
         "daemon_mode": False,
@@ -699,6 +706,9 @@ def configure(config_file):
     if __single_instance is not None:
         __config['single_instance'] = __single_instance
 
+    if __ls_stop_first is not None:
+        __config['ls_stop_first'] = __ls_stop_first
+
     if __check_prereq is not None:
         __config['check_prereq'] = __check_prereq
 
@@ -781,7 +791,10 @@ def ls():
         logging.error('invalid ls command')
         usage_ls()
         sys.exit(-1)
-    files = __cl_sync.ls(common.remove_ending_slash(__args[1]))
+    files = __cl_sync.ls(
+        common.remove_ending_slash(__args[1]),
+        stop_after_first=__config.get('ls_stop_first', False),
+    )
     largest_length = 25
     keys = common.sort_dict_keys(files)
     for tmp_file in keys:
@@ -823,7 +836,10 @@ def lsmd5():
         logging.error('invalid lsmd5 command')
         usage_lsmd5()
         sys.exit(-1)
-    files = __cl_sync.lsmd5(common.remove_ending_slash(__args[1]))
+    files = __cl_sync.lsmd5(
+        common.remove_ending_slash(__args[1]),
+        stop_after_first=__config.get('ls_stop_first', False),
+    )
     largest_length = 25
     keys = common.sort_dict_keys(files)
     for tmp_file in keys:
