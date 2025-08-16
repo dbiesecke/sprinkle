@@ -11,8 +11,74 @@ __revision__ = "2"
 
 import logging
 import json
+import os
+import random
 from libsprinkle import common
 from libsprinkle import exceptions
+
+
+def generate_rclone_config(
+        json_dir,
+        output_file,
+        root_folder_id,
+        sample_size=None,
+        prefix="dst",
+        start_index=101):
+    """Generate an rclone configuration from service account files.
+
+    The function scans ``json_dir`` for ``.json`` files, shuffles them to
+    provide a random selection and writes configuration sections for each
+    file.  Sections are named using ``prefix`` followed by a counter
+    starting at ``start_index``.
+
+    Parameters
+    ----------
+    json_dir: str
+        Directory containing the service account ``.json`` files.
+    output_file: str
+        Path where the generated configuration should be written.
+    root_folder_id: str
+        Google Drive root folder ID for each remote.
+    sample_size: int, optional
+        Limit the number of JSON files processed.  When ``None`` all
+        files are used.
+    prefix: str, optional
+        Prefix for the remote names.  Defaults to ``dst``.
+    start_index: int, optional
+        Starting index for remote names.  Defaults to ``101``.
+
+    Returns
+    -------
+    str
+        The generated configuration content.
+    """
+    if not os.path.isdir(json_dir):
+        raise ValueError("Directory {} not found".format(json_dir))
+
+    files = [f for f in os.listdir(json_dir) if f.endswith(".json")]
+    random.shuffle(files)
+    if sample_size is not None:
+        files = files[:sample_size]
+
+    count = start_index - 1
+    lines = []
+    for filename in files:
+        count += 1
+        lines.extend([
+            "[{}{}]".format(prefix, count),
+            "type = drive",
+            "scope = drive",
+            "service_account_file = {}".format(
+                os.path.join(os.path.abspath(json_dir), filename)
+            ),
+            "root_folder_id = {}".format(root_folder_id),
+            "",
+        ])
+
+    config_text = "\n".join(lines)
+    with open(output_file, "w") as conf_fp:
+        conf_fp.write(config_text)
+    return config_text
 
 class RClone:
 
