@@ -616,7 +616,7 @@ def configure(config_file):
         "dry_run": False,
         "show_progress": False,
         "delete_files": False,
-        "rclone_move": False,
+        "rclone_move": True,
         "restore_duplicates": False,
         "smtp_enable": False,
         "no_cache": False,
