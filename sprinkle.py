@@ -21,6 +21,7 @@ import getopt
 import sys
 import traceback
 import os
+import tempfile
 try:
     from filelock import Timeout, FileLock
 except:
@@ -30,6 +31,7 @@ except:
 
 lock = FileLock("sprinkle.lock", timeout=1)
 
+__drive_id = None
 
 def warranty():
     """
@@ -88,6 +90,9 @@ OPTIONS:
     --log-file {file}            logs output to the specified file
     --no-cache                   turn off caching
     --rclone-conf {config file}  rclone configuration (default:None)
+    --rclone-sa-dir {dir}        build rclone config from service accounts
+    --rclone-sa-count {num}      limit number of service accounts used
+    --drive-id {id}              Google Drive folder ID for rclone config
     --rclone-exe {rclone_exe}    rclone executable (default:rclone)
     --restore-duplicates         restore files if duplicates are found (default:false)
     --retries {num_retries}      number of retries (default:1)
@@ -393,6 +398,7 @@ def read_args(argv):
     global __comp_method
     global __rclone_exe
     global __rclone_conf
+    global __drive_id
     global __display_unit
     global __rclone_retries
     global __show_progress
@@ -424,6 +430,7 @@ def read_args(argv):
     __comp_method = None
     __rclone_exe = None
     __rclone_conf = None
+    __drive_id = None
     __display_unit = None
     __rclone_retries = None
     __show_progress = None
@@ -449,6 +456,9 @@ def read_args(argv):
     __daemon_interval = None
     __daemon_pidfile = None
 
+    rclone_sa_dir = None
+    rclone_sa_count = None
+
     try:
         opts, args = getopt.getopt(argv, "dvhc:s:",
                                    ["help",
@@ -459,6 +469,9 @@ def read_args(argv):
                                     "comp-method=",
                                     "rclone-exe=",
                                     "rclone-conf=",
+                                    "rclone-sa-dir=",
+                                    "rclone-sa-count=",
+                                    "drive-id=",
                                     "stats=",
                                     "display-unit=",
                                     "rclone-retries=",
@@ -507,6 +520,12 @@ def read_args(argv):
             __rclone_exe = arg
         elif opt in ("--rclone-conf"):
             __rclone_conf = arg
+        elif opt in ("--rclone-sa-dir"):
+            rclone_sa_dir = arg
+        elif opt in ("--rclone-sa-count"):
+            rclone_sa_count = int(arg)
+        elif opt in ("--drive-id"):
+            __drive_id = arg
         elif opt in ("--display-unit"):
             if arg != 'G' and arg != 'M' and arg != 'K' and arg != 'B':
                 logging.error('invalid UNIT ' + arg + ', only [G|M|K|B] accepted')
@@ -557,6 +576,16 @@ def read_args(argv):
         elif opt in ("--daemon-pidfile"):
             __daemon_pidfile = arg
 
+    if rclone_sa_dir is not None:
+        if __drive_id is None:
+            raise Exception("--drive-id option is required when using --rclone-sa-dir")
+        fd, tmp_conf = tempfile.mkstemp(prefix="rclone-", suffix=".conf")
+        os.close(fd)
+        rclone.generate_rclone_config(
+            rclone_sa_dir, tmp_conf, __drive_id, max_accounts=rclone_sa_count
+        )
+        __rclone_conf = tmp_conf
+
     if len(args) < 1 and __check_prereq is None:
         usage()
         sys.exit()
@@ -566,6 +595,7 @@ def read_args(argv):
 
 def configure(config_file):
     global __config
+    global __drive_id
 
     _default_values = {
         "debug": False,
@@ -614,6 +644,9 @@ def configure(config_file):
 
     if __rclone_conf is not None:
         __config['rclone_config'] = __rclone_conf
+
+    if __drive_id is not None:
+        __config['drive_id'] = __drive_id
 
     if __rclone_retries is not None:
         __config['rclone_retries'] = str(__rclone_retries)
