@@ -96,8 +96,9 @@ class ClSync:
             logging.debug('creating directory ' + remote + directory)
             self._rclone.mkdir(remote, directory)
 
-    def ls(self, file, with_dups=False, regex=None, stop_after_first=False):
+    def ls(self, file, with_dups=False, regex=None):
         logging.debug('lsjson of file: ' + file)
+        stop_after_first=self._config['ls_stop_first']
         if self._config['no_cache'] is False and self._cache is not None:
             logging.debug('serving cached version of file list...')
             self._cache_counter += 1
@@ -146,9 +147,9 @@ class ClSync:
                 if with_dups and tmp_file.is_dir is False and key in files:
                     key = key + ClSync.duplicate_suffix
                 files[key] = tmp_file
+                if stop_after_first and len(files) > 0:
+                    return files
             logging.debug('end of clsync.ls()')
-            if stop_after_first and len(files) > 0:
-                break
         if self._config['no_cache'] is False and self._cache is None:
             self._cache = files
         return files
