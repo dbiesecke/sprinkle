@@ -30,7 +30,7 @@ RUN pip install .
 RUN curl https://rclone.org/install.sh | bash
 
 # Unprivilegierter Nutzer
-RUN useradd -u 10001 -m -d /home/sprinkle -s /usr/sbin/nologin sprinkle \
+RUN useradd -u 1000 -m -d /home/sprinkle -s /usr/sbin/nologin sprinkle \
     && mkdir -p /config /data \
     && chown -R sprinkle:sprinkle /app /config /data
 
