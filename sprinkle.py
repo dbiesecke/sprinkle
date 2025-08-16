@@ -530,6 +530,7 @@ def read_args(argv):
             rclone_sa_count = int(arg)
         elif opt in ("--drive-id"):
             __drive_id = arg
+            __ls_stop_first = True
         elif opt in ("--display-unit"):
             if arg != 'G' and arg != 'M' and arg != 'K' and arg != 'B':
                 logging.error('invalid UNIT ' + arg + ', only [G|M|K|B] accepted')
