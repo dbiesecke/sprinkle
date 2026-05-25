@@ -14,6 +14,7 @@ from libsprinkle import clsync
 from libsprinkle import rclone
 from libsprinkle import config
 from libsprinkle import common
+from libsprinkle import service_accounts
 from libsprinkle import smtp_email
 from libsprinkle import sprinkle_daemon
 import logging
@@ -32,6 +33,10 @@ except:
 lock = FileLock("sprinkle.lock", timeout=1)
 
 __drive_id = None
+
+def default_config_path():
+    return os.path.join(os.path.expanduser("~"), ".sprinkle", "sprinkle.conf")
+
 
 def warranty():
     """
@@ -93,6 +98,12 @@ OPTIONS:
     --rclone-sa-dir {dir}        build rclone config from service accounts
     --rclone-sa-count {num}      limit number of service accounts used
     --drive-id {id}              Google Drive folder ID for rclone config
+    --sa-db {file}               service account registry database
+    --sa-store {dir}             managed service account store
+    --sa-cache-ttl-hours {num}   hours before cached SA quota is stale (default:72)
+    --sa-refresh {mode}          SA quota refresh [missing|stale|all|none] (default:stale)
+    --sa-clean-invalid {mode}    invalid SA cleanup [none|quarantine|delete] (default:quarantine)
+    --sa-group-size {num}        preferred SA grouping size for generated operator configs
     --rclone-exe {rclone_exe}    rclone executable (default:rclone)
     --rclone-move                use 'rclone move' instead of 'rclone copy' (default:false)
     --restore-duplicates         restore files if duplicates are found (default:false)
@@ -108,11 +119,13 @@ def usage_commands():
     """
 COMMANDS:
     backup                       backup files to clustered drives
-    config                       configure rclone to access volumes
+    config                       create ~/.sprinkle/sprinkle.conf
     help                         displays the help fot the specific command
     ls                           list files
     lsmd5                        list md5 of files
     stats                        display volume statistics
+    sa-import                    import Google Drive service account files
+    sa-stats                     display imported service account statistics
     restore                      restore files from clustered drives
     removedups                   removes duplicate files
     """
@@ -132,6 +145,7 @@ DESCRIPTION:
     Sprinkle uses the excellent [RClone](https://rclone.org) software for cloud volume access.
 
 EXAMPLES:
+    sprinkle.py config
     sprinkle.py ls /backup
     sprinkle.py backup /dir_to_backup
     sprinkle.py restore /backup /opt/restore_dir
@@ -151,20 +165,21 @@ EXAMPLES:
 def usage_config():
     """
 NAME:
-    sprinkle config - configure sprinkle/rclone
+    sprinkle config - create a Sprinkle configuration file
 
 SYNOPSIS:
     sprinkle.py [options] config
 
 DESCRIPTION:
-    Configure sprinkle/rclone to communicate with remote volumes. This process might enable API access and may
-    require authorization before sprinkle/rclone can access the drives. For config documentation refer to rclone
-    documentation at https://rclone.org/docs/.
+    Interactively writes ~/.sprinkle/sprinkle.conf with the common Sprinkle defaults,
+    including rclone_move, delete_files, and Google Drive service account cache defaults.
+    Use -c/--conf with this command to write a different config path.
 
 EXAMPLES:
     sprinkle.py config
+    sprinkle.py -c /tmp/sprinkle.conf config
     """
-    print(usage_ls.__doc__)
+    print(usage_config.__doc__)
     print(usage_options.__doc__)
     print(copyrights.__doc__)
     print(credits.__doc__)
@@ -336,6 +351,52 @@ EXAMPLES:
     print(credits.__doc__)
 
 
+def usage_sa_import():
+    """
+NAME:
+    sprinkle sa-import - import Google Drive service account files
+
+SYNOPSIS:
+    sprinkle.py [options] sa-import {path...}
+
+DESCRIPTION:
+    Recursively imports valid service account JSON files into Sprinkle's managed store.
+    Duplicates are recorded but not copied again. New accounts are validated with
+    rclone about --json during import. Invalid accounts and unknown quota results are
+    quarantined by default.
+
+EXAMPLES:
+    sprinkle.py --drive-id XXXXX sa-import /Users/user/workspace/svcacc
+    """
+    print(usage_sa_import.__doc__)
+    print(usage_options.__doc__)
+    print(copyrights.__doc__)
+    print(credits.__doc__)
+
+
+def usage_sa_stats():
+    """
+NAME:
+    sprinkle sa-stats - display imported service account statistics
+
+SYNOPSIS:
+    sprinkle.py [options] sa-stats
+
+DESCRIPTION:
+    Shows imported service accounts and cached quota data. By default this command refreshes
+    stale cache entries with rclone about --json.
+
+EXAMPLES:
+    sprinkle.py --drive-id XXXXX sa-stats
+    sprinkle.py --sa-refresh=none sa-stats
+    sprinkle.py --sa-cache-ttl-hours=72 --sa-refresh=stale sa-stats
+    """
+    print(usage_sa_stats.__doc__)
+    print(usage_options.__doc__)
+    print(copyrights.__doc__)
+    print(credits.__doc__)
+
+
 def usage_removedups():
     """
 NAME:
@@ -427,6 +488,14 @@ def read_args(argv):
     global __daemon_interval
     global __daemon_pidfile
     global __ls_stop_first
+    global __sa_db
+    global __sa_store
+    global __sa_cache_ttl_hours
+    global __sa_refresh
+    global __sa_clean_invalid
+    global __sa_group_size
+    global __rclone_sa_dir
+    global __rclone_sa_count
 
     __configfile = None
     __cmd_debug = None
@@ -461,9 +530,14 @@ def read_args(argv):
     __daemon_interval = None
     __daemon_pidfile = None
     __ls_stop_first = None
-
-    rclone_sa_dir = None
-    rclone_sa_count = None
+    __sa_db = None
+    __sa_store = None
+    __sa_cache_ttl_hours = None
+    __sa_refresh = None
+    __sa_clean_invalid = None
+    __sa_group_size = None
+    __rclone_sa_dir = None
+    __rclone_sa_count = None
 
     try:
         opts, args = getopt.getopt(argv, "dvhc:s:",
@@ -478,6 +552,12 @@ def read_args(argv):
                                     "rclone-sa-dir=",
                                     "rclone-sa-count=",
                                     "drive-id=",
+                                    "sa-db=",
+                                    "sa-store=",
+                                    "sa-cache-ttl-hours=",
+                                    "sa-refresh=",
+                                    "sa-clean-invalid=",
+                                    "sa-group-size=",
                                     "stats=",
                                     "display-unit=",
                                     "rclone-retries=",
@@ -529,12 +609,28 @@ def read_args(argv):
         elif opt in ("--rclone-conf"):
             __rclone_conf = arg
         elif opt in ("--rclone-sa-dir"):
-            rclone_sa_dir = arg
+            __rclone_sa_dir = arg
         elif opt in ("--rclone-sa-count"):
-            rclone_sa_count = int(arg)
+            __rclone_sa_count = int(arg)
         elif opt in ("--drive-id"):
             __drive_id = arg
             __ls_stop_first = True
+        elif opt in ("--sa-db"):
+            __sa_db = arg
+        elif opt in ("--sa-store"):
+            __sa_store = arg
+        elif opt in ("--sa-cache-ttl-hours"):
+            __sa_cache_ttl_hours = int(arg)
+        elif opt in ("--sa-refresh"):
+            if arg not in ("missing", "stale", "all", "none"):
+                raise Exception("--sa-refresh must be one of missing, stale, all, none")
+            __sa_refresh = arg
+        elif opt in ("--sa-clean-invalid"):
+            if arg not in ("none", "quarantine", "delete"):
+                raise Exception("--sa-clean-invalid must be one of none, quarantine, delete")
+            __sa_clean_invalid = arg
+        elif opt in ("--sa-group-size"):
+            __sa_group_size = int(arg)
         elif opt in ("--display-unit"):
             if arg != 'G' and arg != 'M' and arg != 'K' and arg != 'B':
                 logging.error('invalid UNIT ' + arg + ', only [G|M|K|B] accepted')
@@ -589,15 +685,10 @@ def read_args(argv):
         elif opt in ("--daemon-pidfile"):
             __daemon_pidfile = arg
 
-    if rclone_sa_dir is not None:
-        if __drive_id is None:
-            raise Exception("--drive-id option is required when using --rclone-sa-dir")
-        fd, tmp_conf = tempfile.mkstemp(prefix="rclone-", suffix=".conf")
-        os.close(fd)
-        rclone.generate_rclone_config(
-            rclone_sa_dir, tmp_conf, __drive_id, max_accounts=rclone_sa_count
-        )
-        __rclone_conf = tmp_conf
+    if __configfile is None:
+        candidate_config = default_config_path()
+        if os.path.isfile(candidate_config):
+            __configfile = candidate_config
 
     if len(args) < 1 and __check_prereq is None:
         usage()
@@ -624,6 +715,9 @@ def configure(config_file):
         "compare_method": "size",
         "display_unit": "G",
         "rclone_retries": '1',
+        "drive_id": None,
+        "rclone_sa_dir": None,
+        "rclone_sa_count": None,
         "log_file": None,
         "single_instance": False,
         "ls_stop_first": False,
@@ -631,7 +725,16 @@ def configure(config_file):
         "daemon_type": 'interval',
         "daemon_mode": False,
         "daemon_interval": 60,
-        "daemon_pidfile": '/var/run/sprinkle.pid'
+        "daemon_pidfile": '/var/run/sprinkle.pid',
+        "sa_db": service_accounts.DEFAULT_DB_PATH,
+        "sa_store": service_accounts.DEFAULT_STORE_DIR,
+        "sa_cache_ttl_hours": service_accounts.DEFAULT_CACHE_TTL_HOURS,
+        "sa_refresh": service_accounts.DEFAULT_REFRESH_MODE,
+        "sa_clean_invalid": service_accounts.DEFAULT_CLEAN_INVALID,
+        "sa_group_size": 50,
+        "large_file_threshold_bytes": clsync.DEFAULT_LARGE_FILE_THRESHOLD_BYTES,
+        "large_file_min_free_bytes": clsync.DEFAULT_LARGE_FILE_MIN_FREE_BYTES,
+        "large_file_min_free_percent": clsync.DEFAULT_LARGE_FILE_MIN_FREE_PERCENT
     }
 
     if config_file is not None:
@@ -644,7 +747,10 @@ def configure(config_file):
         if field not in __config:
             __config[field] = _default_values[field]
 
+    normalize_config_types(__config)
+
     if __cmd_debug is True:
+        __config['debug'] = True
         init_logging(True, __daemon_mode)
     elif 'debug' in __config:
         init_logging(__config['debug'], __daemon_mode)
@@ -663,6 +769,12 @@ def configure(config_file):
 
     if __drive_id is not None:
         __config['drive_id'] = __drive_id
+
+    if __rclone_sa_dir is not None:
+        __config['rclone_sa_dir'] = __rclone_sa_dir
+
+    if __rclone_sa_count is not None:
+        __config['rclone_sa_count'] = __rclone_sa_count
 
     if __rclone_retries is not None:
         __config['rclone_retries'] = str(__rclone_retries)
@@ -737,6 +849,62 @@ def configure(config_file):
     if __daemon_pidfile is not None:
         __config['daemon_pidfile'] = __daemon_pidfile
 
+    if __sa_db is not None:
+        __config['sa_db'] = __sa_db
+
+    if __sa_store is not None:
+        __config['sa_store'] = __sa_store
+
+    if __sa_cache_ttl_hours is not None:
+        __config['sa_cache_ttl_hours'] = __sa_cache_ttl_hours
+
+    if __sa_refresh is not None:
+        __config['sa_refresh'] = __sa_refresh
+
+    if __sa_clean_invalid is not None:
+        __config['sa_clean_invalid'] = __sa_clean_invalid
+
+    if __sa_group_size is not None:
+        __config['sa_group_size'] = __sa_group_size
+
+
+def normalize_config_types(config_values):
+    bool_fields = (
+        'debug',
+        'dry_run',
+        'show_progress',
+        'delete_files',
+        'rclone_move',
+        'restore_duplicates',
+        'smtp_enable',
+        'no_cache',
+        'single_instance',
+        'ls_stop_first',
+        'check_prereq',
+        'daemon_mode',
+    )
+    int_fields = (
+        'daemon_interval',
+        'sa_cache_ttl_hours',
+        'sa_group_size',
+        'rclone_sa_count',
+        'large_file_threshold_bytes',
+        'large_file_min_free_bytes',
+        'large_file_min_free_percent',
+    )
+    for field in bool_fields:
+        if field in config_values:
+            config_values[field] = _parse_bool(config_values[field])
+    for field in int_fields:
+        if field in config_values and config_values[field] not in (None, ''):
+            config_values[field] = int(config_values[field])
+
+
+def _parse_bool(value):
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ('true', '1', 'yes', 'y', 'ja', 'j')
+
 
 def verify_configuration():
     logging.debug('verifying configuration ' + str(__config))
@@ -761,6 +929,56 @@ def verify_configuration():
     if __daemon_mode is True and os.access(os.path.dirname(__config['daemon_pidfile']), os.W_OK) is not True:
         logging.warning('cannot write to pidfile "' + __config['daemon_pidfile'] + '" switching to /tmp/sprinkle.pid')
         __config['daemon_pidfile'] = '/tmp/sprinkle.pid'
+
+
+def prepare_rclone_sa_config():
+    global __rclone_conf
+    rclone_sa_dir = __config.get('rclone_sa_dir')
+    if rclone_sa_dir in (None, ''):
+        return
+    if __rclone_conf is not None and globals().get('__rclone_sa_dir') is None:
+        return
+    drive_id = __config.get('drive_id')
+    if drive_id in (None, ''):
+        raise Exception("--drive-id option or drive_id config value is required when using rclone_sa_dir")
+    fd, tmp_conf = tempfile.mkstemp(prefix="rclone-", suffix=".conf")
+    os.close(fd)
+    registry = service_accounts.ServiceAccountRegistry(
+        __config.get('sa_db'),
+        __config.get('sa_store'),
+        __config.get('sa_cache_ttl_hours', service_accounts.DEFAULT_CACHE_TTL_HOURS),
+    )
+    import_result = registry.import_paths(
+        [rclone_sa_dir],
+        __config.get('sa_clean_invalid', service_accounts.DEFAULT_CLEAN_INVALID),
+    )
+    if len(import_result.selected_files) == 0:
+        raise Exception("no valid service accounts found in " + rclone_sa_dir)
+    config_text, entries = rclone.generate_rclone_config_from_files(
+        import_result.selected_files,
+        tmp_conf,
+        drive_id,
+        max_accounts=_optional_int(__config.get('rclone_sa_count')),
+        return_entries=True,
+        shuffle=False,
+    )
+    registry.assign_remote_names(entries)
+    __rclone_conf = tmp_conf
+    __config['rclone_config'] = tmp_conf
+
+
+def command_needs_rclone_config():
+    if __check_prereq is not None and __check_prereq is True:
+        return True
+    if len(__args) < 1:
+        return False
+    return __args[0] in ('ls', 'lsmd5', 'backup', 'restore', 'stats', 'removedups', 'find')
+
+
+def _optional_int(value):
+    if value in (None, ''):
+        return None
+    return int(value)
 
 
 def load_exclusion_file(exclude_file):
@@ -793,6 +1011,161 @@ def init_logging(debug, daemon_mode=False):
                                 level=logging.INFO,
                                 filename=__log_file)
         logging.getLogger('sprinkle').setLevel(logging.INFO)
+
+
+def config_command(prompt_func=input, output_path=None):
+    target = output_path or default_config_path()
+    common.print_line('creating Sprinkle configuration at ' + target)
+    if os.path.exists(target):
+        overwrite = _prompt_bool(prompt_func, 'Overwrite existing config', False)
+        if not overwrite:
+            common.print_line('configuration not changed')
+            return target
+
+    rclone_move = _prompt_bool(prompt_func, 'rclone_move: move files instead of copying them', True)
+    delete_files = _prompt_bool(prompt_func, 'delete_files: delete files after 1-way sync', False)
+    debug = _prompt_bool(prompt_func, 'debug output (-d)', True)
+    rclone_sa_count = _prompt_text(prompt_func, 'rclone_sa_count', '5')
+    drive_id = _prompt_text(prompt_func, 'drive_id', 'XXXXX')
+    rclone_sa_dir = _prompt_text(prompt_func, 'rclone_sa_dir', '/etc/rclone/sa')
+    sa_cache_ttl_hours = _prompt_int(
+        prompt_func,
+        'sa_cache_ttl_hours',
+        service_accounts.DEFAULT_CACHE_TTL_HOURS,
+    )
+    sa_refresh = _prompt_choice(
+        prompt_func,
+        'sa_refresh',
+        service_accounts.DEFAULT_REFRESH_MODE,
+        ('missing', 'stale', 'all', 'none'),
+    )
+    sa_clean_invalid = _prompt_choice(
+        prompt_func,
+        'sa_clean_invalid',
+        service_accounts.DEFAULT_CLEAN_INVALID,
+        ('none', 'quarantine', 'delete'),
+    )
+
+    content = _build_config_text(
+        rclone_move,
+        delete_files,
+        debug,
+        rclone_sa_count,
+        drive_id,
+        rclone_sa_dir,
+        sa_cache_ttl_hours,
+        sa_refresh,
+        sa_clean_invalid,
+    )
+    parent = os.path.dirname(target)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(target, 'w') as fp:
+        fp.write(content)
+    common.print_line('wrote ' + target)
+    return target
+
+
+def _prompt_bool(prompt_func, label, default):
+    default_text = 'Y/n' if default else 'y/N'
+    answer = prompt_func(label + ' [' + default_text + ']: ').strip().lower()
+    if answer == '':
+        return default
+    return answer in ('y', 'yes', 'true', '1', 'j', 'ja')
+
+
+def _prompt_text(prompt_func, label, default):
+    answer = prompt_func(label + ' [' + str(default) + ']: ').strip()
+    if answer == '':
+        return str(default)
+    return answer
+
+
+def _prompt_int(prompt_func, label, default):
+    while True:
+        answer = _prompt_text(prompt_func, label, default)
+        try:
+            return str(int(answer))
+        except ValueError:
+            common.print_line(label + ' must be an integer')
+
+
+def _prompt_choice(prompt_func, label, default, choices):
+    while True:
+        answer = _prompt_text(prompt_func, label + ' {' + '|'.join(choices) + '}', default)
+        if answer in choices:
+            return answer
+        common.print_line(label + ' must be one of ' + ', '.join(choices))
+
+
+def _bool_text(value):
+    return 'true' if value else 'false'
+
+
+def _build_config_text(
+        rclone_move,
+        delete_files,
+        debug,
+        rclone_sa_count,
+        drive_id,
+        rclone_sa_dir,
+        sa_cache_ttl_hours,
+        sa_refresh,
+        sa_clean_invalid):
+    return """## SPRINKLE CONFIGURATION
+## Generated by: sprinkle.py config
+
+# run sprinkle in debug mode. Equivalent to command line -d
+debug={debug}
+
+# rclone_move: move files instead of copying them
+# rclone_move=false (copy files and keep sources) (default)
+rclone_move={rclone_move}
+
+# delete_files: delete files after 1-way sync
+# delete_files=false (leave files not locally present on remote drives)
+# delete_files=true (delete files not locally present from remote drives) (default)
+delete_files={delete_files}
+
+# Google Drive service account defaults.
+# Equivalent command line:
+# --rclone-sa-count {rclone_sa_count} --drive-id {drive_id} -d --rclone-sa-dir {rclone_sa_dir}
+rclone_sa_count={rclone_sa_count}
+drive_id={drive_id}
+rclone_sa_dir={rclone_sa_dir}
+
+# service account registry database and managed JSON store
+sa_db=~/.sprinkle/sa-cache.sqlite3
+sa_store=~/.sprinkle/service-accounts
+sa_cache_ttl_hours={sa_cache_ttl_hours}
+sa_refresh={sa_refresh}
+sa_clean_invalid={sa_clean_invalid}
+sa_group_size=50
+
+# Large-file upload selection keeps enough headroom on small Google Drive accounts.
+# Defaults require an extra 512 MiB or 5%, whichever is larger, for files >= 1 GiB.
+large_file_threshold_bytes={large_file_threshold_bytes}
+large_file_min_free_bytes={large_file_min_free_bytes}
+large_file_min_free_percent={large_file_min_free_percent}
+
+display_unit=G
+distribution_type=mas
+compare_method=size
+rclone_retries=1
+""".format(
+        debug=_bool_text(debug),
+        rclone_move=_bool_text(rclone_move),
+        delete_files=_bool_text(delete_files),
+        rclone_sa_count=rclone_sa_count,
+        drive_id=drive_id,
+        rclone_sa_dir=rclone_sa_dir,
+        sa_cache_ttl_hours=sa_cache_ttl_hours,
+        sa_refresh=sa_refresh,
+        sa_clean_invalid=sa_clean_invalid,
+        large_file_threshold_bytes=clsync.DEFAULT_LARGE_FILE_THRESHOLD_BYTES,
+        large_file_min_free_bytes=clsync.DEFAULT_LARGE_FILE_MIN_FREE_BYTES,
+        large_file_min_free_percent=clsync.DEFAULT_LARGE_FILE_MIN_FREE_PERCENT,
+    )
 
 
 def ls():
@@ -927,32 +1300,288 @@ def stats():
     frees = __cl_sync.get_frees()
     display_unit = __config['display_unit']
     for remote in sizes:
-        percent_use = frees[remote] * 100 / sizes[remote]
-        size_d = common.convert_unit(sizes[remote], display_unit)
-        free_d = common.convert_unit(frees[remote], display_unit)
+        percent_use = _format_percent(frees[remote], sizes[remote])
         common.print_line(remote.ljust(15) + " " +
-                          "{:,}".format(size_d).rjust(19) + display_unit + " " +
-                          "{:,}".format(free_d).rjust(19) + display_unit + " " +
-                          "{:,}".format(int(percent_use)).rjust(10)
+                          _format_amount(sizes[remote], display_unit).rjust(20) + " " +
+                          _format_amount(frees[remote], display_unit).rjust(20) + " " +
+                          percent_use.rjust(10)
                           )
 
     size = __cl_sync.get_size()
     free = __cl_sync.get_free()
     logging.debug('size: ' + "{:,}".format(size))
     logging.debug('free: ' + "{:,}".format(free))
-    percent_use = free * 100 / size
+    percent_use = _format_percent(free, size)
     common.print_line(''.join('-' for i in range(15)) + " " +
                       ''.join('-' for i in range(20)) + " " +
                       ''.join('-' for i in range(20)) + " " +
                       ''.join('-' for i in range(10))
                       )
-    size_d = common.convert_unit(size, display_unit)
-    free_d = common.convert_unit(free, display_unit)
     common.print_line("total:".ljust(15) + " " +
-                      "{:,}".format(size_d).rjust(19) + display_unit + " " +
-                      "{:,}".format(free_d).rjust(19) + display_unit + " " +
-                      "{:,}".format(int(percent_use)).rjust(10)
+                      _format_amount(size, display_unit).rjust(20) + " " +
+                      _format_amount(free, display_unit).rjust(20) + " " +
+                      percent_use.rjust(10)
                       )
+
+
+def _service_account_registry():
+    return service_accounts.ServiceAccountRegistry(
+        __config['sa_db'],
+        __config['sa_store'],
+        __config['sa_cache_ttl_hours'],
+    )
+
+
+def _format_amount(amount, display_unit):
+    if amount is None:
+        return 'UNKNOWN'
+    return "{:,}{}".format(common.convert_unit(amount, display_unit), display_unit)
+
+
+def _format_percent(free, total):
+    if free is None or total is None or total == 0:
+        return 'UNKNOWN'
+    return "{:,}".format(int(free * 100 / total))
+
+
+def _sa_import_progress(event):
+    event_type = event.get("event")
+    if event_type == "start":
+        common.print_line("service account import: found " + str(event.get("total", 0)) + " json files")
+        return
+    if event_type != "status":
+        return
+    status = event.get("status")
+    path = event.get("path") or ""
+    basename = os.path.basename(path)
+    prefix = "service account import [{}/{}] ".format(event.get("index"), event.get("total"))
+    message = prefix + status + ": " + basename
+    reason = event.get("reason")
+    if reason:
+        message += " - " + reason
+    common.print_line(message)
+
+
+def _service_account_live_validator(path, payload):
+    fd, tmp_conf = tempfile.mkstemp(prefix="rclone-sa-import-", suffix=".conf")
+    os.close(fd)
+    try:
+        rclone.generate_rclone_config_from_files(
+            [path],
+            tmp_conf,
+            None,
+            prefix="sa_import",
+            start_index=1,
+            shuffle=False,
+        )
+        rclone_exe = __config.get('rclone_exe', 'rclone')
+        rclone_retries = __config.get('rclone_retries', '1')
+        rc = rclone.RClone(tmp_conf, rclone_exe, rclone_retries)
+        quota, error = rc.get_about_json_with_error("sa_import1:")
+        if error is not None:
+            return None, _friendly_rclone_error(error, payload)
+        unknown_reason = _quota_unknown_reason(quota)
+        if unknown_reason is not None:
+            return None, unknown_reason
+        return quota, None
+    finally:
+        try:
+            os.unlink(tmp_conf)
+        except Exception:
+            pass
+
+
+def _quota_unknown_reason(quota):
+    if not isinstance(quota, dict):
+        return "rclone about returned unknown quota"
+    missing = []
+    for field in ("total", "free"):
+        if field not in quota or quota.get(field) is None:
+            missing.append(field)
+    if missing:
+        return "rclone about returned unknown quota: missing " + ",".join(missing)
+    return None
+
+
+def _friendly_rclone_error(error, identity=None):
+    text = " ".join(str(error).split())
+    if len(text) > 320:
+        text = text[:317] + "..."
+    lower = text.lower()
+    account = ""
+    if identity is not None:
+        email = _identity_value(identity, "client_email")
+        project = _identity_value(identity, "project_id")
+        if email or project:
+            account = " for"
+            if email:
+                account += " " + email
+            if project:
+                account += " project " + project
+    if "executable not found" in lower or "no such file" in lower:
+        return "rclone executable not found" + account
+    if "invalid_grant" in lower or "jwt" in lower or "invalid_client" in lower:
+        return "service account credentials rejected" + account + ": " + text
+    if "project" in lower and ("not found" in lower or "deleted" in lower or "disabled" in lower):
+        return "service account project not available" + account + ": " + text
+    if "service_disabled" in lower or "accessnotconfigured" in lower or "api has not been used" in lower:
+        return "Google Drive API is not available for project" + account + ": " + text
+    if "notfound" in lower or "not found" in lower:
+        return "service account user, project, or Drive target was not found" + account + ": " + text
+    if text == "":
+        return "rclone about failed with no error output" + account
+    return "rclone about failed" + account + ": " + text
+
+
+def _identity_value(identity, key):
+    if hasattr(identity, "get"):
+        return identity.get(key)
+    try:
+        return identity[key]
+    except Exception:
+        return None
+
+
+def sa_import():
+    if len(__args) < 2:
+        logging.error('invalid sa-import command')
+        usage_sa_import()
+        sys.exit(-1)
+    registry = _service_account_registry()
+    result = registry.import_paths(
+        __args[1:],
+        __config['sa_clean_invalid'],
+        validator=_service_account_live_validator,
+        progress=_sa_import_progress,
+    )
+    common.print_line('service account import complete')
+    common.print_line('scanned:      ' + str(result.scanned))
+    common.print_line('validated:    ' + str(result.validated))
+    common.print_line('imported:     ' + str(result.imported))
+    common.print_line('duplicates:   ' + str(result.duplicates))
+    common.print_line('invalid:      ' + str(result.invalid))
+    common.print_line('validation errors: ' + str(result.validation_errors))
+    common.print_line('quarantined:  ' + str(result.quarantined))
+    common.print_line('deleted:      ' + str(result.deleted))
+    common.print_line('store:        ' + os.path.abspath(os.path.expanduser(__config['sa_store'])))
+    common.print_line('database:     ' + os.path.abspath(os.path.expanduser(__config['sa_db'])))
+
+
+def sa_stats():
+    registry = _service_account_registry()
+    refresh_mode = __config['sa_refresh']
+    if globals().get('__sa_refresh') is None and refresh_mode == service_accounts.DEFAULT_REFRESH_MODE:
+        refresh_mode = 'stale'
+    refreshed = 0
+    for account in registry.active_accounts():
+        quota_row = registry.quota_by_account_id(account['id'])
+        if registry.should_refresh(quota_row, refresh_mode):
+            quota, error = _refresh_service_account_quota(account)
+            registry.update_quota(account['id'], quota, error)
+            refreshed += 1
+
+    counts = registry.summary_counts()
+    rows = registry.all_account_stats()
+    active_rows = [row for row in rows if row['status'] == 'active']
+    stale_count = 0
+    error_count = 0
+    unknown_count = 0
+    total = 0
+    used = 0
+    free = 0
+    for row in active_rows:
+        if row['last_about_at'] is None:
+            unknown_count += 1
+        elif registry.is_stale(row['last_about_at']):
+            stale_count += 1
+        if row['last_error'] is not None:
+            error_count += 1
+        if row['total'] is not None:
+            total += row['total']
+        if row['used'] is not None:
+            used += row['used']
+        if row['free'] is not None:
+            free += row['free']
+
+    common.print_line('SERVICE ACCOUNT SUMMARY')
+    common.print_line('active:      ' + str(counts.get('active', 0)))
+    common.print_line('duplicates:  ' + str(counts.get('duplicate', 0)))
+    common.print_line('invalid:     ' + str(counts.get('invalid', 0)))
+    common.print_line('refreshed:   ' + str(refreshed))
+    common.print_line('errors:      ' + str(error_count))
+    common.print_line('stale:       ' + str(stale_count))
+    common.print_line('unknown:     ' + str(unknown_count))
+    common.print_line('')
+    common.print_line('ACCOUNT'.ljust(44) + " " +
+                      'SIZE'.rjust(12) + " " +
+                      'USED'.rjust(12) + " " +
+                      'FREE'.rjust(12) + " " +
+                      '%FREE'.rjust(8) + " " +
+                      'UPDATED'.ljust(20) + " " +
+                      'ERROR')
+    common.print_line(''.join('=' for i in range(44)) + " " +
+                      ''.join('=' for i in range(12)) + " " +
+                      ''.join('=' for i in range(12)) + " " +
+                      ''.join('=' for i in range(12)) + " " +
+                      ''.join('=' for i in range(8)) + " " +
+                      ''.join('=' for i in range(20)) + " " +
+                      ''.join('=' for i in range(20)))
+    display_unit = __config['display_unit']
+    for row in active_rows:
+        account = row['client_email'] or row['account_key'] or str(row['id'])
+        if len(account) > 44:
+            account = account[:41] + '...'
+        common.print_line(account.ljust(44) + " " +
+                          _format_amount(row['total'], display_unit).rjust(12) + " " +
+                          _format_amount(row['used'], display_unit).rjust(12) + " " +
+                          _format_amount(row['free'], display_unit).rjust(12) + " " +
+                          _format_percent(row['free'], row['total']).rjust(8) + " " +
+                          str(row['last_about_at'] or 'UNKNOWN').ljust(20) + " " +
+                          str(row['last_error'] or ''))
+    common.print_line(''.join('-' for i in range(44)) + " " +
+                      ''.join('-' for i in range(12)) + " " +
+                      ''.join('-' for i in range(12)) + " " +
+                      ''.join('-' for i in range(12)) + " " +
+                      ''.join('-' for i in range(8)) + " " +
+                      ''.join('-' for i in range(20)) + " " +
+                      ''.join('-' for i in range(20)))
+    common.print_line('total:'.ljust(44) + " " +
+                      _format_amount(total, display_unit).rjust(12) + " " +
+                      _format_amount(used, display_unit).rjust(12) + " " +
+                      _format_amount(free, display_unit).rjust(12) + " " +
+                      _format_percent(free, total).rjust(8))
+
+
+def _refresh_service_account_quota(account):
+    if account['managed_path'] is None:
+        return None, 'missing managed service account file'
+    fd, tmp_conf = tempfile.mkstemp(prefix="rclone-sa-", suffix=".conf")
+    os.close(fd)
+    try:
+        rclone.generate_rclone_config_from_files(
+            [account['managed_path']],
+            tmp_conf,
+            __config.get('drive_id'),
+            prefix="sa",
+            start_index=1,
+        )
+        rclone_exe = __config.get('rclone_exe', 'rclone')
+        rclone_retries = __config.get('rclone_retries', '1')
+        rc = rclone.RClone(tmp_conf, rclone_exe, rclone_retries)
+        quota, error = rc.get_about_json_with_error("sa1:")
+        if error is not None:
+            return None, _friendly_rclone_error(error, account)
+        unknown_reason = _quota_unknown_reason(quota)
+        if unknown_reason is not None:
+            return None, unknown_reason
+        return quota, None
+    except Exception as e:
+        return None, str(e)
+    finally:
+        try:
+            os.unlink(tmp_conf)
+        except Exception:
+            pass
 
 
 def remove_duplicates():
@@ -1035,7 +1664,12 @@ def check_prerequisites():
 
 def main(argv):
     read_args(argv)
+    if len(__args) > 0 and __args[0] == 'config':
+        config_command(output_path=__configfile)
+        sys.exit(0)
     configure(__configfile)
+    if command_needs_rclone_config():
+        prepare_rclone_sa_config()
     verify_configuration()
     if __check_prereq is not None and __check_prereq is True:
         check_prerequisites()
@@ -1084,6 +1718,10 @@ def main(argv):
             restore()
         elif __args[0] == 'stats':
             stats()
+        elif __args[0] == 'sa-import':
+            sa_import()
+        elif __args[0] == 'sa-stats':
+            sa_stats()
         elif __args[0] == 'removedups':
             remove_duplicates()
         elif __args[0] == 'find':
@@ -1102,6 +1740,10 @@ def main(argv):
                     usage_restore()
                 elif __args[1] == 'stats':
                     usage_stats()
+                elif __args[1] == 'sa-import':
+                    usage_sa_import()
+                elif __args[1] == 'sa-stats':
+                    usage_sa_stats()
                 elif __args[1] == 'removedups':
                     usage_removedups()
                 elif __args[1] == 'config':

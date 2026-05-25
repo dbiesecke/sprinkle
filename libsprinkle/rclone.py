@@ -23,13 +23,14 @@ def generate_rclone_config(
         root_folder_id,
         max_accounts=None,
         prefix="dst",
-        start_index=101):
+        start_index=101,
+        return_entries=False,
+        shuffle=True):
     """Generate an rclone configuration from service account files.
 
-    The function scans ``json_dir`` for ``.json`` files, shuffles them to
-    provide a random selection and writes configuration sections for each
-    file.  Sections are named using ``prefix`` followed by a counter
-    starting at ``start_index``.
+    The function scans ``json_dir`` for ``.json`` files and writes
+    configuration sections for each file. Sections are named using
+    ``prefix`` followed by a counter starting at ``start_index``.
 
     Parameters
     ----------
@@ -55,26 +56,87 @@ def generate_rclone_config(
     if not os.path.isdir(json_dir):
         raise ValueError("Directory {} not found".format(json_dir))
 
-    files = [f for f in os.listdir(json_dir) if f.endswith(".json")]
-    files = random.sample(files, len(files))
+    files = [
+        os.path.join(os.path.abspath(json_dir), f)
+        for f in os.listdir(json_dir)
+        if f.endswith(".json")
+    ]
+    return generate_rclone_config_from_files(
+        files,
+        output_file,
+        root_folder_id,
+        max_accounts=max_accounts,
+        prefix=prefix,
+        start_index=start_index,
+        return_entries=return_entries,
+        shuffle=shuffle,
+    )
+
+
+def generate_rclone_config_from_files(
+        json_files,
+        output_file,
+        root_folder_id=None,
+        max_accounts=None,
+        prefix="dst",
+        start_index=101,
+        return_entries=False,
+        shuffle=True):
+    """Generate an rclone configuration from explicit service account files."""
+    files = [os.path.abspath(path) for path in json_files]
+    if shuffle:
+        files = random.sample(files, len(files))
+    else:
+        files = sorted(files)
     if max_accounts is not None:
         files = files[:max_accounts]
 
     count = start_index - 1
     lines = []
+    entries = []
     for filename in files:
         count += 1
+        remote = "{}{}".format(prefix, count)
         lines.extend([
-            "[{}{}]".format(prefix, count),
+            "[{}]".format(remote),
             "type = drive",
             "scope = drive",
-            "service_account_file = {}".format(
-                os.path.join(os.path.abspath(json_dir), filename)
-            ),
-            "root_folder_id = {}".format(root_folder_id),
+            "service_account_file = {}".format(filename),
+        ])
+        if root_folder_id:
+            lines.append("root_folder_id = {}".format(root_folder_id))
+        lines.append("")
+        entries.append({"remote": remote, "path": filename})
+
+    config_text = "\n".join(lines)
+    with open(output_file, "w") as conf_fp:
+        conf_fp.write(config_text)
+    if return_entries:
+        return config_text, entries
+    return config_text
+
+
+def generate_rclone_combine_config(upstreams, output_file, group_size=50, prefix="sa_group"):
+    """Generate optional rclone combine remotes from upstream specs."""
+    if group_size < 1:
+        raise ValueError("group_size must be at least 1")
+    specs = []
+    for upstream in upstreams:
+        if isinstance(upstream, dict):
+            remote = upstream["remote"].rstrip(":")
+            specs.append("{}={}:".format(remote, remote))
+        else:
+            specs.append(str(upstream))
+    lines = []
+    group = 1
+    for index in range(0, len(specs), group_size):
+        lines.extend([
+            "[{}{}]".format(prefix, group),
+            "type = combine",
+            "upstreams = {}".format(" ".join(specs[index:index + group_size])),
             "",
         ])
-
+        group += 1
     config_text = "\n".join(lines)
     with open(output_file, "w") as conf_fp:
         conf_fp.write(config_text)
@@ -87,7 +149,7 @@ class RClone:
         if config_file is not None and not common.is_file(config_file):
             logging.error("configuration file " + str(config_file) + " not found. Cannot continue!")
             raise Exception("Configuration file " + str(config_file) + " not found")
-        if rclone_exe is not "rclone" and not common.is_file(rclone_exe):
+        if rclone_exe != "rclone" and not common.is_file(rclone_exe):
             #logging.error("rclone executable " + str(rclone_exe) + " not found. Cannot continue!")
             common.print_line('RCLONE.EXE not in PATH. Put it in PATH or modify libsprinkle.conf to point to it.')
             raise Exception("rclone executable " + str(rclone_exe) + " not found")
@@ -113,7 +175,7 @@ class RClone:
         if result['code'] == -20:
             logging.error("rclone executable not found. Please make sure it's in the PATH or in the config file")
             raise Exception("rclone executable not found. Please make sure it's in the PATH or in the config file")
-        if result['error'] is not '':
+        if result['error'] != '':
             logging.error('error getting remotes objects')
             raise Exception('error getting remote object. ' + result['error'])
         remotes = result['out'].splitlines()
@@ -134,7 +196,7 @@ class RClone:
         command_with_args.append(remote + directory)
         result = common.execute(command_with_args, no_error)
         logging.debug('result: ' + str(result)[0:128])
-        if result['error'] is not '':
+        if result['error'] != '':
             if no_error is False:
                 # logging.error('error getting remotes objects')
                 if result['error'].find("directory not found") != -1:
@@ -164,7 +226,7 @@ class RClone:
         command_with_args.append(remote+directory)
         result = common.execute(command_with_args, no_error)
         logging.debug('result: ' + str(result)[0:128])
-        if result['error'] is not '':
+        if result['error'] != '':
             if no_error is False:
                 #logging.error('error getting remotes objects')
                 if result['error'].find("directory not found") != -1:
@@ -178,7 +240,7 @@ class RClone:
         logging.debug('returning ' + str(lsjson)[0:128])
         return lsjson
 
-    def get_about(self, remote):
+    def get_about_json_with_error(self, remote):
         logging.debug('running about for ' + remote)
         command_with_args = []
         command_with_args.append(self._rclone_exe)
@@ -191,14 +253,33 @@ class RClone:
         command_with_args.append("--retries")
         command_with_args.append(self._rclone_retries)
         command_with_args.append(remote)
-        result = common.execute(command_with_args)
+        result = common.execute(command_with_args, True)
         logging.debug('result: ' + str(result))
-        if result['error'] is not '':
-            logging.error('error getting remotes objects')
-            raise Exception('error getting remote object. ' + result['error'])
-        aboutjson = result['out'].splitlines()
+        if result.get('code', 0) != 0 or result.get('error') not in (None, ''):
+            error = result.get('error') or result.get('out') or 'rclone about failed'
+            return None, str(error)
+        if result.get('out') in (None, ''):
+            return None, 'rclone about returned empty output'
+        try:
+            return json.loads(result['out']), None
+        except Exception as exc:
+            return None, 'rclone about returned invalid json: {}'.format(exc.__class__.__name__)
+
+    def get_about_json(self, remote, no_error=False):
+        quota, error = self.get_about_json_with_error(remote)
+        if error is not None:
+            logging.error('error getting remote quota')
+            if no_error:
+                return None
+            raise Exception('error getting remote quota. ' + error)
+        return quota
+
+    def get_about(self, remote):
+        aboutjson = self.get_about_json(remote)
+        if aboutjson is None:
+            return []
         logging.debug('returning ' + str(aboutjson))
-        return aboutjson
+        return json.dumps(aboutjson).splitlines()
 
     def mkdir(self, remote, directory):
         logging.debug('running mkdir for ' + remote + ":" + directory)
@@ -214,7 +295,7 @@ class RClone:
         command_with_args.append(remote + directory)
         result = common.execute(command_with_args)
         logging.debug('result: ' + str(result))
-        if result['error'] is not '':
+        if result['error'] != '':
             logging.error('error getting remotes objects')
             raise Exception('error getting remote object. ' + result['error'])
         out = result['out'].splitlines()
@@ -235,7 +316,7 @@ class RClone:
         command_with_args.append(remote + directory)
         result = common.execute(command_with_args)
         logging.debug('result: ' + str(result))
-        if result['error'] is not '':
+        if result['error'] != '':
             logging.error('error getting remotes objects')
             raise Exception('error getting remote object. ' + result['error'])
         out = result['out'].splitlines()
@@ -247,7 +328,7 @@ class RClone:
         command_with_args = [self._rclone_exe, "version"]
         result = common.execute(command_with_args)
         logging.debug('result: ' + str(result))
-        if result['error'] is not '':
+        if result['error'] != '':
             logging.error('error getting remotes objects')
             raise Exception('error getting remote object. ' + result['error'])
         out = result['out'].splitlines()
@@ -268,7 +349,7 @@ class RClone:
         command_with_args.append(remote + file)
         result = common.execute(command_with_args)
         logging.debug('result: ' + str(result))
-        if result['error'] is not '':
+        if result['error'] != '':
             logging.error('error getting remotes objects')
             raise Exception('error getting remote object. ' + result['error'])
         out = result['out'].splitlines()
@@ -289,7 +370,7 @@ class RClone:
         command_with_args.append(remote + file)
         result = common.execute(command_with_args)
         logging.debug('result: ' + str(result))
-        if result['error'] is not '':
+        if result['error'] != '':
             logging.error('error getting remotes objects')
             raise Exception('error getting remote object. ' + result['error'])
         out = result['out'].splitlines()
@@ -310,7 +391,7 @@ class RClone:
         command_with_args.append(remote + file)
         result = common.execute(command_with_args)
         logging.debug('result: ' + str(result))
-        if result['error'] is not '':
+        if result['error'] != '':
             logging.error('error getting remotes objects')
             raise Exception('error getting remote object. ' + result['error'])
         out = result['out'].splitlines()
@@ -338,7 +419,7 @@ class RClone:
         logging.debug('command args: ' + str(command_with_args))
         result = common.execute(command_with_args, no_error)
         logging.debug('result: ' + str(result))
-        if result['error'] is not '':
+        if result['error'] != '':
             if no_error is False:
                 logging.error('error getting remotes objects')
                 raise Exception('error getting remote object. ' + result['error'])
@@ -366,7 +447,7 @@ class RClone:
         command_with_args.append(dst)
         result = common.execute(command_with_args)
         logging.debug('result: ' + str(result))
-        if result['error'] is not '':
+        if result['error'] != '':
             logging.error('error getting remotes objects')
             raise Exception('error getting remote object. ' + result['error'])
         out = result['out'].splitlines()
@@ -374,63 +455,18 @@ class RClone:
         return out
 
     def get_free(self, remote):
-        logging.debug('running about for ' + remote)
-        command_with_args = []
-        command_with_args.append(self._rclone_exe)
-        command_with_args.append("about")
-        command_with_args.append("--json")
-        if self._config_file is not None:
-            command_with_args.append("--config")
-            command_with_args.append(self._config_file)
-        command_with_args.append("--auto-confirm")
-        command_with_args.append("--retries")
-        command_with_args.append(self._rclone_retries)
-        command_with_args.append(remote)
-        result = common.execute(command_with_args)
-        logging.debug('result: ' + str(result))
-        if result['error'] is not '':
-            logging.error('error getting remotes objects')
-            return 1
-            #raise Exception('error getting remote object. ' + result['error'])
-        aboutjson = result['out']
-        json_obj = json.loads(aboutjson)
-        # simple fix for accounts with errors
-        if "free" in json_obj:
+        json_obj = self.get_about_json(remote, True)
+        if json_obj is not None and "free" in json_obj:
             logging.debug('free ' + str(json_obj['free']))
             return json_obj['free']
-        else:
-            return 1
-#        return json_obj['free']
-
+        return None
 
     def get_size(self, remote):
-        logging.debug('running about for ' + remote)
-        command_with_args = []
-        command_with_args.append(self._rclone_exe)
-        command_with_args.append("about")
-        command_with_args.append("--json")
-        if self._config_file is not None:
-            command_with_args.append("--config")
-            command_with_args.append(self._config_file)
-        command_with_args.append("--auto-confirm")
-        command_with_args.append("--retries")
-        command_with_args.append(self._rclone_retries)
-        command_with_args.append(remote)
-        result = common.execute(command_with_args)
-        logging.debug('result: ' + str(result))
-        if result['error'] is not '':
-            logging.error('error getting remotes objects')
-            #raise Exception('error getting remote object. ' + result['error'])
-            return 1
-        aboutjson = result['out']
-        json_obj = json.loads(aboutjson)
-        # simple fix for accounts with errors
-        if "total" in json_obj:
+        json_obj = self.get_about_json(remote, True)
+        if json_obj is not None and "total" in json_obj:
             logging.debug('total ' + str(json_obj['total']))
             return json_obj['total']
-        else:
-            return 1
-        #return json_obj['total']
+        return None
 
     def sync(self, src, dst, extra_args=[]):
         logging.debug('running sync from ' + src + " to " + dst)
@@ -447,11 +483,9 @@ class RClone:
         command_with_args.append(self._rclone_retries)
         result = common.execute(command_with_args)
         logging.debug('result: ' + str(result))
-        if result['error'] is not '':
+        if result['error'] != '':
             logging.error('error getting remotes objects')
             raise Exception('error getting remote object. ' + result['error'])
         out = result['out'].splitlines()
         logging.debug('returning ' + str(out))
         return out
-
-
