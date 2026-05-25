@@ -1,48 +1,11 @@
-#!/usr/bin/env python
-"""
-setup.py PuPI setup project file
-"""
-__author__ = "Michael Montuori [michael.montuori@gmail.com]"
-__copyright__ = "Copyright 2017 Michael Montuori. All rights reserved."
-__credits__ = []
-__license__ = "GPLv3"
-__version__ = "1.0"
-__revision__ = "0"
+#!/usr/bin/env python3
+"""Compatibility shim for setuptools.
 
-import os
+Project metadata lives in pyproject.toml. Keeping this file lets legacy
+commands such as ``python3 setup.py sdist`` continue to work.
+"""
+
 from setuptools import setup
-from setuptools import find_packages
-import sprinkle
 
-with open('README.md', 'r') as fh:
-    long_description = fh.read()
 
-this = os.path.dirname(os.path.realpath(__file__))
-
-def read(name):
-    with open(os.path.join(this, name)) as f:
-        return f.read()
-
-setup(
-    name='sprinkle-py',
-    version=sprinkle.__version__+'.'+sprinkle.__revision__,
-    #packages=find_packages(exclude=['contrib', 'docs', 'tests']),
-    packages=['libsprinkle'],
-    install_requires=read('requirements.txt'),
-    url='https://gitlab.com/mmontuori/sprinkle',
-    license='GPLv3',
-    include_package_data=True,
-    author='mmontuori',
-    author_email='michael.montuori@gmail.com',
-    description='Sprinkle is a volume clustering utility based on [RClone](https://rclone.org).',
-    long_description=long_description,
-    keywords='sprinkle cloud backup restore',
-    zip_safe=True,
-    long_description_content_type="text/markdown",
-    classifiers=[
-        'Development Status :: 5 - Production/Stable',
-        'Intended Audience :: Developers',
-        'Natural Language :: English'
-    ],
-    scripts=['sprinkle.py']
-)
+setup()

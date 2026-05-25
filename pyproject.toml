@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sprinkle-py"
+version = "1.0.0"
+description = "Sprinkle is a volume clustering utility based on RClone."
+readme = "README.md"
+requires-python = ">=3.6"
+license = { text = "GPLv3" }
+authors = [
+    { name = "Michael Montuori", email = "michael.montuori@gmail.com" },
+]
+keywords = ["sprinkle", "cloud", "backup", "restore", "rclone"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Natural Language :: English",
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+]
+dependencies = [
+    "daemons>=1.3.0",
+    "filelock>=3.0.10",
+    "progress>=1.4",
+]
+
+[project.urls]
+Homepage = "https://gitlab.com/mmontuori/sprinkle"
+Source = "https://gitlab.com/mmontuori/sprinkle"
+
+[project.optional-dependencies]
+dev = [
+    "build>=1.0",
+    "pytest>=7.0",
+    "twine>=4.0",
+]
+
+[tool.setuptools]
+packages = ["libsprinkle"]
+py-modules = ["sprinkle"]
+script-files = ["sprinkle.py"]
+include-package-data = true
+zip-safe = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
