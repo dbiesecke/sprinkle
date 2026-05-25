@@ -71,7 +71,8 @@ class Config(object):
             logging.error("File " + self._config_file + " not found")
             raise Exception("File " + self._config_file + " not found")
         else:
-            config_str = '[' + self._CONFIG_MAIN_SECTION + ']\n' + open(self._config_file, 'r').read()
+            with open(self._config_file, 'r') as fp:
+                config_str = '[' + self._CONFIG_MAIN_SECTION + ']\n' + fp.read()
             try:
                 config_fp = StringIO.StringIO(config_str)
             except:
@@ -80,7 +81,10 @@ class Config(object):
                 self._conf_obj = ConfigParser.RawConfigParser()
             except:
                 self._conf_obj = configparser.RawConfigParser()
-            self._conf_obj.readfp(config_fp)
+            try:
+                self._conf_obj.read_file(config_fp)
+            except AttributeError:
+                self._conf_obj.readfp(config_fp)
 
     def get_config(self):
         retconf = {}

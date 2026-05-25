@@ -8,12 +8,34 @@ backup and recovery. Sprinkle uses the excellent [RClone](https://rclone.org) so
 
 * Docker Image [dbiesecke/sprinkle](https://hub.docker.com/r/dbiesecke/sprinkle)
   
-* load sa accounts from directory, random selection, gdrive_id option & with limiter
+* load sa accounts from directory with import, dedupe, gdrive_id option & limiter
 
 ```bash
 # will load 5 sa accounts from /etc/rclone/sa & root_folder it is set to "XXXXX" ( your public gdrive dir)
 
 $ docker run -i -v /etc/rclone:/etc/rclone:ro dbiesecke/sprinkle --rclone-sa-count 5 --drive-id XXXXX -d --rclone-sa-dir /etc/rclone/sa stats
+```
+
+* import, dedupe, validate, quarantine, and cache Google Drive service account quota data
+
+```bash
+$ ./sprinkle.py sa-import /etc/rclone/sa
+$ ./sprinkle.py --drive-id XXXXX sa-stats
+```
+
+`sa-import` validates new accounts with `rclone about --json` and prints per-file progress. If rclone returns an error or quota remains unknown, the account is recorded as invalid and quarantined by default.
+
+Sprinkle keeps upload placement capacity-aware for large files: service accounts are selected by known free space, with extra headroom for files of at least 1 GiB so a large movie is not sent to an account that only barely fits it.
+
+* create a home-directory configuration with interactive defaults
+
+```bash
+$ ./sprinkle.py config
+# writes ~/.sprinkle/sprinkle.conf, including:
+# --rclone-sa-count 5 --drive-id XXXXX -d --rclone-sa-dir /etc/rclone/sa
+# sa_cache_ttl_hours=72
+# sa_refresh=stale
+# sa_clean_invalid=quarantine
 ```
 
 
@@ -34,11 +56,13 @@ pip3 install sprinkle-py
 
 Or by cloning the repository to your running machine, but make sure prerequisites are met:
 ```
-git clone https://gitlab.com/mmontuori/sprinkle.git
+git clone https://gitlab.com/dbiesecke/sprinkle.git
 cd sprinkle
-./sprinkle.py -c sprinkle.conf ls /
+sprinkle.py config
+sprinkle.py sa-import /your/sa/accounts
+sprinkle.py sa-stats 
 ```
-A more comprehensive guide can be found [here](https://mmontuori.github.io/sprinkle/docs/guide)
+A more comprehensive guide can be found [here](https://dbiesecke.github.io/sprinkle/docs/guide)
 
 ## Prerequisites
 
@@ -101,6 +125,12 @@ and the command specific help.
     --rclone-sa-dir {dir}        build rclone config from service accounts
     --rclone-sa-count {num}      limit number of service accounts used
     --drive-id {id}              Google Drive folder ID for rclone config
+    --sa-db {file}               service account registry database
+    --sa-store {dir}             managed service account store
+    --sa-cache-ttl-hours {num}   hours before cached SA quota is stale (default:72)
+    --sa-refresh {mode}          SA quota refresh [missing|stale|all|none] (default:stale)
+    --sa-clean-invalid {mode}    invalid SA cleanup [none|quarantine|delete] (default:quarantine)
+    --sa-group-size {num}        preferred SA grouping size for generated operator configs
     --rclone-exe {rclone_exe}    rclone executable (default:rclone)
     --rclone-move                use 'rclone move' instead of 'rclone copy' (default:false)
     --restore-duplicates         restore files if duplicates are found (default:false)
@@ -115,7 +145,7 @@ and the command specific help.
 
 * **Michael Montuori** - *Head developer* - [mmontuori](https://gitlab.com/mmontuori)
 * **Daniel** - *Fork* [dbiesecke](https://gitlab.com/dbiesecke)
-
+#
 ## License
 
 This project is licensed under the GPLv3 License - see the
