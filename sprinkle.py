@@ -77,7 +77,7 @@ def usage_options():
     """
 OPTIONS:
     -c, --conf {config file}     configuration file
-    -d, --debug                  debug output
+    -d, --debug                  debug output (default:true)
     -h, --help                   help
     -v, --version                print version
     --check-prereq               chech prerequisites
@@ -110,7 +110,7 @@ OPTIONS:
     --retries {num_retries}      number of retries (default:1)
     --show-progress              show progress
     --single-instance            make sure only 1 concurrent instance of sprinkle is running (default:False)
-    --ls-stop-first             stop listing after first remote with files
+    --ls-stop-first              stop listing after first remote with files (default:true)
     """
     return
 
@@ -257,13 +257,17 @@ SYNOPSIS:
 
 DESCRIPTION:
     Backs up the local directory to the remote drives configured in rclone.
+    Hint: backup requires --drive-id <folder-id>. You can also pass
+    --rclone-sa-dir <path>; if omitted, Sprinkle uses the default managed
+    service-account store.
 
 ARGUMENTS:
     local dir
         the local directory to backup
 
 EXAMPLES:
-    sprinkle.py backup /backup
+    sprinkle.py --drive-id XXXXX backup /backup
+    sprinkle.py --drive-id XXXXX --rclone-sa-dir /etc/rclone/sa backup /backup
     """
     print(usage_backup.__doc__)
     print(usage_options.__doc__)
@@ -703,7 +707,7 @@ def configure(config_file):
     global __rclone_move
 
     _default_values = {
-        "debug": False,
+        "debug": True,
         "dry_run": False,
         "show_progress": False,
         "delete_files": False,
@@ -720,7 +724,7 @@ def configure(config_file):
         "rclone_sa_count": None,
         "log_file": None,
         "single_instance": False,
-        "ls_stop_first": False,
+        "ls_stop_first": True,
         "check_prereq": False,
         "daemon_type": 'interval',
         "daemon_mode": False,
@@ -935,11 +939,24 @@ def prepare_rclone_sa_config():
     global __rclone_conf
     rclone_sa_dir = __config.get('rclone_sa_dir')
     if rclone_sa_dir in (None, ''):
-        return
+        if len(__args) > 0 and __args[0] == 'backup':
+            rclone_sa_dir = service_accounts.DEFAULT_STORE_DIR
+            __config['rclone_sa_dir'] = rclone_sa_dir
+            common.print_line(
+                "backup hint: set --drive-id <folder-id>; --rclone-sa-dir is optional and defaults to "
+                + rclone_sa_dir
+            )
+        else:
+            return
     if __rclone_conf is not None and globals().get('__rclone_sa_dir') is None:
         return
     drive_id = __config.get('drive_id')
     if drive_id in (None, ''):
+        if len(__args) > 0 and __args[0] == 'backup':
+            raise Exception(
+                "backup requires --drive-id <folder-id>; optionally pass --rclone-sa-dir <path> "
+                "to override the default service-account store"
+            )
         raise Exception("--drive-id option or drive_id config value is required when using rclone_sa_dir")
     fd, tmp_conf = tempfile.mkstemp(prefix="rclone-", suffix=".conf")
     os.close(fd)
@@ -948,14 +965,24 @@ def prepare_rclone_sa_config():
         __config.get('sa_store'),
         __config.get('sa_cache_ttl_hours', service_accounts.DEFAULT_CACHE_TTL_HOURS),
     )
-    import_result = registry.import_paths(
-        [rclone_sa_dir],
-        __config.get('sa_clean_invalid', service_accounts.DEFAULT_CLEAN_INVALID),
-    )
-    if len(import_result.selected_files) == 0:
+    source_dir = os.path.abspath(os.path.expanduser(rclone_sa_dir))
+    managed_store_dir = os.path.abspath(os.path.expanduser(__config.get('sa_store')))
+    if source_dir == managed_store_dir:
+        selected_files = [
+            account['managed_path']
+            for account in registry.active_accounts()
+            if account['managed_path']
+        ]
+    else:
+        import_result = registry.import_paths(
+            [rclone_sa_dir],
+            __config.get('sa_clean_invalid', service_accounts.DEFAULT_CLEAN_INVALID),
+        )
+        selected_files = import_result.selected_files
+    if len(selected_files) == 0:
         raise Exception("no valid service accounts found in " + rclone_sa_dir)
     config_text, entries = rclone.generate_rclone_config_from_files(
-        import_result.selected_files,
+        selected_files,
         tmp_conf,
         drive_id,
         max_accounts=_optional_int(__config.get('rclone_sa_count')),
@@ -1141,6 +1168,7 @@ sa_cache_ttl_hours={sa_cache_ttl_hours}
 sa_refresh={sa_refresh}
 sa_clean_invalid={sa_clean_invalid}
 sa_group_size=50
+ls_stop_first=true
 
 # Large-file upload selection keeps enough headroom on small Google Drive accounts.
 # Defaults require an extra 512 MiB or 5%, whichever is larger, for files >= 1 GiB.

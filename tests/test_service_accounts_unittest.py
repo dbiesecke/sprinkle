@@ -361,6 +361,52 @@ class ServiceAccountCliTest(unittest.TestCase):
             self.assertIn(os.path.abspath(store), content)
             os.unlink(conf_path)
 
+    def test_backup_without_rclone_sa_dir_uses_default_service_account_store(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "source")
+            store = os.path.join(tmp, "store")
+            db_path = os.path.join(tmp, "sa.sqlite3")
+            os.mkdir(source)
+            os.mkdir(store)
+            default_store = service_accounts.DEFAULT_STORE_DIR
+            write_json(os.path.join(source, "source.json"), make_service_account("default@example.test"))
+            registry = service_accounts.ServiceAccountRegistry(db_path, store)
+            registry.import_paths([source])
+            messages = []
+            old_print_line = common.print_line
+
+            try:
+                common.print_line = lambda message="": messages.append(message)
+                service_accounts.DEFAULT_STORE_DIR = store
+                sprinkle.read_args([
+                    "--drive-id",
+                    "drive-id",
+                    "--sa-db",
+                    db_path,
+                    "--sa-store",
+                    store,
+                    "backup",
+                    "/tmp/local",
+                ])
+                sprinkle.configure(None)
+                sprinkle.prepare_rclone_sa_config()
+
+                self.assertEqual(getattr(sprinkle, "__config")["rclone_sa_dir"], store)
+                conf_path = getattr(sprinkle, "__rclone_conf")
+                self.assertTrue(os.path.exists(conf_path))
+                with open(conf_path) as fp:
+                    content = fp.read()
+                self.assertIn("service_account_file = ", content)
+                self.assertIn("root_folder_id = drive-id", content)
+                self.assertTrue(any("--drive-id" in message for message in messages))
+                self.assertTrue(any("--rclone-sa-dir" in message for message in messages))
+            finally:
+                common.print_line = old_print_line
+                service_accounts.DEFAULT_STORE_DIR = default_store
+                generated = getattr(sprinkle, "__rclone_conf", None)
+                if generated and os.path.exists(generated):
+                    os.unlink(generated)
+
     def test_config_command_writes_home_style_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:
             output = os.path.join(tmp, "sprinkle.conf")
@@ -382,6 +428,7 @@ class ServiceAccountCliTest(unittest.TestCase):
             self.assertIn("sa_cache_ttl_hours=72", content)
             self.assertIn("sa_refresh=stale", content)
             self.assertIn("sa_clean_invalid=quarantine", content)
+            self.assertIn("ls_stop_first=true", content)
             self.assertIn("large_file_threshold_bytes=1073741824", content)
 
     def test_config_command_defaults_to_home_sprinkle_config_path(self):
@@ -415,7 +462,6 @@ class ServiceAccountCliTest(unittest.TestCase):
             write_json(os.path.join(source, "two.json"), make_service_account("two@example.test", "key-two"))
             with open(config_path, "w") as fp:
                 fp.write("\n".join([
-                    "debug=true",
                     "rclone_move=true",
                     "delete_files=false",
                     "rclone_sa_count=1",
@@ -433,6 +479,7 @@ class ServiceAccountCliTest(unittest.TestCase):
                 content = fp.read()
 
             self.assertTrue(getattr(sprinkle, "__config")["debug"])
+            self.assertTrue(getattr(sprinkle, "__config")["ls_stop_first"])
             self.assertFalse(getattr(sprinkle, "__config")["delete_files"])
             self.assertEqual(content.count("[dst"), 1)
             self.assertIn("root_folder_id = drive-id", content)
