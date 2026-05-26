@@ -421,39 +421,66 @@ class ClSync:
         return clfiles
 
     def compare_clfiles(self, local_dir, local_clfiles, remote_clfiles, delete_file=True):
+        remote_root = self.get_backup_remote_root(local_dir)
+        return self.compare_clfiles_for_remote_root(
+            local_dir,
+            local_clfiles,
+            remote_clfiles,
+            delete_file,
+            remote_root,
+        )
+
+    def compare_clfiles_for_remote_root(
+            self,
+            local_dir,
+            local_clfiles,
+            remote_clfiles,
+            delete_file=True,
+            remote_root=None):
         common.print_line('calculating differences...')
         logging.debug('comparing clfiles')
         logging.debug('local directory: ' + local_dir)
         logging.debug('local clfiles size: ' + str(len(local_clfiles)))
         logging.debug('remote clfiles size: ' + str(len(remote_clfiles)))
-        remote_dir = os.path.dirname(local_dir)
+        if remote_root is None:
+            remote_root = self.get_backup_remote_root(local_dir)
+        local_remote_keys = {}
+        for local_path in local_clfiles:
+            local_clfile = local_clfiles[local_path]
+            full_path = local_clfile.path + '/' + local_clfile.name
+            remote_key = self.remote_key_for_local_path(local_dir, full_path, remote_root)
+            local_remote_keys[remote_key] = local_clfile
         operations = []
         for local_path in local_clfiles:
             local_clfile = local_clfiles[local_path]
             if local_clfile.is_dir:
                 continue
             logging.debug('checking local clfile: ' + local_path + " name: " + local_clfile.name)
-            rel_name = common.remove_localdir(local_dir, local_clfile.path+'/'+local_clfile.name)
-            rel_path = common.remove_localdir(local_dir, local_clfile.path)
-            logging.debug('relative name: ' + rel_name)
-            if rel_name not in remote_clfiles:
+            remote_name = self.remote_key_for_local_path(
+                local_dir,
+                local_clfile.path + '/' + local_clfile.name,
+                remote_root,
+            )
+            remote_path = os.path.dirname(remote_name).replace('\\', '/')
+            logging.debug('remote name: ' + remote_name)
+            if remote_name not in remote_clfiles:
                 logging.debug('not found in remote_clfiles')
-                local_clfile.remote_path = rel_path
+                local_clfile.remote_path = remote_path
                 op = operation.Operation(operation.Operation.ADD,
                                          local_clfile, None)
                 operations.append(op)
             else:
                 logging.debug('file found in remote_clfiles')
-                remote_clfile = remote_clfiles[rel_name]
+                remote_clfile = remote_clfiles[remote_name]
                 if self._compare_method == 'size':
                     size_local = local_clfile.size
                     size_remote = remote_clfile.size
-                    current_remote = remote_clfiles[rel_name].remote
+                    current_remote = remote_clfiles[remote_name].remote
                     logging.debug('local_file.size:' + str(local_clfile.size) +
                                   ', remote_clfile.size:' + str(remote_clfile.size))
                     if size_local != size_remote:
                         logging.debug('file has changed')
-                        local_clfile.remote_path = rel_path
+                        local_clfile.remote_path = remote_path
                         local_clfile.remote = current_remote
                         op = operation.Operation(operation.Operation.UPDATE,
                                                  local_clfile, None)
@@ -461,12 +488,12 @@ class ClSync:
                 elif self._compare_method == 'md5':
                     local_md5 = local_clfile.md5
                     remote_md5 = remote_clfile.md5
-                    current_remote = remote_clfiles[rel_name].remote
+                    current_remote = remote_clfiles[remote_name].remote
                     logging.debug('local_file.md5:' + str(local_md5) +
                                   ', remote_clfile.md5:' + str(remote_md5))
                     if local_md5 != remote_md5:
                         logging.debug('file has changed')
-                        local_clfile.remote_path = rel_path
+                        local_clfile.remote_path = remote_path
                         local_clfile.remote = current_remote
                         op = operation.Operation(operation.Operation.UPDATE,
                                                  local_clfile, None)
@@ -479,13 +506,10 @@ class ClSync:
             reverse_keys = common.sort_dict_keys(remote_clfiles, True)
             for remote_path in reverse_keys:
                 remote_clfile = remote_clfiles[remote_path]
-                logging.debug('checking file ' + remote_dir+remote_path + ' for deletion')
-                rel_name = common.remove_localdir(local_dir, remote_clfile.path + '/' + remote_clfile.name)
-                rel_path = common.remove_localdir(local_dir, remote_clfile.path)
-                logging.debug('relative name: ' + rel_name)
-                if remote_dir+remote_path not in local_clfiles:
+                logging.debug('checking file ' + remote_path + ' for deletion')
+                if remote_path not in local_remote_keys:
                     logging.debug('file ' + remote_path + ' has been deleted')
-                    remote_clfile.remote_path = rel_path
+                    remote_clfile.remote_path = os.path.dirname(remote_path).replace('\\', '/')
                     op = operation.Operation(operation.Operation.REMOVE,
                                              remote_clfile, None)
                     operations.append(op)
@@ -497,9 +521,17 @@ class ClSync:
         if not common.is_dir(local_dir):
             logging.error("local directory " + local_dir + " not found. Cannot continue!")
             raise Exception("Local directory " + local_dir + " not found")
+        remote_root = self.get_backup_remote_root(local_dir)
+        logging.debug('backup remote root: ' + remote_root)
         local_clfiles = self.index_local_dir(local_dir, self.__exclusion_list)
-        remote_clfiles = self.ls(os.path.basename(local_dir))
-        ops = self.compare_clfiles(local_dir, local_clfiles, remote_clfiles, delete_files)
+        remote_clfiles = self.ls(remote_root)
+        ops = self.compare_clfiles_for_remote_root(
+            local_dir,
+            local_clfiles,
+            remote_clfiles,
+            delete_files,
+            remote_root,
+        )
         if self._show_progress:
             bar = Bar('Progress', max=len(ops), suffix='%(index)d/%(max)d %(percent)d%% [%(elapsed_td)s/%(eta_td)s]')
         if dry_run is True:
@@ -546,6 +578,24 @@ class ClSync:
                 bar.next()
         if self._show_progress:
             bar.finish()
+
+    def get_backup_remote_root(self, local_dir):
+        abs_local_dir = os.path.realpath(local_dir).replace('\\', '/')
+        abs_cwd = os.path.realpath(os.getcwd()).replace('\\', '/')
+        rel_path = os.path.relpath(abs_local_dir, abs_cwd).replace('\\', '/')
+        if rel_path == '.':
+            rel_path = os.path.basename(abs_local_dir)
+        if rel_path.startswith('../') or rel_path == '..' or os.path.isabs(rel_path):
+            rel_path = os.path.basename(abs_local_dir)
+        return '/' + rel_path.strip('/')
+
+    def remote_key_for_local_path(self, local_dir, path, remote_root=None):
+        if remote_root is None:
+            remote_root = self.get_backup_remote_root(local_dir)
+        rel_path = os.path.relpath(os.path.realpath(path), os.path.realpath(local_dir)).replace('\\', '/')
+        if rel_path == '.':
+            return remote_root
+        return common.normalize_path(remote_root.rstrip('/') + '/' + rel_path)
 
     def restore_old(self, remote_path, local_dir):
         logging.debug('restoring directory ' + local_dir + ' from ' + remote_path)

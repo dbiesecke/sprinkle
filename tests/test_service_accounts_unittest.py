@@ -281,6 +281,35 @@ class RCloneQuotaTest(unittest.TestCase):
 
 
 class ClSyncPlacementTest(unittest.TestCase):
+    def test_backup_preserves_cwd_relative_directory_in_remote_destination(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            movie_dir = os.path.join(tmp, "Movies", "Aladin")
+            os.makedirs(movie_dir)
+            local_file = os.path.join(movie_dir, "movie.mkv")
+            with open(local_file, "w") as fp:
+                fp.write("synthetic movie")
+            old_cwd = os.getcwd()
+            sync = clsync.ClSync.__new__(clsync.ClSync)
+            sync._show_progress = False
+            sync._compare_method = "size"
+            sync._ClSync__exclusion_list = None
+            sync._ClSync__exclude_regex = None
+            sync.get_best_remote = lambda _size: "dst109:"
+            sync.mark_remote_used = lambda _remote, _size: None
+            listed_paths = []
+            copies = []
+            sync.ls = lambda path: listed_paths.append(path) or {}
+            sync.copy = lambda src, dst, remote: copies.append((src, dst, remote))
+
+            try:
+                os.chdir(tmp)
+                sync.backup(movie_dir, delete_files=False, dry_run=False)
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(listed_paths, ["/Movies/Aladin"])
+            self.assertEqual(copies, [(local_file, "/Movies/Aladin", "dst109:")])
+
     def test_large_file_selection_requires_headroom(self):
         sync = clsync.ClSync.__new__(clsync.ClSync)
         sync._distribution_type = "mas"
