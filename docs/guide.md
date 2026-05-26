@@ -126,6 +126,29 @@ As long as RClone is configured correctly with volumes, Sprinkle works out of th
 Sprinkle can be configured by editing the file sprinkle.conf. The file that ships with sprinkle
 has all default values assigned which work for most installations, however, it's possible that
 values have to be tweaked for specific installations. All values in sprinkle.conf are commented.
+The recommended way to create a local configuration is the interactive config command. By default it
+writes to `~/.sprinkle/sprinkle.conf`.
+
+##### interactive configuration:
+```
+$ python3 sprinkle.py config
+rclone_move: move files instead of copying them [Y/n]: Y
+delete_files: delete files after 1-way sync [y/N]:
+debug output (-d) [Y/n]:
+rclone_sa_count [5]:
+drive_id [XXXXX]: GDRIVE_FOLDER_ID
+rclone_sa_dir [/etc/rclone/sa]:
+sa_cache_ttl_hours [72]:
+sa_refresh {missing|stale|all|none} [stale]:
+sa_clean_invalid {none|quarantine|delete} [quarantine]:
+```
+
+The generated config can also store defaults equivalent to:
+
+```
+--rclone-sa-count 5 --drive-id GDRIVE_FOLDER_ID -d --rclone-sa-dir /etc/rclone/sa
+```
+
 For example, the **debug** value
 ##### sprinkle.conf debug value:
 ```
@@ -142,12 +165,58 @@ debug=true
 This modification will set the debug value to true and output additional information that can be
 used for development or troubleshooting.
 
+### Configure Google Drive Service Accounts
+Sprinkle can import Google Drive service-account JSON files into a managed local store, dedupe them,
+validate them with `rclone about --json`, and cache quota data in SQLite. Service-account JSON files
+contain secrets, so do not commit or paste raw `private_key` values.
+
+##### import service accounts:
+```
+$ python3 sprinkle.py sa-import /path/to/service-accounts
+service account import: found 46 json files
+service account import [1/46] imported: sa-77757096d8ee3b33cf290d6a.json
+service account import [2/46] imported: sa-774a8b4465f01f42f1e45016.json
+...
+service account import complete
+scanned:      46
+validated:    46
+imported:     46
+duplicates:   0
+invalid:      0
+validation errors: 0
+quarantined:  0
+deleted:      0
+store:        /home/user/.sprinkle/service-accounts
+database:     /home/user/.sprinkle/sa-cache.sqlite3
+```
+
+Invalid JSON files, rejected service accounts, missing projects/users, and unknown quota results are
+recorded as invalid. With the default `sa_clean_invalid=quarantine`, the affected JSON file is copied
+to the managed quarantine directory instead of being deleted from the source path.
+
+##### inspect imported accounts and cached quota:
+```
+$ python3 sprinkle.py --drive-id GDRIVE_FOLDER_ID sa-stats
+SERVICE ACCOUNT SUMMARY
+active:      46
+duplicates:  0
+invalid:     0
+refreshed:   0
+errors:      0
+stale:       0
+unknown:     0
+```
+
+Most Google Drive service accounts are effectively small 10-15 GB quotas. Sprinkle therefore uses the
+cached quota data for placement and keeps extra headroom for large files so uploads are not sent to an
+account that only barely fits the file.
+
 ## Verify
 ### Verify Sprinkle->RClone->Volumes Connections
 To verify proper Sprinkle operation, use any commands, like the stats command:
 ##### for Windows:
 ```
-C:\>python sprinkle.py --version
+C:\>python sprinkle.py stats
 calculating total and free space...
 REMOTE                          SIZE                 FREE      %FREE
 =============== ==================== ==================== ==========
@@ -239,11 +308,14 @@ DESCRIPTION:
     Sprinkle uses the excellent [RClone](https://rclone.org) software for cloud volume access.
 
 EXAMPLES:
+    sprinkle.py config
     sprinkle.py ls /backup
     sprinkle.py backup /dir_to_backup
     sprinkle.py restore /backup /opt/restore_dir
     sprinkle.py stats
     sprinkle.py -c /home/sprinkle/sprinkle.conf ls /backup
+    sprinkle.py sa-import /path/to/service-accounts
+    sprinkle.py --drive-id GDRIVE_FOLDER_ID sa-stats
 ...
 ...
 ```
@@ -262,11 +334,14 @@ DESCRIPTION:
     Sprinkle uses the excellent [RClone](https://rclone.org) software for cloud volume access.
 
 EXAMPLES:
+    sprinkle.py config
     sprinkle.py ls /backup
     sprinkle.py backup /dir_to_backup
     sprinkle.py restore /backup /opt/restore_dir
     sprinkle.py stats
     sprinkle.py -c /home/sprinkle/sprinkle.conf ls /backup
+    sprinkle.py sa-import /path/to/service-accounts
+    sprinkle.py --drive-id GDRIVE_FOLDER_ID sa-stats
 ...
 ...
 ```
@@ -282,4 +357,3 @@ We use [SemVer](http://semver.org/) for versioning. For the versions available, 
 
 ## License
 This project is licensed under the GPLv3 License - see the [LICENSE.md](https://github.com/mmontuori/sprinkle/LICENSE) file for details
-
