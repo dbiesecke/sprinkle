@@ -222,6 +222,45 @@ class RCloneQuotaTest(unittest.TestCase):
         self.assertIn("credentials rejected", friendly)
         self.assertIn("one@example.test", friendly)
 
+    def test_lsjson_ignores_rclone_progress_output(self):
+        old_execute = common.execute
+
+        def fake_execute(_command, no_error=False):
+            return {
+                "code": 0,
+                "out": "[\n]\nTransferred:   \t          0 B / 0 B, -, 0 B/s, ETA -\nElapsed time:         1.7s\n",
+                "error": "",
+            }
+
+        try:
+            common.execute = fake_execute
+            rc = rclone.RClone()
+            out = rc.lsjson("dst101:", "/Movies/Aladin", ["--fast-list"], True)
+        finally:
+            common.execute = old_execute
+
+        self.assertEqual(json.loads(out), [])
+
+    def test_about_json_ignores_rclone_progress_output(self):
+        old_execute = common.execute
+
+        def fake_execute(_command, no_error=False):
+            return {
+                "code": 0,
+                "out": '{"total": 100, "free": 75}\nTransferred:   \t0 B / 0 B, -, 0 B/s, ETA -\n',
+                "error": "",
+            }
+
+        try:
+            common.execute = fake_execute
+            rc = rclone.RClone()
+            quota, error = rc.get_about_json_with_error("dst101:")
+        finally:
+            common.execute = old_execute
+
+        self.assertIsNone(error)
+        self.assertEqual(quota["free"], 75)
+
     def test_unknown_quota_reason_requires_total_and_free(self):
         self.assertIn("missing total,free", sprinkle._quota_unknown_reason({"used": 1}))
         self.assertIsNone(sprinkle._quota_unknown_reason({"total": 100, "free": 0}))
@@ -494,6 +533,8 @@ class ClSyncPlacementTest(unittest.TestCase):
                     store,
                     "--sa-refresh",
                     "all",
+                    "--rclone-env-file",
+                    os.path.join(tmp, "rclone.env"),
                     "sa-stats",
                 ])
                 sprinkle.configure(None)
@@ -585,6 +626,127 @@ class ClSyncPlacementTest(unittest.TestCase):
 
 
 class ServiceAccountCliTest(unittest.TestCase):
+    def test_rclone_env_file_rolls_out_and_loads_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = os.path.join(tmp, "rclone.env")
+            keys = [key for key, _value in sprinkle.DEFAULT_RCLONE_ENV_VALUES]
+            old_env = dict((key, os.environ.get(key)) for key in keys)
+            try:
+                for key in keys:
+                    os.environ.pop(key, None)
+
+                loaded = sprinkle.apply_rclone_env_file(env_path)
+
+                self.assertTrue(os.path.exists(env_path))
+                with open(env_path) as fp:
+                    content = fp.read()
+                self.assertIn("# Lines whose first non-space character is # are ignored.", content)
+                self.assertEqual(loaded["RCLONE_DRIVE_CHUNK_SIZE"], "256M")
+                self.assertEqual(os.environ["RCLONE_SIZE_ONLY"], "1")
+                self.assertEqual(os.environ["RCLONE_NO_UPDATE_MODTIME"], "1")
+            finally:
+                for key, value in old_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+
+    def test_rclone_env_file_ignores_comments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = os.path.join(tmp, "rclone.env")
+            with open(env_path, "w") as fp:
+                fp.write("\n".join([
+                    "# RCLONE_SIZE_ONLY=0",
+                    "  # RCLONE_NO_UPDATE_MODTIME=0",
+                    "RCLONE_DRIVE_CHUNK_SIZE=512M",
+                    "RCLONE_EXTRA=value=with=equals",
+                    "",
+                ]))
+            keys = [
+                "RCLONE_SIZE_ONLY",
+                "RCLONE_NO_UPDATE_MODTIME",
+                "RCLONE_DRIVE_CHUNK_SIZE",
+                "RCLONE_EXTRA",
+            ]
+            old_env = dict((key, os.environ.get(key)) for key in keys)
+            try:
+                for key in keys:
+                    os.environ.pop(key, None)
+
+                loaded = sprinkle.apply_rclone_env_file(env_path)
+
+                self.assertNotIn("RCLONE_SIZE_ONLY", loaded)
+                self.assertNotIn("RCLONE_NO_UPDATE_MODTIME", loaded)
+                self.assertEqual(os.environ["RCLONE_DRIVE_CHUNK_SIZE"], "512M")
+                self.assertEqual(os.environ["RCLONE_EXTRA"], "value=with=equals")
+            finally:
+                for key, value in old_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+
+    def test_configure_rolls_out_default_rclone_env_file(self):
+        old_home = os.environ.get("HOME")
+        keys = [key for key, _value in sprinkle.DEFAULT_RCLONE_ENV_VALUES]
+        old_env = dict((key, os.environ.get(key)) for key in keys)
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                os.environ["HOME"] = tmp
+                for key in keys:
+                    os.environ.pop(key, None)
+
+                sprinkle.read_args(["stats"])
+                sprinkle.configure(None)
+
+                env_path = os.path.join(tmp, ".sprinkle", "rclone.env")
+                self.assertTrue(os.path.exists(env_path))
+                self.assertEqual(os.environ["RCLONE_DRIVE_CHUNK_SIZE"], "256M")
+                self.assertEqual(getattr(sprinkle, "__config")["rclone_env_file"], env_path)
+            finally:
+                if old_home is None:
+                    os.environ.pop("HOME", None)
+                else:
+                    os.environ["HOME"] = old_home
+                for key, value in old_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+
+    def test_dash_v_sets_rclone_verbose(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_verbose = os.environ.get("RCLONE_VERBOSE")
+            try:
+                os.environ.pop("RCLONE_VERBOSE", None)
+                sprinkle.read_args([
+                    "-v",
+                    "--rclone-env-file",
+                    os.path.join(tmp, "rclone.env"),
+                    "stats",
+                ])
+                sprinkle.configure(None)
+
+                self.assertEqual(os.environ["RCLONE_VERBOSE"], "1")
+            finally:
+                if old_verbose is None:
+                    os.environ.pop("RCLONE_VERBOSE", None)
+                else:
+                    os.environ["RCLONE_VERBOSE"] = old_verbose
+
+    def test_progress_option_sets_show_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sprinkle.read_args([
+                "--progress",
+                "--rclone-env-file",
+                os.path.join(tmp, "rclone.env"),
+                "backup",
+                "/tmp/local",
+            ])
+            sprinkle.configure(None)
+
+            self.assertTrue(getattr(sprinkle, "__config")["show_progress"])
+
     def test_rclone_sa_dir_imports_deduped_managed_accounts(self):
         with tempfile.TemporaryDirectory() as tmp:
             source = os.path.join(tmp, "source")
@@ -602,6 +764,8 @@ class ServiceAccountCliTest(unittest.TestCase):
                 "1",
                 "--drive-id",
                 "drive-id",
+                "--rclone-env-file",
+                os.path.join(tmp, "rclone.env"),
                 "--sa-db",
                 db_path,
                 "--sa-store",
@@ -639,6 +803,8 @@ class ServiceAccountCliTest(unittest.TestCase):
                 sprinkle.read_args([
                     "--drive-id",
                     "drive-id",
+                    "--rclone-env-file",
+                    os.path.join(tmp, "rclone.env"),
                     "--sa-db",
                     db_path,
                     "--sa-store",
@@ -687,6 +853,7 @@ class ServiceAccountCliTest(unittest.TestCase):
             self.assertIn("sa_refresh=stale", content)
             self.assertIn("sa_clean_invalid=quarantine", content)
             self.assertIn("ls_stop_first=true", content)
+            self.assertIn("rclone_env_file=~/.sprinkle/rclone.env", content)
             self.assertIn("large_file_threshold_bytes=1073741824", content)
 
     def test_config_command_defaults_to_home_sprinkle_config_path(self):
@@ -702,6 +869,7 @@ class ServiceAccountCliTest(unittest.TestCase):
                 target = sprinkle.config_command(prompt)
                 self.assertEqual(target, os.path.join(tmp, ".sprinkle", "sprinkle.conf"))
                 self.assertTrue(os.path.exists(target))
+                self.assertTrue(os.path.exists(os.path.join(tmp, ".sprinkle", "rclone.env")))
             finally:
                 if old_home is None:
                     os.environ.pop("HOME", None)
@@ -725,6 +893,7 @@ class ServiceAccountCliTest(unittest.TestCase):
                     "rclone_sa_count=1",
                     "drive_id=drive-id",
                     "rclone_sa_dir=" + source,
+                    "rclone_env_file=" + os.path.join(tmp, "rclone.env"),
                     "sa_db=" + db_path,
                     "sa_store=" + store,
                 ]))
