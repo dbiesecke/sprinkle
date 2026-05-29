@@ -21,6 +21,8 @@ $ docker run -i -v /etc/rclone:/etc/rclone:ro dbiesecke/sprinkle --rclone-sa-cou
 ```bash
 $ ./sprinkle.py sa-import /etc/rclone/sa
 $ ./sprinkle.py --drive-id XXXXX sa-stats
+$ ./sprinkle/sprinkle.py -d --drive-id YouDriveID backup /Users/user/workspace/Movies/Aladin
+
 ```
 
 `sa-import` validates new accounts with `rclone about --json` and prints per-file progress. If rclone returns an error or quota remains unknown, the account is recorded as invalid and quarantined by default.
@@ -56,7 +58,7 @@ Features:
 
 The easiest way to install Sprinkle and all prerequisites is via PyPI with:
 ```
-pip3 install sprinkle-py
+pip3 install git https://gitlab.com/dbiesecke/sprinkle.git
 ```
 
 Or by cloning the repository to your running machine, but make sure prerequisites are met:
@@ -65,7 +67,8 @@ git clone https://gitlab.com/dbiesecke/sprinkle.git
 cd sprinkle
 sprinkle.py config
 sprinkle.py sa-import /your/sa/accounts
-sprinkle.py sa-stats 
+sprinkle.py sa-stats
+sprinkle.py -d --drive-id YourDrive backup Movies/Aladin  
 ```
 A more comprehensive guide can be found [here](https://dbiesecke.github.io/sprinkle/docs/guide)
 
@@ -109,7 +112,7 @@ and the command specific help.
 
 ```
     -c, --conf {config file}     configuration file
-    -d, --debug                  debug output
+    -d, --debug                  debug output (default:true)
     -h, --help                   help
     -v, --verbose                set RCLONE_VERBOSE=1 for rclone
     --version                    print version
@@ -144,7 +147,7 @@ and the command specific help.
     --retries {num_retries}      number of retries (default:1)
     --progress                   show progress
     --single-instance            make sure only 1 concurrent instance of sprinkle is running (default:False)
-    --ls-stop-first             stop listing after first remote with files
+    --ls-stop-first              stop listing after first remote with files (default:true)
     
 ```
 
@@ -158,6 +161,3 @@ and the command specific help.
 This project is licensed under the GPLv3 License - see the
 [LICENSE](https://www.gnu.org/licenses/gpl-3.0.en.html) file for details
 
-## Acknowledgments
-
-* Warren Crigger for development support
