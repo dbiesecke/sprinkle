@@ -33,10 +33,15 @@ Sprinkle keeps upload placement capacity-aware for large files: service accounts
 $ ./sprinkle.py config
 # writes ~/.sprinkle/sprinkle.conf, including:
 # --rclone-sa-count 5 --drive-id XXXXX -d --rclone-sa-dir /etc/rclone/sa
+# rclone_env_file=~/.sprinkle/rclone.env
 # sa_cache_ttl_hours=72
 # sa_refresh=stale
 # sa_clean_invalid=quarantine
 ```
+
+`~/.sprinkle/rclone.env` is created on first use and exports rclone tuning defaults
+such as `RCLONE_DRIVE_CHUNK_SIZE=256M`, `RCLONE_SIZE_ONLY=1`, and
+`RCLONE_NO_UPDATE_MODTIME=1`. Lines beginning with `#` are ignored.
 
 
 
@@ -106,7 +111,8 @@ and the command specific help.
     -c, --conf {config file}     configuration file
     -d, --debug                  debug output
     -h, --help                   help
-    -v, --version                print version
+    -v, --verbose                set RCLONE_VERBOSE=1 for rclone
+    --version                    print version
     --check-prereq               chech prerequisites
     --comp-method {size|md5}     compare method [size|md5] (default:size)
     --daemon-interval            interval for the daemon to execute in minutes (default:60)
@@ -122,6 +128,7 @@ and the command specific help.
     --log-file {file}            logs output to the specified file
     --no-cache                   turn off caching
     --rclone-conf {config file}  rclone configuration (default:None)
+    --rclone-env-file {file}     file with environment variables for rclone
     --rclone-sa-dir {dir}        build rclone config from service accounts
     --rclone-sa-count {num}      limit number of service accounts used
     --drive-id {id}              Google Drive folder ID for rclone config
@@ -135,7 +142,7 @@ and the command specific help.
     --rclone-move                use 'rclone move' instead of 'rclone copy' (default:false)
     --restore-duplicates         restore files if duplicates are found (default:false)
     --retries {num_retries}      number of retries (default:1)
-    --show-progress              show progress
+    --progress                   show progress
     --single-instance            make sure only 1 concurrent instance of sprinkle is running (default:False)
     --ls-stop-first             stop listing after first remote with files
     

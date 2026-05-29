@@ -6,7 +6,7 @@ __author__ = "Michael Montuori [michael.montuori@gmail.com]"
 __copyright__ = "Copyright 2017 Michael Montuori. All rights reserved."
 __credits__ = ["Warren Crigger"]
 __license__ = "GPLv3"
-__version__ = "1.0"
+__version__ = "1.1"
 __revision__ = "0"
 
 import logging
@@ -96,8 +96,8 @@ class ClSync:
         else:
             self.__exclude_regex = None
 
-        self._cache = None
-        self._cache_counter = 0
+        self._cache = {}
+        self._cache_counter = {}
         self._cache_invalidation_max = 1440 / (config['daemon_interval'] * 2)
         if self._cache_invalidation_max < 1:
             self._cache_invalidation_max = 1
@@ -129,19 +129,26 @@ class ClSync:
             self._rclone.mkdir(remote, directory)
 
     def ls(self, file, with_dups=False, regex=None, stop_after_first=None):
+        return self._ls(file, with_dups, regex, stop_after_first, recursive=True)
+
+    def ls_shallow(self, file, with_dups=False, regex=None, stop_after_first=None):
+        return self._ls(file, with_dups, regex, stop_after_first, recursive=False)
+
+    def _ls(self, file, with_dups=False, regex=None, stop_after_first=None, recursive=True):
         logging.debug('lsjson of file: ' + file)
         if stop_after_first is None:
             stop_after_first=self._config['ls_stop_first']
-        if self._config['no_cache'] is False and self._cache is not None:
-            logging.debug('serving cached version of file list...')
-            self._cache_counter += 1
-            if self._cache_counter <= self._cache_invalidation_max:
-                return self._cache
-            else:
-                self._cache_counter = 0
         if not file.startswith('/'):
             logging.debug('adding / ' + file)
             file = '/' + file
+        memory_cache_key = (file, with_dups, regex, stop_after_first, recursive)
+        if self._config['no_cache'] is False and memory_cache_key in self._cache:
+            logging.debug('serving cached version of file list...')
+            self._cache_counter[memory_cache_key] += 1
+            if self._cache_counter[memory_cache_key] <= self._cache_invalidation_max:
+                return self._cache[memory_cache_key]
+            else:
+                self._cache_counter[memory_cache_key] = 0
         if regex is not None:
             regexp = re.compile(regex)
         else:
@@ -153,10 +160,7 @@ class ClSync:
         for remote in self.get_remotes():
             common.print_line('retrieving file list from: ' + remote + file + '...')
             logging.debug('getting lsjson from ' + remote + file)
-            try:
-                json_out = self._rclone.lsjson(remote, file, ['--recursive', '--fast-list'], True)
-            except exceptions.FileNotFoundException as e:
-                json_out = '[]'
+            json_out = self._cached_lsjson(remote, file, recursive)
             logging.debug('loading json')
             tmp_json = json.loads(json_out)
             logging.debug('json size: ' + str(len(tmp_json)))
@@ -181,11 +185,97 @@ class ClSync:
                     key = key + ClSync.duplicate_suffix
                 files[key] = tmp_file
                 if stop_after_first and len(files) > 0:
+                    self._store_memory_ls_cache(memory_cache_key, files)
                     return files
+            if stop_after_first and self._stop_after_first_success():
+                self._store_memory_ls_cache(memory_cache_key, files)
+                return files
             logging.debug('end of clsync.ls()')
-        if self._config['no_cache'] is False and self._cache is None:
-            self._cache = files
+        self._store_memory_ls_cache(memory_cache_key, files)
         return files
+
+    def _cached_lsjson(self, remote, path, recursive=True):
+        if self._config['no_cache'] is False and self._sa_registry is not None:
+            cached = self._sa_registry.ls_cache_by_remote(remote, path)
+            if cached is not None and not self._sa_registry.should_refresh_ls_cache(cached, self._sa_refresh):
+                logging.debug('serving cached lsjson for ' + remote + path)
+                return self._json_for_listing_depth(cached["json_text"], recursive)
+            if cached is not None and self._sa_refresh == 'none':
+                logging.debug('serving cached lsjson for ' + remote + path)
+                return self._json_for_listing_depth(cached["json_text"], recursive)
+            parent_json = self._json_from_cached_parent(remote, path, recursive)
+            if parent_json is not None:
+                logging.debug('serving parent cached lsjson for ' + remote + path)
+                return parent_json
+        extra_args = ['--fast-list']
+        if recursive:
+            extra_args.insert(0, '--recursive')
+        try:
+            json_out = self._rclone.lsjson(remote, path, extra_args, True)
+        except exceptions.FileNotFoundException as e:
+            json_out = '[]'
+        except Exception as e:
+            if self._config['no_cache'] is False and self._sa_registry is not None:
+                self._sa_registry.update_ls_cache_for_remote(remote, path, None, str(e))
+            raise
+        if recursive and self._config['no_cache'] is False and self._sa_registry is not None:
+            self._sa_registry.update_ls_cache_for_remote(remote, path, json_out, None)
+        return json_out
+
+    def _json_from_cached_parent(self, remote, path, recursive=True):
+        if path == '/':
+            return None
+        root_cache = self._sa_registry.ls_cache_by_remote(remote, '/')
+        if root_cache is None:
+            return None
+        if self._sa_registry.should_refresh_ls_cache(root_cache, self._sa_refresh):
+            return None
+        prefix = path.strip('/')
+        try:
+            rows = json.loads(root_cache["json_text"])
+        except Exception:
+            return None
+        filtered = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            row_path = row.get("Path", "")
+            if row_path == prefix:
+                continue
+            if not row_path.startswith(prefix + '/'):
+                continue
+            copied = dict(row)
+            copied["Path"] = row_path[len(prefix) + 1:]
+            if not recursive and '/' in copied["Path"]:
+                continue
+            filtered.append(copied)
+        return json.dumps(filtered)
+
+    def _json_for_listing_depth(self, json_text, recursive=True):
+        if recursive:
+            return json_text
+        try:
+            rows = json.loads(json_text)
+        except Exception:
+            return json_text
+        if not isinstance(rows, list):
+            return json_text
+        filtered = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if '/' in row.get("Path", ""):
+                continue
+            filtered.append(row)
+        return json.dumps(filtered)
+
+    def _stop_after_first_success(self):
+        return self._config.get('drive_id') not in (None, '')
+
+    def _store_memory_ls_cache(self, cache_key, files):
+        if self._config['no_cache'] is False:
+            self._cache[cache_key] = files
+            self._cache_counter[cache_key] = 0
 
     def lsmd5(self, file, stop_after_first=False):
         logging.debug('lsjson of file: ' + file)
@@ -331,6 +421,8 @@ class ClSync:
                 self._frees[remote] = max(0, self._frees[remote] - int(size))
         if self._sa_registry is not None:
             self._sa_registry.adjust_quota_for_remote(remote, int(size))
+            self._sa_registry.invalidate_ls_cache_for_remote(remote)
+        self._clear_memory_ls_cache()
 
     def _get_remote_quota(self, remote):
         cached = None
@@ -516,6 +608,30 @@ class ClSync:
         common.print_line('found ' + str(len(operations)) + ' differences')
         return operations
 
+    def ls_matching_local_files(self, local_dir, local_clfiles, remote_root=None):
+        if remote_root is None:
+            remote_root = self.get_backup_remote_root(local_dir)
+        wanted_by_parent = {}
+        for local_path in local_clfiles:
+            local_clfile = local_clfiles[local_path]
+            if local_clfile.is_dir:
+                continue
+            remote_key = self.remote_key_for_local_path(
+                local_dir,
+                local_clfile.path + '/' + local_clfile.name,
+                remote_root,
+            )
+            remote_parent = os.path.dirname(remote_key).replace('\\', '/')
+            wanted_by_parent.setdefault(remote_parent, set()).add(remote_key)
+
+        remote_clfiles = {}
+        for remote_parent in sorted(wanted_by_parent):
+            parent_files = self.ls_shallow(remote_parent)
+            for remote_key in wanted_by_parent[remote_parent]:
+                if remote_key in parent_files:
+                    remote_clfiles[remote_key] = parent_files[remote_key]
+        return remote_clfiles
+
     def backup(self, local_dir, delete_files=True, dry_run=False):
         logging.debug('backing up directory ' + local_dir)
         if not common.is_dir(local_dir):
@@ -524,7 +640,10 @@ class ClSync:
         remote_root = self.get_backup_remote_root(local_dir)
         logging.debug('backup remote root: ' + remote_root)
         local_clfiles = self.index_local_dir(local_dir, self.__exclusion_list)
-        remote_clfiles = self.ls(remote_root)
+        if delete_files is True or self._compare_method == 'md5':
+            remote_clfiles = self.ls(remote_root)
+        else:
+            remote_clfiles = self.ls_matching_local_files(local_dir, local_clfiles, remote_root)
         ops = self.compare_clfiles_for_remote_root(
             local_dir,
             local_clfiles,
@@ -631,6 +750,9 @@ class ClSync:
     def rmdir(self, directory, remote):
         logging.debug('removing directory ' + remote+directory)
         self._rclone.rmdir(remote, directory)
+        if self._sa_registry is not None:
+            self._sa_registry.invalidate_ls_cache_for_remote(remote)
+        self._clear_memory_ls_cache()
 
     def get_version(self):
         logging.debug('getting version')
@@ -641,10 +763,16 @@ class ClSync:
     def delete_file(self, file, remote):
         logging.debug('deleting file ' + remote+file)
         self._rclone.delete_file(remote, file)
+        if self._sa_registry is not None:
+            self._sa_registry.invalidate_ls_cache_for_remote(remote)
+        self._clear_memory_ls_cache()
 
     def delete(self, path, remote):
         logging.debug('deleting path ' + remote+path)
         self._rclone.delete(remote, path)
+        if self._sa_registry is not None:
+            self._sa_registry.invalidate_ls_cache_for_remote(remote)
+        self._clear_memory_ls_cache()
 
     def copy(self, src, dst, remote):
         logging.debug('copy ' + src + ' to ' + remote + dst)
@@ -662,6 +790,10 @@ class ClSync:
 
     def move(self, src, dst):
         logging.debug('move ' + src + ' to ' + dst)
+
+    def _clear_memory_ls_cache(self):
+        self._cache = {}
+        self._cache_counter = {}
 
     def sync(self, path):
         logging.debug('synchronize path ' + path)

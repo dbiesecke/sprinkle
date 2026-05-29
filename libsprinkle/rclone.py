@@ -6,8 +6,8 @@ __author__ = "Michael Montuori [michael.montuori@gmail.com]"
 __copyright__ = "Copyright 2017 Michael Montuori. All rights reserved."
 __credits__ = ["Warren Crigger"]
 __license__ = "GPLv3"
-__version__ = "1.0"
-__revision__ = "2"
+__version__ = "1.1"
+__revision__ = "0"
 
 import logging
 import json
@@ -15,6 +15,23 @@ import os
 import random
 from libsprinkle import common
 from libsprinkle import exceptions
+
+
+def extract_json_output(text):
+    if text is None:
+        return text
+    if text.strip() == '[':
+        return '[]'
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(text):
+        if char not in ('[', '{'):
+            continue
+        try:
+            value, _end = decoder.raw_decode(text[index:])
+            return json.dumps(value)
+        except ValueError:
+            continue
+    return text
 
 
 def generate_rclone_config(
@@ -203,10 +220,7 @@ class RClone:
                     raise exceptions.FileNotFoundException(result['error'])
                 else:
                     raise Exception('error getting remote object. ' + result['error'])
-        if 'out' in result and result['out'] == '[\n':
-            lsjson = '[]'
-        else:
-            lsjson = result['out']
+        lsjson = extract_json_output(result.get('out'))
         logging.debug('returning ' + str(lsjson)[0:128])
         return lsjson
 
@@ -233,12 +247,9 @@ class RClone:
                     raise exceptions.FileNotFoundException(result['error'])
                 else:
                     raise Exception('error getting remote object. ' + result['error'])
-        if 'out' in result and result['out'] == '[\n':
-            lsjson = '[]'
-        else:
-            lsjson = result['out']
-        logging.debug('returning ' + str(lsjson)[0:128])
-        return lsjson
+        out = result.get('out', '')
+        logging.debug('returning ' + str(out)[0:128])
+        return out
 
     def get_about_json_with_error(self, remote):
         logging.debug('running about for ' + remote)
@@ -261,7 +272,7 @@ class RClone:
         if result.get('out') in (None, ''):
             return None, 'rclone about returned empty output'
         try:
-            return json.loads(result['out']), None
+            return json.loads(extract_json_output(result['out'])), None
         except Exception as exc:
             return None, 'rclone about returned invalid json: {}'.format(exc.__class__.__name__)
 

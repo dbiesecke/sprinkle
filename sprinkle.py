@@ -6,7 +6,7 @@ __author__ = "Michael Montuori [michael.montuori@gmail.com]"
 __copyright__ = "Copyright 2017 Michael Montuori. All rights reserved."
 __credits__ = ["Warren Crigger"]
 __license__ = "GPLv3"
-__version__ = "1.0"
+__version__ = "1.1"
 __revision__ = "0"
 __docformat__ = "reStructuredText"
 
@@ -33,9 +33,77 @@ except:
 lock = FileLock("sprinkle.lock", timeout=1)
 
 __drive_id = None
+__rclone_env_file = None
+__rclone_verbose = None
+
+DEFAULT_RCLONE_ENV_VALUES = (
+    ("RCLONE_DRIVE_CHUNK_SIZE", "256M"),
+    ("RCLONE_SIZE_ONLY", "1"),
+    ("RCLONE_NO_UPDATE_MODTIME", "1"),
+)
 
 def default_config_path():
     return os.path.join(os.path.expanduser("~"), ".sprinkle", "sprinkle.conf")
+
+
+def default_rclone_env_path():
+    return os.path.join(os.path.expanduser("~"), ".sprinkle", "rclone.env")
+
+
+def default_rclone_env_text():
+    comments = {
+        "RCLONE_DRIVE_CHUNK_SIZE": "Google Drive upload chunk size.",
+        "RCLONE_SIZE_ONLY": "Compare by size only.",
+        "RCLONE_NO_UPDATE_MODTIME": "Do not update remote modtime metadata after upload.",
+    }
+    lines = [
+        "# Sprinkle rclone environment overrides.",
+        "# Lines whose first non-space character is # are ignored.",
+        "# Edit this file to tune rclone without changing Sprinkle commands.",
+        "",
+    ]
+    for key, value in DEFAULT_RCLONE_ENV_VALUES:
+        lines.append("# " + comments[key])
+        lines.append("{}={}".format(key, value))
+    lines.append("")
+    return "\n".join(lines)
+
+
+def ensure_rclone_env_file(path):
+    path = os.path.abspath(os.path.expanduser(path))
+    if os.path.exists(path):
+        return path
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w") as fp:
+        fp.write(default_rclone_env_text())
+    return path
+
+
+def apply_rclone_env_file(path):
+    if path in (None, ""):
+        return {}
+    path = ensure_rclone_env_file(path)
+    loaded = {}
+    with open(path, "r") as fp:
+        for line in fp:
+            line = line.strip()
+            if line == "" or line.startswith("#"):
+                continue
+            if "=" not in line:
+                logging.debug("ignoring invalid rclone env line in " + path)
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if key == "":
+                logging.debug("ignoring empty rclone env key in " + path)
+                continue
+            value = value.strip()
+            os.environ[key] = value
+            loaded[key] = value
+    logging.debug("loaded " + str(len(loaded)) + " rclone environment variables from " + path)
+    return loaded
 
 
 def warranty():
@@ -79,7 +147,8 @@ OPTIONS:
     -c, --conf {config file}     configuration file
     -d, --debug                  debug output (default:true)
     -h, --help                   help
-    -v, --version                print version
+    -v, --verbose                set RCLONE_VERBOSE=1 for rclone
+    --version                    print version
     --check-prereq               chech prerequisites
     --comp-method {size|md5}     compare method [size|md5] (default:size)
     --daemon-interval            interval for the daemon to execute in minutes (default:60)
@@ -95,6 +164,7 @@ OPTIONS:
     --log-file {file}            logs output to the specified file
     --no-cache                   turn off caching
     --rclone-conf {config file}  rclone configuration (default:None)
+    --rclone-env-file {file}     file with environment variables for rclone
     --rclone-sa-dir {dir}        build rclone config from service accounts
     --rclone-sa-count {num}      limit number of service accounts used
     --drive-id {id}              Google Drive folder ID for rclone config
@@ -108,7 +178,7 @@ OPTIONS:
     --rclone-move                use 'rclone move' instead of 'rclone copy' (default:false)
     --restore-duplicates         restore files if duplicates are found (default:false)
     --retries {num_retries}      number of retries (default:1)
-    --show-progress              show progress
+    --progress                   show progress
     --single-instance            make sure only 1 concurrent instance of sprinkle is running (default:False)
     --ls-stop-first              stop listing after first remote with files (default:true)
     """
@@ -465,6 +535,8 @@ def read_args(argv):
     global __comp_method
     global __rclone_exe
     global __rclone_conf
+    global __rclone_env_file
+    global __rclone_verbose
     global __drive_id
     global __display_unit
     global __rclone_retries
@@ -507,6 +579,8 @@ def read_args(argv):
     __comp_method = None
     __rclone_exe = None
     __rclone_conf = None
+    __rclone_env_file = None
+    __rclone_verbose = None
     __drive_id = None
     __display_unit = None
     __rclone_retries = None
@@ -548,11 +622,13 @@ def read_args(argv):
                                    ["help",
                                     "conf=",
                                     "debug",
+                                    "verbose",
                                     "version",
                                     "dist-type=",
                                     "comp-method=",
                                     "rclone-exe=",
                                     "rclone-conf=",
+                                    "rclone-env-file=",
                                     "rclone-sa-dir=",
                                     "rclone-sa-count=",
                                     "drive-id=",
@@ -567,6 +643,7 @@ def read_args(argv):
                                     "rclone-retries=",
                                     "rclone-move",
                                     "show-progress",
+                                    "progress",
                                     "dry-run",
                                     "delete-files",
                                     "restore-duplicates",
@@ -597,9 +674,11 @@ def read_args(argv):
         if opt in ('-h', '--help'):
             usage()
             sys.exit(0)
-        elif opt in ('-v', '--version'):
+        elif opt == '--version':
             version()
             sys.exit(0)
+        elif opt in ("-v", "--verbose"):
+            __rclone_verbose = True
         elif opt in ("-c", "--conf"):
             __configfile = arg
         elif opt in ("-d", "--debug"):
@@ -612,6 +691,8 @@ def read_args(argv):
             __rclone_exe = arg
         elif opt in ("--rclone-conf"):
             __rclone_conf = arg
+        elif opt in ("--rclone-env-file"):
+            __rclone_env_file = arg
         elif opt in ("--rclone-sa-dir"):
             __rclone_sa_dir = arg
         elif opt in ("--rclone-sa-count"):
@@ -641,7 +722,7 @@ def read_args(argv):
             __display_unit = arg
         elif opt in ("--rclone-retries"):
             __rclone_retries = int(arg)
-        elif opt in ("--show-progress"):
+        elif opt in ("--show-progress", "--progress"):
             __show_progress = True
         elif opt in ("--delete-files"):
             __delete_files = True
@@ -720,6 +801,7 @@ def configure(config_file):
         "display_unit": "G",
         "rclone_retries": '1',
         "drive_id": None,
+        "rclone_env_file": default_rclone_env_path(),
         "rclone_sa_dir": None,
         "rclone_sa_count": None,
         "log_file": None,
@@ -770,6 +852,9 @@ def configure(config_file):
 
     if __rclone_conf is not None:
         __config['rclone_config'] = __rclone_conf
+
+    if __rclone_env_file is not None:
+        __config['rclone_env_file'] = __rclone_env_file
 
     if __drive_id is not None:
         __config['drive_id'] = __drive_id
@@ -870,6 +955,10 @@ def configure(config_file):
 
     if __sa_group_size is not None:
         __config['sa_group_size'] = __sa_group_size
+
+    apply_rclone_env_file(__config.get('rclone_env_file'))
+    if __rclone_verbose is True:
+        os.environ["RCLONE_VERBOSE"] = "1"
 
 
 def normalize_config_types(config_values):
@@ -1089,6 +1178,8 @@ def config_command(prompt_func=input, output_path=None):
         os.makedirs(parent, exist_ok=True)
     with open(target, 'w') as fp:
         fp.write(content)
+    if os.path.abspath(os.path.expanduser(target)) == os.path.abspath(default_config_path()):
+        ensure_rclone_env_file(default_rclone_env_path())
     common.print_line('wrote ' + target)
     return target
 
@@ -1148,6 +1239,10 @@ debug={debug}
 # rclone_move: move files instead of copying them
 # rclone_move=false (copy files and keep sources) (default)
 rclone_move={rclone_move}
+
+# rclone_env_file: environment variables exported before invoking rclone.
+# Lines starting with # are ignored. The default file is created on first use.
+rclone_env_file=~/.sprinkle/rclone.env
 
 # delete_files: delete files after 1-way sync
 # delete_files=false (leave files not locally present on remote drives)
@@ -1501,14 +1596,25 @@ def sa_stats():
     if globals().get('__sa_refresh') is None and refresh_mode == service_accounts.DEFAULT_REFRESH_MODE:
         refresh_mode = 'stale'
     refreshed = 0
+    files_cached = 0
+    file_cache_errors = 0
     for account in registry.active_accounts():
         quota_row = registry.quota_by_account_id(account['id'])
         if registry.should_refresh(quota_row, refresh_mode):
             quota, error = _refresh_service_account_quota(account)
             registry.update_quota(account['id'], quota, error)
             refreshed += 1
+        ls_cache_row = registry.ls_cache_by_account_id(account['id'], '/')
+        if registry.should_refresh_ls_cache(ls_cache_row, refresh_mode):
+            json_text, error = _refresh_service_account_file_cache(account)
+            registry.update_ls_cache(account['id'], '/', json_text, error)
+            if error is None:
+                files_cached += 1
+            else:
+                file_cache_errors += 1
 
     counts = registry.summary_counts()
+    ls_summary = registry.ls_cache_summary()
     rows = registry.all_account_stats()
     active_rows = [row for row in rows if row['status'] == 'active']
     stale_count = 0
@@ -1536,6 +1642,10 @@ def sa_stats():
     common.print_line('duplicates:  ' + str(counts.get('duplicate', 0)))
     common.print_line('invalid:     ' + str(counts.get('invalid', 0)))
     common.print_line('refreshed:   ' + str(refreshed))
+    common.print_line('file caches: ' + str(files_cached))
+    common.print_line('file cache errors: ' + str(file_cache_errors))
+    common.print_line('cached paths:' + str(ls_summary['cached_paths']))
+    common.print_line('cached files:' + str(ls_summary['files']))
     common.print_line('errors:      ' + str(error_count))
     common.print_line('stale:       ' + str(stale_count))
     common.print_line('unknown:     ' + str(unknown_count))
@@ -1605,6 +1715,32 @@ def _refresh_service_account_quota(account):
         return quota, None
     except Exception as e:
         return None, str(e)
+    finally:
+        try:
+            os.unlink(tmp_conf)
+        except Exception:
+            pass
+
+
+def _refresh_service_account_file_cache(account):
+    if account['managed_path'] is None:
+        return None, 'missing managed service account file'
+    fd, tmp_conf = tempfile.mkstemp(prefix="rclone-sa-files-", suffix=".conf")
+    os.close(fd)
+    try:
+        rclone.generate_rclone_config_from_files(
+            [account['managed_path']],
+            tmp_conf,
+            __config.get('drive_id'),
+            prefix="sa_files",
+            start_index=1,
+        )
+        rclone_exe = __config.get('rclone_exe', 'rclone')
+        rclone_retries = __config.get('rclone_retries', '1')
+        rc = rclone.RClone(tmp_conf, rclone_exe, rclone_retries)
+        return rc.lsjson("sa_files1:", "/", ['--recursive', '--fast-list'], True), None
+    except Exception as e:
+        return None, _friendly_rclone_error(e, account)
     finally:
         try:
             os.unlink(tmp_conf)
