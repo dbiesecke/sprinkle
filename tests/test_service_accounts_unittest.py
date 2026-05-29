@@ -281,6 +281,235 @@ class RCloneQuotaTest(unittest.TestCase):
 
 
 class ClSyncPlacementTest(unittest.TestCase):
+    def test_lsjson_results_are_cached_by_service_account_remote(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "source")
+            store = os.path.join(tmp, "store")
+            db_path = os.path.join(tmp, "sa.sqlite3")
+            os.mkdir(source)
+            write_json(os.path.join(source, "one.json"), make_service_account("one@example.test"))
+            registry = service_accounts.ServiceAccountRegistry(db_path, store)
+            registry.import_paths([source])
+            account = registry.active_accounts()[0]
+            registry.assign_remote_names([{"remote": "dst101", "path": account["managed_path"]}])
+            calls = []
+            payload = json.dumps([{
+                "Path": "movie.mkv",
+                "Name": "movie.mkv",
+                "Size": 10,
+                "MimeType": "video/x-matroska",
+                "ModTime": "2024-01-01T00:00:00Z",
+                "IsDir": False,
+                "ID": "file-id",
+            }])
+
+            def make_sync():
+                sync = clsync.ClSync.__new__(clsync.ClSync)
+                sync._config = {
+                    "no_cache": False,
+                    "ls_stop_first": False,
+                }
+                sync._sa_registry = service_accounts.ServiceAccountRegistry(db_path, store)
+                sync._sa_refresh = "stale"
+                sync._compare_method = "size"
+                sync._cache = {}
+                sync._cache_counter = {}
+                sync._cache_invalidation_max = 10
+                sync.get_remotes = lambda: ["dst101:"]
+                sync._rclone = types.SimpleNamespace(
+                    lsjson=lambda remote, path, _args, _no_error: calls.append((remote, path)) or payload
+                )
+                return sync
+
+            first = make_sync()
+            self.assertIn("/Movies/movie.mkv", first.ls("/Movies"))
+            second = make_sync()
+            self.assertIn("/Movies/movie.mkv", second.ls("/Movies"))
+            self.assertEqual(calls, [("dst101:", "/Movies")])
+
+    def test_root_lsjson_cache_serves_subdirectory_listing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "source")
+            store = os.path.join(tmp, "store")
+            db_path = os.path.join(tmp, "sa.sqlite3")
+            os.mkdir(source)
+            write_json(os.path.join(source, "one.json"), make_service_account("one@example.test"))
+            registry = service_accounts.ServiceAccountRegistry(db_path, store)
+            registry.import_paths([source])
+            account = registry.active_accounts()[0]
+            registry.assign_remote_names([{"remote": "dst101", "path": account["managed_path"]}])
+            registry.update_ls_cache(account["id"], "/", json.dumps([{
+                "Path": "Movies/Aladin/movie.mkv",
+                "Name": "movie.mkv",
+                "Size": 10,
+                "MimeType": "video/x-matroska",
+                "ModTime": "2024-01-01T00:00:00Z",
+                "IsDir": False,
+                "ID": "file-id",
+            }]))
+            calls = []
+            sync = clsync.ClSync.__new__(clsync.ClSync)
+            sync._config = {
+                "no_cache": False,
+                "ls_stop_first": False,
+            }
+            sync._sa_registry = service_accounts.ServiceAccountRegistry(db_path, store)
+            sync._sa_refresh = "stale"
+            sync._compare_method = "size"
+            sync._cache = {}
+            sync._cache_counter = {}
+            sync._cache_invalidation_max = 10
+            sync.get_remotes = lambda: ["dst101:"]
+            sync._rclone = types.SimpleNamespace(
+                lsjson=lambda remote, path, _args, _no_error: calls.append((remote, path)) or "[]"
+            )
+
+            files = sync.ls("/Movies/Aladin")
+
+            self.assertIn("/Movies/Aladin/movie.mkv", files)
+            self.assertEqual(calls, [])
+
+    def test_drive_id_ls_stop_first_stops_after_empty_listing(self):
+        sync = clsync.ClSync.__new__(clsync.ClSync)
+        sync._config = {
+            "no_cache": False,
+            "ls_stop_first": True,
+            "drive_id": "drive-id",
+        }
+        sync._sa_registry = None
+        sync._sa_refresh = "stale"
+        sync._compare_method = "size"
+        sync._cache = {}
+        sync._cache_counter = {}
+        sync._cache_invalidation_max = 10
+        sync.get_remotes = lambda: ["dst101:", "dst102:", "dst103:"]
+        calls = []
+        sync._rclone = types.SimpleNamespace(
+            lsjson=lambda remote, path, _args, _no_error: calls.append((remote, path)) or "[]"
+        )
+
+        files = sync.ls("/Movies/Aladin")
+
+        self.assertEqual(files, {})
+        self.assertEqual(calls, [("dst101:", "/Movies/Aladin")])
+
+    def test_ls_shallow_omits_recursive_rclone_arg(self):
+        sync = clsync.ClSync.__new__(clsync.ClSync)
+        sync._config = {
+            "no_cache": False,
+            "ls_stop_first": True,
+        }
+        sync._sa_registry = None
+        sync._sa_refresh = "stale"
+        sync._compare_method = "size"
+        sync._cache = {}
+        sync._cache_counter = {}
+        sync._cache_invalidation_max = 10
+        sync.get_remotes = lambda: ["dst101:"]
+        calls = []
+        payload = json.dumps([{
+            "Path": "movie.mkv",
+            "Name": "movie.mkv",
+            "Size": 10,
+            "MimeType": "video/x-matroska",
+            "ModTime": "2024-01-01T00:00:00Z",
+            "IsDir": False,
+            "ID": "file-id",
+        }])
+        sync._rclone = types.SimpleNamespace(
+            lsjson=lambda remote, path, args, _no_error: calls.append((remote, path, args)) or payload
+        )
+
+        files = sync.ls_shallow("/Movies/Aladin")
+
+        self.assertIn("/Movies/Aladin/movie.mkv", files)
+        self.assertEqual(calls, [("dst101:", "/Movies/Aladin", ["--fast-list"])])
+
+    def test_backup_without_delete_files_uses_shallow_remote_listings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            movie_dir = os.path.join(tmp, "Movies", "Aladin")
+            os.makedirs(movie_dir)
+            local_file = os.path.join(movie_dir, "movie.mkv")
+            with open(local_file, "w") as fp:
+                fp.write("synthetic movie")
+
+            sync = clsync.ClSync.__new__(clsync.ClSync)
+            sync._show_progress = False
+            sync._compare_method = "size"
+            sync._ClSync__exclusion_list = None
+            sync._ClSync__exclude_regex = None
+            sync.get_best_remote = lambda _size: "dst109:"
+            sync.mark_remote_used = lambda _remote, _size: None
+            shallow_paths = []
+            recursive_paths = []
+            copies = []
+            sync.ls_shallow = lambda path: shallow_paths.append(path) or {}
+            sync.ls = lambda path: recursive_paths.append(path) or {}
+            sync.copy = lambda src, dst, remote: copies.append((src, dst, remote))
+
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(tmp)
+                sync.backup(movie_dir, delete_files=False, dry_run=False)
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(shallow_paths, ["/Movies/Aladin"])
+            self.assertEqual(recursive_paths, [])
+            self.assertEqual(copies, [(local_file, "/Movies/Aladin", "dst109:")])
+
+    def test_sa_stats_refreshes_service_account_file_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "source")
+            store = os.path.join(tmp, "store")
+            db_path = os.path.join(tmp, "sa.sqlite3")
+            os.mkdir(source)
+            write_json(os.path.join(source, "one.json"), make_service_account("one@example.test"))
+            registry = service_accounts.ServiceAccountRegistry(db_path, store)
+            registry.import_paths([source])
+            old_quota = sprinkle._refresh_service_account_quota
+            old_file_cache = sprinkle._refresh_service_account_file_cache
+            old_print_line = common.print_line
+
+            try:
+                sprinkle._refresh_service_account_quota = (
+                    lambda _account: ({"total": 100, "used": 20, "free": 80}, None)
+                )
+                sprinkle._refresh_service_account_file_cache = (
+                    lambda _account: (json.dumps([{
+                        "Path": "Movies/Aladin/movie.mkv",
+                        "Name": "movie.mkv",
+                        "Size": 10,
+                        "MimeType": "video/x-matroska",
+                        "ModTime": "2024-01-01T00:00:00Z",
+                        "IsDir": False,
+                        "ID": "file-id",
+                    }]), None)
+                )
+                common.print_line = lambda _message="": None
+                sprinkle.read_args([
+                    "--sa-db",
+                    db_path,
+                    "--sa-store",
+                    store,
+                    "--sa-refresh",
+                    "all",
+                    "sa-stats",
+                ])
+                sprinkle.configure(None)
+                sprinkle.sa_stats()
+            finally:
+                sprinkle._refresh_service_account_quota = old_quota
+                sprinkle._refresh_service_account_file_cache = old_file_cache
+                common.print_line = old_print_line
+
+            cache_row = service_accounts.ServiceAccountRegistry(db_path, store).ls_cache_by_account_id(
+                registry.active_accounts()[0]["id"],
+                "/",
+            )
+            self.assertIsNotNone(cache_row)
+            self.assertEqual(cache_row["file_count"], 1)
+
     def test_backup_preserves_cwd_relative_directory_in_remote_destination(self):
         with tempfile.TemporaryDirectory() as tmp:
             movie_dir = os.path.join(tmp, "Movies", "Aladin")
@@ -298,7 +527,7 @@ class ClSyncPlacementTest(unittest.TestCase):
             sync.mark_remote_used = lambda _remote, _size: None
             listed_paths = []
             copies = []
-            sync.ls = lambda path: listed_paths.append(path) or {}
+            sync.ls_shallow = lambda path: listed_paths.append(path) or {}
             sync.copy = lambda src, dst, remote: copies.append((src, dst, remote))
 
             try:

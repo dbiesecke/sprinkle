@@ -104,12 +104,28 @@ class ServiceAccountRegistry(object):
                     FOREIGN KEY(account_id) REFERENCES accounts(id)
                 )
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS ls_cache (
+                    account_id INTEGER NOT NULL,
+                    path TEXT NOT NULL,
+                    json_text TEXT NOT NULL,
+                    object_count INTEGER,
+                    dir_count INTEGER,
+                    file_count INTEGER,
+                    last_lsjson_at TEXT,
+                    last_error TEXT,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(account_id, path),
+                    FOREIGN KEY(account_id) REFERENCES accounts(id)
+                )
+            """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_accounts_email ON accounts(client_email)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_accounts_key_id ON accounts(private_key_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_accounts_hash ON accounts(content_hash)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_accounts_source ON accounts(source_path)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_accounts_remote ON accounts(remote_name)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_ls_cache_path ON ls_cache(path)")
 
     def import_paths(self, paths, clean_invalid=DEFAULT_CLEAN_INVALID, validator=None, progress=None):
         if clean_invalid not in ("none", "quarantine", "delete"):
@@ -473,6 +489,109 @@ class ServiceAccountRegistry(object):
         age = datetime.datetime.utcnow() - last
         return age.total_seconds() > self.cache_ttl_hours * 3600
 
+    def ls_cache_by_remote(self, remote, path):
+        account = self.quota_by_remote(remote)
+        if account is None:
+            return None
+        return self.ls_cache_by_account_id(account["account_id"], path)
+
+    def ls_cache_by_account_id(self, account_id, path):
+        with self._connect() as conn:
+            return conn.execute(
+                "SELECT * FROM ls_cache WHERE account_id=? AND path=?",
+                (account_id, self._normalize_cache_path(path)),
+            ).fetchone()
+
+    def should_refresh_ls_cache(self, cache_row, mode):
+        if mode == "none":
+            return False
+        if mode == "all":
+            return True
+        if cache_row is None or cache_row["last_lsjson_at"] is None:
+            return mode in ("missing", "stale")
+        if mode == "missing":
+            return False
+        if mode == "stale":
+            return self.is_stale(cache_row["last_lsjson_at"])
+        return False
+
+    def update_ls_cache_for_remote(self, remote, path, json_text, error=None):
+        account = self.quota_by_remote(remote)
+        if account is None:
+            return
+        self.update_ls_cache(account["account_id"], path, json_text, error)
+
+    def update_ls_cache(self, account_id, path, json_text=None, error=None):
+        now = self._utcnow()
+        path = self._normalize_cache_path(path)
+        if error is not None:
+            with self._connect() as conn:
+                existing = conn.execute(
+                    "SELECT account_id FROM ls_cache WHERE account_id=? AND path=?",
+                    (account_id, path),
+                ).fetchone()
+                if existing is None:
+                    conn.execute("""
+                        INSERT INTO ls_cache (
+                            account_id, path, json_text, last_lsjson_at, last_error, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                    """, (account_id, path, "[]", None, error, now))
+                else:
+                    conn.execute("""
+                        UPDATE ls_cache
+                        SET last_error=?, updated_at=?
+                        WHERE account_id=? AND path=?
+                    """, (error, now, account_id, path))
+            return
+
+        json_text = json_text or "[]"
+        object_count, dir_count, file_count = self._lsjson_counts(json_text)
+        with self._connect() as conn:
+            conn.execute("""
+                INSERT INTO ls_cache (
+                    account_id, path, json_text, object_count, dir_count, file_count,
+                    last_lsjson_at, last_error, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(account_id, path) DO UPDATE SET
+                    json_text=excluded.json_text,
+                    object_count=excluded.object_count,
+                    dir_count=excluded.dir_count,
+                    file_count=excluded.file_count,
+                    last_lsjson_at=excluded.last_lsjson_at,
+                    last_error=excluded.last_error,
+                    updated_at=excluded.updated_at
+            """, (
+                account_id,
+                path,
+                json_text,
+                object_count,
+                dir_count,
+                file_count,
+                now,
+                None,
+                now,
+            ))
+
+    def ls_cache_summary(self):
+        with self._connect() as conn:
+            row = conn.execute("""
+                SELECT
+                    COUNT(*) AS cached_paths,
+                    COALESCE(SUM(object_count), 0) AS objects,
+                    COALESCE(SUM(file_count), 0) AS files,
+                    COALESCE(SUM(dir_count), 0) AS dirs,
+                    SUM(CASE WHEN last_error IS NOT NULL THEN 1 ELSE 0 END) AS errors
+                FROM ls_cache
+            """).fetchone()
+        return row
+
+    def invalidate_ls_cache_for_remote(self, remote):
+        account = self.quota_by_remote(remote)
+        if account is None:
+            return
+        with self._connect() as conn:
+            conn.execute("DELETE FROM ls_cache WHERE account_id=?", (account["account_id"],))
+
     def update_quota_for_remote(self, remote, quota, error=None):
         row = self.quota_by_remote(remote)
         if row is None:
@@ -548,6 +667,33 @@ class ServiceAccountRegistry(object):
                 SET free=?, used=?, updated_at=?
                 WHERE account_id=?
             """, (free, used, now, row["account_id"]))
+
+    def _normalize_cache_path(self, path):
+        path = path or "/"
+        path = path.replace('\\', '/')
+        if not path.startswith('/'):
+            path = '/' + path
+        while '//' in path:
+            path = path.replace('//', '/')
+        if len(path) > 1 and path.endswith('/'):
+            path = path[:-1]
+        return path
+
+    def _lsjson_counts(self, json_text):
+        try:
+            rows = json.loads(json_text)
+        except Exception:
+            rows = []
+        object_count = len(rows) if isinstance(rows, list) else 0
+        dir_count = 0
+        file_count = 0
+        if isinstance(rows, list):
+            for row in rows:
+                if isinstance(row, dict) and row.get("IsDir"):
+                    dir_count += 1
+                else:
+                    file_count += 1
+        return object_count, dir_count, file_count
 
     @staticmethod
     def _utcnow():

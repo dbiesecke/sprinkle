@@ -1501,14 +1501,25 @@ def sa_stats():
     if globals().get('__sa_refresh') is None and refresh_mode == service_accounts.DEFAULT_REFRESH_MODE:
         refresh_mode = 'stale'
     refreshed = 0
+    files_cached = 0
+    file_cache_errors = 0
     for account in registry.active_accounts():
         quota_row = registry.quota_by_account_id(account['id'])
         if registry.should_refresh(quota_row, refresh_mode):
             quota, error = _refresh_service_account_quota(account)
             registry.update_quota(account['id'], quota, error)
             refreshed += 1
+        ls_cache_row = registry.ls_cache_by_account_id(account['id'], '/')
+        if registry.should_refresh_ls_cache(ls_cache_row, refresh_mode):
+            json_text, error = _refresh_service_account_file_cache(account)
+            registry.update_ls_cache(account['id'], '/', json_text, error)
+            if error is None:
+                files_cached += 1
+            else:
+                file_cache_errors += 1
 
     counts = registry.summary_counts()
+    ls_summary = registry.ls_cache_summary()
     rows = registry.all_account_stats()
     active_rows = [row for row in rows if row['status'] == 'active']
     stale_count = 0
@@ -1536,6 +1547,10 @@ def sa_stats():
     common.print_line('duplicates:  ' + str(counts.get('duplicate', 0)))
     common.print_line('invalid:     ' + str(counts.get('invalid', 0)))
     common.print_line('refreshed:   ' + str(refreshed))
+    common.print_line('file caches: ' + str(files_cached))
+    common.print_line('file cache errors: ' + str(file_cache_errors))
+    common.print_line('cached paths:' + str(ls_summary['cached_paths']))
+    common.print_line('cached files:' + str(ls_summary['files']))
     common.print_line('errors:      ' + str(error_count))
     common.print_line('stale:       ' + str(stale_count))
     common.print_line('unknown:     ' + str(unknown_count))
@@ -1605,6 +1620,32 @@ def _refresh_service_account_quota(account):
         return quota, None
     except Exception as e:
         return None, str(e)
+    finally:
+        try:
+            os.unlink(tmp_conf)
+        except Exception:
+            pass
+
+
+def _refresh_service_account_file_cache(account):
+    if account['managed_path'] is None:
+        return None, 'missing managed service account file'
+    fd, tmp_conf = tempfile.mkstemp(prefix="rclone-sa-files-", suffix=".conf")
+    os.close(fd)
+    try:
+        rclone.generate_rclone_config_from_files(
+            [account['managed_path']],
+            tmp_conf,
+            __config.get('drive_id'),
+            prefix="sa_files",
+            start_index=1,
+        )
+        rclone_exe = __config.get('rclone_exe', 'rclone')
+        rclone_retries = __config.get('rclone_retries', '1')
+        rc = rclone.RClone(tmp_conf, rclone_exe, rclone_retries)
+        return rc.lsjson("sa_files1:", "/", ['--recursive', '--fast-list'], True), None
+    except Exception as e:
+        return None, _friendly_rclone_error(e, account)
     finally:
         try:
             os.unlink(tmp_conf)
