@@ -27,6 +27,12 @@ $ ./sprinkle/sprinkle.py -d --drive-id YouDriveID backup /Users/user/workspace/M
 
 `sa-import` validates new accounts with `rclone about --json` and prints per-file progress. If rclone returns an error or quota remains unknown, the account is recorded as invalid and quarantined by default.
 
+* run an auditable monthly Google Drive service-account keepalive through Cron
+
+For unattended monthly authentication checks, install the operational runner described in
+[docs/sa-keepalive.md](docs/sa-keepalive.md). It forces a read-only refresh for every active account,
+verifies the SQLite results, maintains a success marker for monitoring, and never logs key material.
+
 Sprinkle keeps upload placement capacity-aware for large files: service accounts are selected by known free space, with extra headroom for files of at least 1 GiB so a large movie is not sent to an account that only barely fits it.
 
 * create a home-directory configuration with interactive defaults
@@ -160,4 +166,3 @@ and the command specific help.
 
 This project is licensed under the GPLv3 License - see the
 [LICENSE](https://www.gnu.org/licenses/gpl-3.0.en.html) file for details
-

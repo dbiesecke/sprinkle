@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+"""Check that the Sprinkle service-account keepalive marker is recent."""
+
+import argparse
+import datetime
+import json
+import sys
+
+
+DEFAULT_MARKER = "/var/lib/sprinkle/sa-keepalive.last-success"
+
+
+def run(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--marker", default=DEFAULT_MARKER)
+    parser.add_argument("--max-age-days", type=int, default=40)
+    args = parser.parse_args(argv)
+
+    try:
+        with open(args.marker, "r") as handle:
+            payload = json.load(handle)
+        completed = datetime.datetime.strptime(payload["completed_at"], "%Y-%m-%dT%H:%M:%SZ")
+        now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+        age = now - completed
+        age_days = age.total_seconds() / 86400
+        if age_days < 0 or age_days > args.max_age_days:
+            print("CRITICAL - service-account keepalive is {:.1f} days old".format(age_days))
+            return 1
+        print(
+            "OK - service-account keepalive is {:.1f} days old; accounts={}".format(
+                age_days, payload.get("total", "UNKNOWN")
+            )
+        )
+        return 0
+    except Exception as error:
+        print("CRITICAL - service-account keepalive marker unavailable ({})".format(error.__class__.__name__))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(run())
