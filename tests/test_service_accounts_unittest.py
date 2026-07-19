@@ -5,6 +5,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -626,6 +627,66 @@ class ClSyncPlacementTest(unittest.TestCase):
 
 
 class ServiceAccountCliTest(unittest.TestCase):
+    def test_service_account_about_uses_and_removes_generated_config(self):
+        old_execute = common.execute
+        old_config = getattr(sprinkle, "__config", None)
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp:
+            account_path = os.path.join(tmp, "account.json")
+            write_json(account_path, make_service_account("one@example.test"))
+
+            def fake_execute(command, no_error=False):
+                config_index = command.index("--config")
+                generated = command[config_index + 1]
+                self.assertTrue(os.path.isfile(generated))
+                calls.append((list(command), generated))
+                return {
+                    "code": 0,
+                    "out": json.dumps({"total": 100, "used": 25, "free": 75}),
+                    "error": "",
+                }
+
+            try:
+                common.execute = fake_execute
+                setattr(sprinkle, "__config", {
+                    "drive_id": "drive-id",
+                    "rclone_retries": "1",
+                })
+                quota, error = sprinkle._refresh_service_account_quota({
+                    "managed_path": account_path,
+                    "client_email": "one@example.test",
+                    "project_id": "synthetic-project",
+                })
+            finally:
+                common.execute = old_execute
+                setattr(sprinkle, "__config", old_config)
+
+            self.assertIsNone(error)
+            self.assertEqual(quota["free"], 75)
+            self.assertEqual(calls[0][0][1], "about")
+            self.assertFalse(os.path.exists(calls[0][1]))
+
+    def test_rclone_subprocess_does_not_inherit_rclone_config(self):
+        old_config = os.environ.get("RCLONE_CONFIG")
+        try:
+            os.environ["RCLONE_CONFIG"] = "/production/old-rclone.conf"
+            process = mock.MagicMock()
+            process.__enter__.return_value = process
+            process.communicate.return_value = (b"", b"")
+            process.returncode = 0
+
+            with mock.patch.object(common.subprocess, "Popen", return_value=process) as popen:
+                rclone.RClone().get_version()
+
+            child_env = popen.call_args.kwargs["env"]
+            self.assertNotIn("RCLONE_CONFIG", child_env)
+            self.assertEqual(os.environ["RCLONE_CONFIG"], "/production/old-rclone.conf")
+        finally:
+            if old_config is None:
+                os.environ.pop("RCLONE_CONFIG", None)
+            else:
+                os.environ["RCLONE_CONFIG"] = old_config
+
     def test_rclone_env_file_rolls_out_and_loads_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:
             env_path = os.path.join(tmp, "rclone.env")
@@ -660,6 +721,7 @@ class ServiceAccountCliTest(unittest.TestCase):
                     "  # RCLONE_NO_UPDATE_MODTIME=0",
                     "RCLONE_DRIVE_CHUNK_SIZE=512M",
                     "RCLONE_EXTRA=value=with=equals",
+                    "RCLONE_CONFIG=/must/not/be/used.conf",
                     "",
                 ]))
             keys = [
@@ -667,6 +729,7 @@ class ServiceAccountCliTest(unittest.TestCase):
                 "RCLONE_NO_UPDATE_MODTIME",
                 "RCLONE_DRIVE_CHUNK_SIZE",
                 "RCLONE_EXTRA",
+                "RCLONE_CONFIG",
             ]
             old_env = dict((key, os.environ.get(key)) for key in keys)
             try:
@@ -679,6 +742,8 @@ class ServiceAccountCliTest(unittest.TestCase):
                 self.assertNotIn("RCLONE_NO_UPDATE_MODTIME", loaded)
                 self.assertEqual(os.environ["RCLONE_DRIVE_CHUNK_SIZE"], "512M")
                 self.assertEqual(os.environ["RCLONE_EXTRA"], "value=with=equals")
+                self.assertNotIn("RCLONE_CONFIG", loaded)
+                self.assertNotIn("RCLONE_CONFIG", os.environ)
             finally:
                 for key, value in old_env.items():
                     if value is None:
@@ -858,8 +923,10 @@ class ServiceAccountCliTest(unittest.TestCase):
 
     def test_config_command_defaults_to_home_sprinkle_config_path(self):
         old_home = os.environ.get("HOME")
+        old_config = os.environ.get("SPRINKLE_CONFIG")
         with tempfile.TemporaryDirectory() as tmp:
             os.environ["HOME"] = tmp
+            os.environ.pop("SPRINKLE_CONFIG", None)
             answers = iter(["", "", "", "", "", "", "", "", ""])
 
             def prompt(_message):
@@ -875,6 +942,82 @@ class ServiceAccountCliTest(unittest.TestCase):
                     os.environ.pop("HOME", None)
                 else:
                     os.environ["HOME"] = old_home
+                if old_config is None:
+                    os.environ.pop("SPRINKLE_CONFIG", None)
+                else:
+                    os.environ["SPRINKLE_CONFIG"] = old_config
+
+    def test_config_path_precedence_is_cli_then_environment_then_home(self):
+        old_home = os.environ.get("HOME")
+        old_config = os.environ.get("SPRINKLE_CONFIG")
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                os.environ["HOME"] = tmp
+                home_config = os.path.join(tmp, ".sprinkle", "sprinkle.conf")
+                env_config = os.path.join(tmp, "environment.conf")
+                os.makedirs(os.path.dirname(home_config))
+                for path in (home_config, env_config):
+                    with open(path, "w") as fp:
+                        fp.write("debug=false\n")
+                os.environ["SPRINKLE_CONFIG"] = env_config
+
+                sprinkle.read_args(["stats"])
+                self.assertEqual(getattr(sprinkle, "__configfile"), env_config)
+
+                sprinkle.read_args(["-c", "~/cli.conf", "stats"])
+                self.assertEqual(getattr(sprinkle, "__configfile"), os.path.join(tmp, "cli.conf"))
+                self.assertEqual(
+                    sprinkle.resolve_config_path("relative.conf", environ={}),
+                    "relative.conf",
+                )
+
+                os.environ.pop("SPRINKLE_CONFIG", None)
+                sprinkle.read_args(["stats"])
+                self.assertEqual(getattr(sprinkle, "__configfile"), home_config)
+            finally:
+                if old_home is None:
+                    os.environ.pop("HOME", None)
+                else:
+                    os.environ["HOME"] = old_home
+                if old_config is None:
+                    os.environ.pop("SPRINKLE_CONFIG", None)
+                else:
+                    os.environ["SPRINKLE_CONFIG"] = old_config
+
+    def test_missing_environment_config_is_an_explicit_error(self):
+        old_config = os.environ.get("SPRINKLE_CONFIG")
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "missing.conf")
+            try:
+                os.environ["SPRINKLE_CONFIG"] = missing
+                sprinkle.read_args(["stats"])
+                with self.assertRaisesRegex(Exception, "not found"):
+                    sprinkle.configure(getattr(sprinkle, "__configfile"))
+            finally:
+                if old_config is None:
+                    os.environ.pop("SPRINKLE_CONFIG", None)
+                else:
+                    os.environ["SPRINKLE_CONFIG"] = old_config
+
+    def test_config_command_uses_sprinkle_config_override(self):
+        old_config = os.environ.get("SPRINKLE_CONFIG")
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "nested", "sprinkle.conf")
+            answers = iter(["", "", "", "", "", "", "", "", ""])
+
+            def prompt(_message):
+                return next(answers)
+
+            try:
+                os.environ["SPRINKLE_CONFIG"] = target
+                written = sprinkle.config_command(prompt)
+                self.assertEqual(written, target)
+                self.assertTrue(os.path.isfile(target))
+            finally:
+                if old_config is None:
+                    os.environ.pop("SPRINKLE_CONFIG", None)
+                else:
+                    os.environ["SPRINKLE_CONFIG"] = old_config
 
     def test_config_file_service_account_defaults_generate_rclone_config(self):
         with tempfile.TemporaryDirectory() as tmp:

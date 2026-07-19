@@ -47,9 +47,28 @@ $ ./sprinkle.py config
 # sa_clean_invalid=quarantine
 ```
 
+Sprinkle resolves its configuration in this order: `-c/--conf`, then a non-empty
+`SPRINKLE_CONFIG`, then `~/.sprinkle/sprinkle.conf`. The `config` command uses the
+same order when choosing where to write. An explicit CLI or environment path must
+exist for normal commands; the Home file is optional.
+
 `~/.sprinkle/rclone.env` is created on first use and exports rclone tuning defaults
 such as `RCLONE_DRIVE_CHUNK_SIZE=256M`, `RCLONE_SIZE_ONLY=1`, and
 `RCLONE_NO_UPDATE_MODTIME=1`. Lines beginning with `#` are ignored.
+`RCLONE_CONFIG` is reserved and ignored, including when inherited from production
+or written into `rclone.env`. Use `--rclone-conf`, `rclone_config`, or Sprinkle's
+generated service-account configuration instead.
+
+The Docker image sets `SPRINKLE_CONFIG=/config/sprinkle.conf`, so a mounted
+`/config` directory intentionally overrides the Home default:
+
+```bash
+docker run --rm \
+  -v "$PWD/config:/config" \
+  dbiesecke/sprinkle config
+```
+
+See [docs/usage.md](docs/usage.md) for configuration and service-account examples.
 
 
 

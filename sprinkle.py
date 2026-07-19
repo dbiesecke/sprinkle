@@ -42,8 +42,26 @@ DEFAULT_RCLONE_ENV_VALUES = (
     ("RCLONE_NO_UPDATE_MODTIME", "1"),
 )
 
+RESERVED_RCLONE_ENV_KEYS = ("RCLONE_CONFIG",)
+
+
 def default_config_path():
     return os.path.join(os.path.expanduser("~"), ".sprinkle", "sprinkle.conf")
+
+
+def resolve_config_path(cli_path=None, for_write=False, environ=None):
+    """Resolve Sprinkle config using CLI, environment, then home precedence."""
+    if cli_path not in (None, ""):
+        return os.path.expanduser(cli_path)
+    if environ is None:
+        environ = os.environ
+    env_path = environ.get("SPRINKLE_CONFIG")
+    if env_path is not None and env_path.strip() != "":
+        return os.path.expanduser(env_path)
+    home_path = default_config_path()
+    if for_write or os.path.isfile(home_path):
+        return home_path
+    return None
 
 
 def default_rclone_env_path():
@@ -98,6 +116,9 @@ def apply_rclone_env_file(path):
             key = key.strip()
             if key == "":
                 logging.debug("ignoring empty rclone env key in " + path)
+                continue
+            if key in RESERVED_RCLONE_ENV_KEYS:
+                logging.warning("ignoring reserved rclone environment variable " + key)
                 continue
             value = value.strip()
             os.environ[key] = value
@@ -770,10 +791,10 @@ def read_args(argv):
         elif opt in ("--daemon-pidfile"):
             __daemon_pidfile = arg
 
-    if __configfile is None:
-        candidate_config = default_config_path()
-        if os.path.isfile(candidate_config):
-            __configfile = candidate_config
+    __configfile = resolve_config_path(
+        __configfile,
+        for_write=len(args) > 0 and args[0] == 'config',
+    )
 
     if len(args) < 1 and __check_prereq is None:
         usage()
@@ -1130,7 +1151,7 @@ def init_logging(debug, daemon_mode=False):
 
 
 def config_command(prompt_func=input, output_path=None):
-    target = output_path or default_config_path()
+    target = resolve_config_path(output_path, for_write=True)
     common.print_line('creating Sprinkle configuration at ' + target)
     if os.path.exists(target):
         overwrite = _prompt_bool(prompt_func, 'Overwrite existing config', False)

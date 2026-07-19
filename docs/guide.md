@@ -129,6 +129,16 @@ values have to be tweaked for specific installations. All values in sprinkle.con
 The recommended way to create a local configuration is the interactive config command. By default it
 writes to `~/.sprinkle/sprinkle.conf`.
 
+Sprinkle uses the same path precedence for reading and writing configuration:
+
+1. `-c/--conf`
+2. a non-empty `SPRINKLE_CONFIG`
+3. `~/.sprinkle/sprinkle.conf`
+
+For normal commands an explicitly selected CLI or environment file must exist. The Home file is
+loaded automatically when present and otherwise remains optional. The Docker image deliberately sets
+`SPRINKLE_CONFIG=/config/sprinkle.conf` so `/config` can be mounted as persistent configuration.
+
 ##### interactive configuration:
 ```
 $ python3 sprinkle.py config
@@ -148,6 +158,10 @@ The generated config can also store defaults equivalent to:
 ```
 --rclone-sa-count 5 --drive-id GDRIVE_FOLDER_ID -d --rclone-sa-dir /etc/rclone/sa
 ```
+
+Sprinkle never passes an inherited `RCLONE_CONFIG` to rclone. The key is also ignored when it appears
+in `rclone.env`. Select a classic rclone file with `--rclone-conf` or `rclone_config`; service-account
+operations generate a temporary configuration and pass it explicitly with `--config`.
 
 For example, the **debug** value
 ##### sprinkle.conf debug value:
