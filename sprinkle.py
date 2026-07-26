@@ -1103,6 +1103,7 @@ def prepare_rclone_sa_config():
         import_result = registry.import_paths(
             [rclone_sa_dir],
             __config.get('sa_clean_invalid', service_accounts.DEFAULT_CLEAN_INVALID),
+            skip_known_invalid=len(__args) > 0 and __args[0] == 'backup',
         )
         imported_paths = set(os.path.abspath(path) for path in import_result.selected_files)
         accounts = [
@@ -1667,7 +1668,7 @@ def sa_stats():
             refreshed += 1
             quota_row = registry.quota_by_account_id(account['id'])
         quota_error = None if quota_row is None else quota_row['last_error']
-        if _delete_account_not_found_if_requested(registry, account, quota_error):
+        if _handle_account_not_found(registry, account, quota_error):
             continue
 
     counts = registry.summary_counts()
@@ -1788,7 +1789,7 @@ def _backup_accounts_with_free_space(registry, accounts):
             registry.update_quota(account['id'], quota, error)
             quota_row = registry.quota_by_account_id(account['id'])
         quota_error = None if quota_row is None else quota_row['last_error']
-        if _delete_account_not_found_if_requested(registry, account, quota_error):
+        if _handle_account_not_found(registry, account, quota_error):
             continue
         free = None if quota_row is None else quota_row['free']
         if quota_error is not None or free is None or free <= 0:
@@ -1814,6 +1815,20 @@ def _delete_account_not_found_if_requested(registry, account, error):
             (account['client_email'] or account['account_key'])
         )
     return deleted
+
+
+def _handle_account_not_found(registry, account, error):
+    if not _is_account_not_found_error(error):
+        return False
+    if _delete_account_not_found_if_requested(registry, account, error):
+        return True
+    invalidated = registry.mark_active_account_invalid(account['id'], str(error))
+    if invalidated:
+        logging.warning(
+            'marked service account invalid after confirmed account-not-found error: ' +
+            (account['client_email'] or account['account_key'])
+        )
+    return invalidated
 
 
 def _is_account_not_found_error(error):

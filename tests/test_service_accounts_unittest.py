@@ -164,7 +164,8 @@ class ServiceAccountRegistryTest(unittest.TestCase):
                 self.assertTrue(os.path.exists(managed_file))
 
                 setattr(sprinkle, "__config", {"sa_delete_account_not_found": True})
-                self.assertTrue(sprinkle._delete_account_not_found_if_requested(registry, account, error))
+                with self.assertLogs(level="DEBUG") as logs:
+                    self.assertTrue(sprinkle._delete_account_not_found_if_requested(registry, account, error))
             finally:
                 setattr(sprinkle, "__config", old_config)
 
@@ -172,10 +173,39 @@ class ServiceAccountRegistryTest(unittest.TestCase):
             self.assertFalse(os.path.exists(managed_file))
             self.assertEqual(len(registry.active_accounts()), 0)
             self.assertEqual(registry.all_account_stats()[0]["status"], "invalid")
+            output = "\n".join(logs.output)
+            self.assertIn("removed service account file after --sa-delete-account-not-found: " + source_file, output)
+            self.assertIn("removed service account file after --sa-delete-account-not-found: " + managed_file, output)
 
     def test_account_not_found_detection_rejects_other_invalid_grants(self):
         self.assertTrue(sprinkle._is_account_not_found_error("Invalid grant: account not found"))
         self.assertFalse(sprinkle._is_account_not_found_error("Invalid grant: Invalid JWT Signature"))
+
+    def test_account_not_found_marks_account_invalid_without_delete_option(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "source")
+            os.mkdir(source)
+            write_json(os.path.join(source, "one.json"), make_service_account("one@example.test"))
+            registry = service_accounts.ServiceAccountRegistry(
+                os.path.join(tmp, "sa.sqlite3"),
+                os.path.join(tmp, "store"),
+            )
+            registry.import_paths([source])
+            account = registry.active_accounts()[0]
+            old_config = getattr(sprinkle, "__config", None)
+
+            try:
+                setattr(sprinkle, "__config", {"sa_delete_account_not_found": False})
+                self.assertTrue(sprinkle._handle_account_not_found(
+                    registry,
+                    account,
+                    "Invalid grant: account not found",
+                ))
+            finally:
+                setattr(sprinkle, "__config", old_config)
+
+            self.assertEqual(registry.all_account_stats()[0]["status"], "invalid")
+            self.assertTrue(os.path.exists(os.path.join(source, "one.json")))
 
     def test_import_validator_stores_quota_and_reports_progress(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1358,6 +1388,55 @@ class ServiceAccountCliTest(unittest.TestCase):
                 self.assertIn(paths["ready@example.test"], content)
                 self.assertNotIn(paths["full@example.test"], content)
                 self.assertNotIn(paths["failed@example.test"], content)
+            finally:
+                sprinkle._refresh_service_account_quota = old_refresh
+                generated = getattr(sprinkle, "__rclone_conf", None)
+                if generated and os.path.exists(generated):
+                    os.unlink(generated)
+
+    def test_backup_skips_known_invalid_service_accounts_without_quota_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "source")
+            store = os.path.join(tmp, "store")
+            db_path = os.path.join(tmp, "sa.sqlite3")
+            base_conf = os.path.join(tmp, "rclone.conf")
+            os.mkdir(source)
+            with open(base_conf, "w") as fp:
+                fp.write("")
+            write_json(os.path.join(source, "ready.json"), make_service_account("ready@example.test", "ready"))
+            write_json(os.path.join(source, "invalid.json"), make_service_account("invalid@example.test", "invalid"))
+            registry = service_accounts.ServiceAccountRegistry(db_path, store)
+            registry.import_paths([source])
+            invalid = next(account for account in registry.active_accounts()
+                           if account["client_email"] == "invalid@example.test")
+            registry.mark_active_account_invalid(invalid["id"], "Invalid grant: account not found")
+            calls = []
+            old_refresh = sprinkle._refresh_service_account_quota
+
+            def refresh(account):
+                calls.append(account["client_email"])
+                return {"total": 100, "used": 20, "free": 80}, None
+
+            try:
+                sprinkle._refresh_service_account_quota = refresh
+                sprinkle.read_args([
+                    "--rclone-sa-dir", source,
+                    "--drive-id", "drive-id",
+                    "--rclone-conf", base_conf,
+                    "--sa-db", db_path,
+                    "--sa-store", store,
+                    "--sa-refresh", "all",
+                    "--rclone-env-file", os.path.join(tmp, "rclone.env"),
+                    "backup",
+                    "/tmp/local",
+                ])
+                sprinkle.configure(None)
+                sprinkle.prepare_rclone_sa_config()
+
+                self.assertEqual(calls, ["ready@example.test"])
+                with open(getattr(sprinkle, "__rclone_conf")) as fp:
+                    content = fp.read()
+                self.assertEqual(content.count("[dst"), 1)
             finally:
                 sprinkle._refresh_service_account_quota = old_refresh
                 generated = getattr(sprinkle, "__rclone_conf", None)

@@ -90,6 +90,7 @@ failed rclone validation are quarantined by default.
 
 Use `--sa-delete-account-not-found` only when source JSON files should be removed after the exact Google
 error `Invalid grant: account not found`. Other quota and credential errors never trigger this deletion.
+Known invalid accounts are skipped during later backups, avoiding repeated `rclone about` calls.
 
 `backup` refreshes missing or stale quota data before generating its clustered rclone configuration.
 Only active accounts with a successful quota check and positive known free space are included; file-size

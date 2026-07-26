@@ -6,10 +6,12 @@ Service account registry and quota cache.
 import datetime
 import hashlib
 import json
+import logging
 import os
 import shutil
 import sqlite3
 import stat
+from contextlib import contextmanager
 
 
 DEFAULT_DB_PATH = os.path.expanduser("~/.sprinkle/sa-cache.sqlite3")
@@ -63,10 +65,15 @@ class ServiceAccountRegistry(object):
         os.chmod(self.store_dir, 0o700)
         os.chmod(self.quarantine_dir, 0o700)
 
+    @contextmanager
     def _connect(self):
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _init_db(self):
         with self._connect() as conn:
@@ -127,7 +134,13 @@ class ServiceAccountRegistry(object):
             conn.execute("CREATE INDEX IF NOT EXISTS idx_accounts_remote ON accounts(remote_name)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_ls_cache_path ON ls_cache(path)")
 
-    def import_paths(self, paths, clean_invalid=DEFAULT_CLEAN_INVALID, validator=None, progress=None):
+    def import_paths(
+            self,
+            paths,
+            clean_invalid=DEFAULT_CLEAN_INVALID,
+            validator=None,
+            progress=None,
+            skip_known_invalid=False):
         if clean_invalid not in ("none", "quarantine", "delete"):
             raise ValueError("invalid service account cleanup mode: {}".format(clean_invalid))
         result = ImportResult()
@@ -149,7 +162,15 @@ class ServiceAccountRegistry(object):
             })
             try:
                 result.scanned += 1
-                self._import_file(json_path, clean_invalid, result, validator, progress, index)
+                self._import_file(
+                    json_path,
+                    clean_invalid,
+                    result,
+                    validator,
+                    progress,
+                    index,
+                    skip_known_invalid,
+                )
             except Exception as exc:
                 reason = "import error: {}".format(exc)
                 self._record_invalid(json_path, b"", {}, None, reason, clean_invalid, result, self._utcnow())
@@ -182,7 +203,15 @@ class ServiceAccountRegistry(object):
                 if filename.endswith(".json"):
                     yield os.path.join(root, filename)
 
-    def _import_file(self, path, clean_invalid, result, validator=None, progress=None, index=None):
+    def _import_file(
+            self,
+            path,
+            clean_invalid,
+            result,
+            validator=None,
+            progress=None,
+            index=None,
+            skip_known_invalid=False):
         with open(path, "rb") as fp:
             raw = fp.read()
         content_hash = hashlib.sha256(raw).hexdigest()
@@ -201,6 +230,16 @@ class ServiceAccountRegistry(object):
 
         duplicate = self._find_duplicate(payload, content_hash)
         account_key = self._account_key(payload, content_hash)
+        if skip_known_invalid and self._is_known_invalid(account_key):
+            self._emit_status(
+                progress,
+                index,
+                result.total,
+                path,
+                "skipped",
+                "known invalid service account",
+            )
+            return
         if duplicate is not None:
             result.duplicates += 1
             self._record_account(
@@ -348,6 +387,14 @@ class ServiceAccountRegistry(object):
             ).fetchone()
             return row
 
+    def _is_known_invalid(self, account_key):
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM accounts WHERE status='invalid' AND account_key=? LIMIT 1",
+                (account_key,),
+            ).fetchone()
+        return row is not None
+
     def _record_account(
             self,
             account_key,
@@ -486,7 +533,8 @@ class ServiceAccountRegistry(object):
         if last_about_at is None:
             return True
         last = datetime.datetime.strptime(last_about_at, "%Y-%m-%dT%H:%M:%SZ")
-        age = datetime.datetime.utcnow() - last
+        last = last.replace(tzinfo=datetime.timezone.utc)
+        age = datetime.datetime.now(datetime.timezone.utc) - last
         return age.total_seconds() > self.cache_ttl_hours * 3600
 
     def ls_cache_by_remote(self, remote, path):
@@ -666,12 +714,30 @@ class ServiceAccountRegistry(object):
             )
             conn.execute("DELETE FROM quota_cache WHERE account_id=?", (account_id,))
             conn.execute("DELETE FROM ls_cache WHERE account_id=?", (account_id,))
-        for path in set(path for path in (account['managed_path'], account['source_path']) if path):
+        for path in sorted(set(path for path in (account['managed_path'], account['source_path']) if path)):
             try:
                 os.remove(path)
+                logging.debug(
+                    'removed service account file after --sa-delete-account-not-found: %s',
+                    path,
+                )
             except FileNotFoundError:
                 pass
         return True
+
+    def mark_active_account_invalid(self, account_id, reason):
+        """Disable a confirmed invalid account without removing its JSON files."""
+        now = self._utcnow()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE accounts
+                SET status='invalid', invalid_reason=?, remote_name=NULL, updated_at=?
+                WHERE id=? AND status='active'
+                """,
+                (reason, now, account_id),
+            )
+            return cursor.rowcount > 0
 
     def mark_remote_quota_exhausted(self, remote):
         account = self.quota_by_remote(remote)
@@ -737,4 +803,4 @@ class ServiceAccountRegistry(object):
 
     @staticmethod
     def _utcnow():
-        return datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")

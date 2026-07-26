@@ -30,6 +30,7 @@ $ ./sprinkle/sprinkle.py -d --drive-id YouDriveID backup /Users/user/workspace/M
 For already imported accounts, `--sa-delete-account-not-found` is an explicit cleanup option. It removes
 the managed and source JSON only when Google returns `Invalid grant: account not found`; other validation
 and quota failures remain non-destructive.
+Known invalid accounts are skipped during later backups, so they do not trigger repeated quota checks.
 
 * run an auditable monthly Google Drive service-account keepalive through Cron
 
