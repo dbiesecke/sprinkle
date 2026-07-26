@@ -634,7 +634,7 @@ class ClSyncPlacementTest(unittest.TestCase):
         )
         self.assertEqual(sync.get_backup_remote_root_for_remote_source("hidrive:", "public/Manga"), "/Manga")
 
-    def test_sa_stats_refreshes_service_account_file_cache(self):
+    def test_sa_stats_refreshes_quota_without_recursive_file_listing(self):
         with tempfile.TemporaryDirectory() as tmp:
             source = os.path.join(tmp, "source")
             store = os.path.join(tmp, "store")
@@ -651,16 +651,8 @@ class ClSyncPlacementTest(unittest.TestCase):
                 sprinkle._refresh_service_account_quota = (
                     lambda _account: ({"total": 100, "used": 20, "free": 80}, None)
                 )
-                sprinkle._refresh_service_account_file_cache = (
-                    lambda _account: (json.dumps([{
-                        "Path": "Movies/Aladin/movie.mkv",
-                        "Name": "movie.mkv",
-                        "Size": 10,
-                        "MimeType": "video/x-matroska",
-                        "ModTime": "2024-01-01T00:00:00Z",
-                        "IsDir": False,
-                        "ID": "file-id",
-                    }]), None)
+                sprinkle._refresh_service_account_file_cache = lambda _account: self.fail(
+                    "sa-stats must not recursively list Drive files"
                 )
                 common.print_line = lambda _message="": None
                 sprinkle.read_args([
@@ -685,8 +677,7 @@ class ClSyncPlacementTest(unittest.TestCase):
                 registry.active_accounts()[0]["id"],
                 "/",
             )
-            self.assertIsNotNone(cache_row)
-            self.assertEqual(cache_row["file_count"], 1)
+            self.assertIsNone(cache_row)
 
     def test_backup_preserves_cwd_relative_directory_in_remote_destination(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1168,9 +1159,13 @@ class ServiceAccountCliTest(unittest.TestCase):
             registry.import_paths([source])
             messages = []
             old_print_line = common.print_line
+            old_refresh = sprinkle._refresh_service_account_quota
 
             try:
                 common.print_line = lambda message="": messages.append(message)
+                sprinkle._refresh_service_account_quota = (
+                    lambda _account: ({"total": 100, "used": 20, "free": 80}, None)
+                )
                 service_accounts.DEFAULT_STORE_DIR = store
                 sprinkle.read_args([
                     "--drive-id",
@@ -1198,7 +1193,62 @@ class ServiceAccountCliTest(unittest.TestCase):
                 self.assertTrue(any("--rclone-sa-dir" in message for message in messages))
             finally:
                 common.print_line = old_print_line
+                sprinkle._refresh_service_account_quota = old_refresh
                 service_accounts.DEFAULT_STORE_DIR = default_store
+                generated = getattr(sprinkle, "__rclone_conf", None)
+                if generated and os.path.exists(generated):
+                    os.unlink(generated)
+
+    def test_backup_config_uses_only_accounts_with_successful_free_quota(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "source")
+            store = os.path.join(tmp, "store")
+            db_path = os.path.join(tmp, "sa.sqlite3")
+            base_conf = os.path.join(tmp, "rclone.conf")
+            os.mkdir(source)
+            with open(base_conf, "w") as fp:
+                fp.write("")
+            write_json(os.path.join(source, "ready.json"), make_service_account("ready@example.test", "ready"))
+            write_json(os.path.join(source, "full.json"), make_service_account("full@example.test", "full"))
+            write_json(os.path.join(source, "failed.json"), make_service_account("failed@example.test", "failed"))
+            registry = service_accounts.ServiceAccountRegistry(db_path, store)
+            registry.import_paths([source])
+            old_refresh = sprinkle._refresh_service_account_quota
+
+            def refresh(account):
+                if account["client_email"] == "ready@example.test":
+                    return {"total": 100, "used": 25, "free": 75}, None
+                if account["client_email"] == "full@example.test":
+                    return {"total": 100, "used": 100, "free": 0}, None
+                return None, "rclone about failed"
+
+            try:
+                sprinkle._refresh_service_account_quota = refresh
+                sprinkle.read_args([
+                    "--rclone-sa-dir", store,
+                    "--drive-id", "drive-id",
+                    "--rclone-conf", base_conf,
+                    "--sa-db", db_path,
+                    "--sa-store", store,
+                    "--sa-refresh", "all",
+                    "--rclone-env-file", os.path.join(tmp, "rclone.env"),
+                    "backup",
+                    "/tmp/local",
+                ])
+                sprinkle.configure(None)
+                sprinkle.prepare_rclone_sa_config()
+                conf_path = getattr(sprinkle, "__rclone_conf")
+                with open(conf_path) as fp:
+                    content = fp.read()
+
+                self.assertEqual(content.count("[dst"), 1)
+                rows = registry.active_accounts()
+                paths = dict((row["client_email"], row["managed_path"]) for row in rows)
+                self.assertIn(paths["ready@example.test"], content)
+                self.assertNotIn(paths["full@example.test"], content)
+                self.assertNotIn(paths["failed@example.test"], content)
+            finally:
+                sprinkle._refresh_service_account_quota = old_refresh
                 generated = getattr(sprinkle, "__rclone_conf", None)
                 if generated and os.path.exists(generated):
                     os.unlink(generated)

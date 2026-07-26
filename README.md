@@ -40,6 +40,9 @@ capacity-qualified remote in order of available space. Any unresolved operations
 end and return a non-zero status, so scheduled jobs and SMTP alerts remain reliable. Resolve the remote
 or quota problem and rerun the backup; already completed files are not uploaded again.
 
+Before clustered backups, Sprinkle only generates remotes for active service accounts with a successful,
+positive free-space quota. `sa-stats` refreshes quota data without recursively listing the Drive contents.
+
 * create a home-directory configuration with interactive defaults
 
 ```bash

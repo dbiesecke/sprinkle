@@ -55,6 +55,12 @@ When neither setting is present, classic remotes use rclone's normal default loc
 operations do not use that fallback: Sprinkle generates a temporary configuration for the selected
 account, supplies it through `--config`, and removes it after the operation.
 
+## Logging
+
+Debug logging is enabled by default. Sprinkle also applies the configured level to existing root handlers,
+so earlier library logging cannot silently suppress its diagnostics. Set `debug=false` in `sprinkle.conf`
+when only normal informational output is wanted.
+
 ## Service-account example
 
 Import synthetic or real account files into the managed store, then refresh every active account:
@@ -80,6 +86,11 @@ rclone_env_file=~/.sprinkle/rclone.env
 
 Service-account JSON contains secrets. Do not print, log, or commit it. Imports with unknown quota or
 failed rclone validation are quarantined by default.
+
+`backup` refreshes missing or stale quota data before generating its clustered rclone configuration.
+Only active accounts with a successful quota check and positive known free space are included; file-size
+placement still applies its normal per-upload capacity check. `sa-stats` refreshes account quotas only and
+does not recursively list every Drive file, so it remains suitable for very large Drive folders.
 
 ## Backup failures
 

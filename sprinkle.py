@@ -1087,19 +1087,22 @@ def prepare_rclone_sa_config():
     source_dir = os.path.abspath(os.path.expanduser(rclone_sa_dir))
     managed_store_dir = os.path.abspath(os.path.expanduser(__config.get('sa_store')))
     if source_dir == managed_store_dir:
-        selected_files = [
-            account['managed_path']
-            for account in registry.active_accounts()
-            if account['managed_path']
-        ]
+        accounts = registry.active_accounts()
     else:
         import_result = registry.import_paths(
             [rclone_sa_dir],
             __config.get('sa_clean_invalid', service_accounts.DEFAULT_CLEAN_INVALID),
         )
-        selected_files = import_result.selected_files
+        imported_paths = set(os.path.abspath(path) for path in import_result.selected_files)
+        accounts = [
+            account for account in registry.active_accounts()
+            if account['managed_path'] and os.path.abspath(account['managed_path']) in imported_paths
+        ]
+    if len(__args) > 0 and __args[0] == 'backup':
+        accounts = _backup_accounts_with_free_space(registry, accounts)
+    selected_files = [account['managed_path'] for account in accounts if account['managed_path']]
     if len(selected_files) == 0:
-        raise Exception("no valid service accounts found in " + rclone_sa_dir)
+        raise Exception("no valid service accounts with known free space found in " + rclone_sa_dir)
     config_text, entries = rclone.generate_rclone_config_from_files(
         selected_files,
         tmp_conf,
@@ -1146,23 +1149,28 @@ def load_exclusion_file(exclude_file):
 
 
 def init_logging(debug, daemon_mode=False):
+    level = logging.DEBUG if debug is True else logging.INFO
     if debug is True:
         logging.basicConfig(format='%(asctime)s %(message)s',
                             datefmt='%m/%d/%Y %I:%M:%S %p',
-                            level=logging.DEBUG,
+                            level=level,
                             filename=__log_file)
-        logging.getLogger('sprinkle').setLevel(logging.DEBUG)
     else:
         if daemon_mode is False:
             logging.basicConfig(format='%(message)s',
-                                level=logging.INFO,
+                                level=level,
                                 filename=__log_file)
         else:
             logging.basicConfig(format='%(asctime)s %(message)s',
                                 datefmt='%m/%d/%Y %I:%M:%S %p',
-                                level=logging.INFO,
+                                level=level,
                                 filename=__log_file)
-        logging.getLogger('sprinkle').setLevel(logging.INFO)
+    # basicConfig is a no-op after an earlier library configured the root logger.
+    root_logger = logging.getLogger()
+    root_logger.setLevel(level)
+    for handler in root_logger.handlers:
+        handler.setLevel(level)
+    logging.getLogger('sprinkle').setLevel(level)
 
 
 def config_command(prompt_func=input, output_path=None):
@@ -1638,22 +1646,12 @@ def sa_stats():
     if globals().get('__sa_refresh') is None and refresh_mode == service_accounts.DEFAULT_REFRESH_MODE:
         refresh_mode = 'stale'
     refreshed = 0
-    files_cached = 0
-    file_cache_errors = 0
     for account in registry.active_accounts():
         quota_row = registry.quota_by_account_id(account['id'])
         if registry.should_refresh(quota_row, refresh_mode):
             quota, error = _refresh_service_account_quota(account)
             registry.update_quota(account['id'], quota, error)
             refreshed += 1
-        ls_cache_row = registry.ls_cache_by_account_id(account['id'], '/')
-        if registry.should_refresh_ls_cache(ls_cache_row, refresh_mode):
-            json_text, error = _refresh_service_account_file_cache(account)
-            registry.update_ls_cache(account['id'], '/', json_text, error)
-            if error is None:
-                files_cached += 1
-            else:
-                file_cache_errors += 1
 
     counts = registry.summary_counts()
     ls_summary = registry.ls_cache_summary()
@@ -1684,8 +1682,6 @@ def sa_stats():
     common.print_line('duplicates:  ' + str(counts.get('duplicate', 0)))
     common.print_line('invalid:     ' + str(counts.get('invalid', 0)))
     common.print_line('refreshed:   ' + str(refreshed))
-    common.print_line('file caches: ' + str(files_cached))
-    common.print_line('file cache errors: ' + str(file_cache_errors))
     common.print_line('cached paths:' + str(ls_summary['cached_paths']))
     common.print_line('cached files:' + str(ls_summary['files']))
     common.print_line('errors:      ' + str(error_count))
@@ -1762,6 +1758,29 @@ def _refresh_service_account_quota(account):
             os.unlink(tmp_conf)
         except Exception:
             pass
+
+
+def _backup_accounts_with_free_space(registry, accounts):
+    """Return active accounts whose current quota can safely receive an upload."""
+    eligible = []
+    refresh_mode = __config['sa_refresh']
+    for account in accounts:
+        quota_row = registry.quota_by_account_id(account['id'])
+        if registry.should_refresh(quota_row, refresh_mode):
+            quota, error = _refresh_service_account_quota(account)
+            registry.update_quota(account['id'], quota, error)
+            quota_row = registry.quota_by_account_id(account['id'])
+        free = None if quota_row is None else quota_row['free']
+        error = None if quota_row is None else quota_row['last_error']
+        if error is not None or free is None or free <= 0:
+            logging.warning(
+                'excluding service account from backup: ' +
+                (account['client_email'] or account['account_key']) +
+                ' has no known free space'
+            )
+            continue
+        eligible.append(account)
+    return eligible
 
 
 def _refresh_service_account_file_cache(account):
