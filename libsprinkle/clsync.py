@@ -458,6 +458,21 @@ class ClSync:
             self._sa_registry.invalidate_ls_cache_for_remote(remote)
         self._clear_memory_ls_cache()
 
+    def mark_remote_quota_exhausted(self, remote):
+        """Exclude a remote after Google confirms that its quota is exhausted."""
+        self._cached_free[remote] = 0
+        if getattr(self, '_frees', None) is not None and remote in self._frees:
+            self._frees[remote] = 0
+        if self._sa_registry is not None:
+            self._sa_registry.mark_remote_quota_exhausted(remote)
+
+    def _is_storage_quota_exceeded(self, error):
+        text = str(error).lower()
+        return (
+            'storagequotaexceeded' in text or
+            'drive storage quota has been exceeded' in text
+        )
+
     def _get_remote_quota(self, remote):
         cached = None
         if self._sa_registry is not None:
@@ -635,7 +650,6 @@ class ClSync:
             local_clfile = local_clfiles[local_path]
             if local_clfile.is_dir:
                 continue
-            logging.debug('checking local clfile: ' + local_path + " name: " + local_clfile.name)
             remote_name = self.remote_key_for_source_path(
                 local_dir,
                 local_clfile.path + '/' + local_clfile.name,
@@ -643,15 +657,14 @@ class ClSync:
                 source_is_remote,
             )
             remote_path = os.path.dirname(remote_name).replace('\\', '/')
-            logging.debug('remote name: ' + remote_name)
             if remote_name not in remote_clfiles:
-                logging.debug('not found in remote_clfiles')
+                logging.debug('compare file local=%s remote=%s result=add', local_path, remote_name)
                 local_clfile.remote_path = remote_path
                 op = operation.Operation(operation.Operation.ADD,
                                          local_clfile, None)
                 operations.append(op)
             else:
-                logging.debug('file found in remote_clfiles')
+                logging.debug('compare file local=%s remote=%s result=existing', local_path, remote_name)
                 remote_clfile = remote_clfiles[remote_name]
                 if self._compare_method == 'size':
                     size_local = local_clfile.size
@@ -833,7 +846,11 @@ class ClSync:
                                 break
                             except Exception as e:
                                 errors.append(e)
-                                logging.warning('copy to ' + remote + ' failed: ' + str(e))
+                                if self._is_storage_quota_exceeded(e):
+                                    self.mark_remote_quota_exhausted(remote)
+                                    logging.warning('copy to ' + remote + ' failed: storage quota exceeded; marking remote full')
+                                else:
+                                    logging.warning('copy to ' + remote + ' failed: ' + str(e))
                         if not copied:
                             raise Exception('; '.join(str(error) for error in errors))
                     except Exception as e:
@@ -848,6 +865,8 @@ class ClSync:
                         if dry_run is False:
                             self.copy(op.src.path + '/' + op.src.name, op.src.remote_path, op.src.remote)
                     except Exception as e:
+                        if self._is_storage_quota_exceeded(e):
+                            self.mark_remote_quota_exhausted(op.src.remote)
                         record_failure(op, e, [op.src.remote])
                 elif op.operation == operation.Operation.REMOVE and delete_files is True:
                     try:

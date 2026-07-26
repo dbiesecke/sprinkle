@@ -19,7 +19,7 @@ Sprinkle now needs to handle very large Google Drive service-account collections
 - Invalid accounts, rclone validation errors, and unknown quota results are quarantined by default and can be ignored or deleted only through an explicit cleanup option.
 - `sa-stats` reads the registry, refreshes missing or stale quota data depending on the selected mode, and prints cached capacity totals.
 - `--rclone-sa-dir` imports and dedupes first, then generates rclone config sections from canonical managed files.
-- `sprinkle.py config` writes `~/.sprinkle/sprinkle.conf` interactively and can persist defaults equivalent to `--rclone-sa-count 5 --drive-id XXXXX -d --rclone-sa-dir /etc/rclone/sa`.
+- `sprinkle.py config` writes `~/.sprinkle/sprinkle.conf` interactively and can persist defaults equivalent to `--rclone-sa-count 20 --drive-id XXXXX -d --rclone-sa-dir /etc/rclone/sa`.
 
 ## Cache Strategy
 

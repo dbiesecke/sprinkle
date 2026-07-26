@@ -650,6 +650,46 @@ class ServiceAccountRegistry(object):
                 now,
             ))
 
+    def delete_active_account(self, account_id, reason):
+        """Disable an active account and remove its managed and source JSON files."""
+        with self._connect() as conn:
+            account = conn.execute(
+                "SELECT source_path, managed_path FROM accounts WHERE id=? AND status='active'",
+                (account_id,),
+            ).fetchone()
+            if account is None:
+                return False
+            now = self._utcnow()
+            conn.execute(
+                "UPDATE accounts SET status='invalid', invalid_reason=?, remote_name=NULL, updated_at=? WHERE id=?",
+                (reason, now, account_id),
+            )
+            conn.execute("DELETE FROM quota_cache WHERE account_id=?", (account_id,))
+            conn.execute("DELETE FROM ls_cache WHERE account_id=?", (account_id,))
+        for path in set(path for path in (account['managed_path'], account['source_path']) if path):
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+        return True
+
+    def mark_remote_quota_exhausted(self, remote):
+        account = self.quota_by_remote(remote)
+        if account is None:
+            return
+        now = self._utcnow()
+        with self._connect() as conn:
+            conn.execute("""
+                INSERT INTO quota_cache (
+                    account_id, free, last_about_at, last_error, updated_at
+                ) VALUES (?, 0, ?, NULL, ?)
+                ON CONFLICT(account_id) DO UPDATE SET
+                    free=0,
+                    last_about_at=excluded.last_about_at,
+                    last_error=NULL,
+                    updated_at=excluded.updated_at
+            """, (account["account_id"], now, now))
+
     def adjust_quota_for_remote(self, remote, byte_delta):
         row = self.quota_by_remote(remote)
         if row is None:

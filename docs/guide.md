@@ -145,7 +145,7 @@ $ python3 sprinkle.py config
 rclone_move: move files instead of copying them [Y/n]: Y
 delete_files: delete files after 1-way sync [y/N]:
 debug output (-d) [Y/n]:
-rclone_sa_count [5]:
+rclone_sa_count [20]:
 drive_id [XXXXX]: GDRIVE_FOLDER_ID
 rclone_sa_dir [/etc/rclone/sa]:
 sa_cache_ttl_hours [72]:
@@ -156,7 +156,7 @@ sa_clean_invalid {none|quarantine|delete} [quarantine]:
 The generated config can also store defaults equivalent to:
 
 ```
---rclone-sa-count 5 --drive-id GDRIVE_FOLDER_ID -d --rclone-sa-dir /etc/rclone/sa
+--rclone-sa-count 20 --drive-id GDRIVE_FOLDER_ID -d --rclone-sa-dir /etc/rclone/sa
 ```
 
 Sprinkle never passes an inherited `RCLONE_CONFIG` to rclone. The key is also ignored when it appears

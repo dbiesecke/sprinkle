@@ -121,6 +121,62 @@ class ServiceAccountRegistryTest(unittest.TestCase):
             self.assertEqual(quota["free"], 40)
             self.assertEqual(quota["last_error"], "rclone about failed")
 
+    def test_storage_quota_error_marks_remote_cache_as_full(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "source")
+            os.mkdir(source)
+            write_json(os.path.join(source, "one.json"), make_service_account("one@example.test"))
+            registry = service_accounts.ServiceAccountRegistry(
+                os.path.join(tmp, "sa.sqlite3"),
+                os.path.join(tmp, "store"),
+            )
+            registry.import_paths([source])
+            account = registry.active_accounts()[0]
+            registry.assign_remote_names([{"remote": "dst101", "path": account["managed_path"]}])
+            registry.update_quota(account["id"], {"total": 100, "used": 100, "free": 0}, None)
+
+            registry.mark_remote_quota_exhausted("dst101:")
+
+            quota = registry.quota_by_remote("dst101:")
+            self.assertEqual(quota["free"], 0)
+            self.assertIsNone(quota["last_error"])
+
+    def test_account_not_found_cleanup_requires_explicit_option(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "source")
+            os.mkdir(source)
+            source_file = os.path.join(source, "one.json")
+            write_json(source_file, make_service_account("one@example.test"))
+            registry = service_accounts.ServiceAccountRegistry(
+                os.path.join(tmp, "sa.sqlite3"),
+                os.path.join(tmp, "store"),
+            )
+            registry.import_paths([source])
+            account = registry.active_accounts()[0]
+            managed_file = account["managed_path"]
+            old_config = getattr(sprinkle, "__config", None)
+            error = '{"error_description":"Invalid grant: account not found"}'
+
+            try:
+                setattr(sprinkle, "__config", {"sa_delete_account_not_found": False})
+                self.assertFalse(sprinkle._delete_account_not_found_if_requested(registry, account, error))
+                self.assertTrue(os.path.exists(source_file))
+                self.assertTrue(os.path.exists(managed_file))
+
+                setattr(sprinkle, "__config", {"sa_delete_account_not_found": True})
+                self.assertTrue(sprinkle._delete_account_not_found_if_requested(registry, account, error))
+            finally:
+                setattr(sprinkle, "__config", old_config)
+
+            self.assertFalse(os.path.exists(source_file))
+            self.assertFalse(os.path.exists(managed_file))
+            self.assertEqual(len(registry.active_accounts()), 0)
+            self.assertEqual(registry.all_account_stats()[0]["status"], "invalid")
+
+    def test_account_not_found_detection_rejects_other_invalid_grants(self):
+        self.assertTrue(sprinkle._is_account_not_found_error("Invalid grant: account not found"))
+        self.assertFalse(sprinkle._is_account_not_found_error("Invalid grant: Invalid JWT Signature"))
+
     def test_import_validator_stores_quota_and_reports_progress(self):
         with tempfile.TemporaryDirectory() as tmp:
             source = os.path.join(tmp, "source")
@@ -343,6 +399,31 @@ class RCloneQuotaTest(unittest.TestCase):
 
 
 class ClSyncPlacementTest(unittest.TestCase):
+    def test_missing_file_comparison_uses_single_debug_line(self):
+        sync = clsync.ClSync.__new__(clsync.ClSync)
+        sync._compare_method = "size"
+        local_file = types.SimpleNamespace(
+            path="./roms/SPC",
+            name="Super Trump Collection [01-Title Screen][n].spc",
+            size=1,
+            is_dir=False,
+        )
+
+        with self.assertLogs(level="DEBUG") as logs:
+            operations = sync.compare_clfiles_for_remote_root(
+                "./roms",
+                {"./roms/SPC/Super Trump Collection [01-Title Screen][n].spc": local_file},
+                {},
+                delete_file=False,
+                remote_root="/roms",
+            )
+
+        compare_logs = [line for line in logs.output if "compare file local=" in line]
+        self.assertEqual(len(operations), 1)
+        self.assertEqual(len(compare_logs), 1)
+        self.assertIn("result=add", compare_logs[0])
+        self.assertFalse(any("remote name:" in line for line in logs.output))
+
     def test_lsjson_results_are_cached_by_service_account_remote(self):
         with tempfile.TemporaryDirectory() as tmp:
             source = os.path.join(tmp, "source")
@@ -796,6 +877,36 @@ class ClSyncPlacementTest(unittest.TestCase):
 
             self.assertEqual([call[2] for call in copies], ["dst102:", "dst101:"])
             self.assertEqual(marked, [("dst101:", len("synthetic movie"))])
+
+    def test_backup_marks_storage_quota_remote_full_before_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            local_file = os.path.join(tmp, "movie.mkv")
+            with open(local_file, "w") as fp:
+                fp.write("synthetic movie")
+            sync = clsync.ClSync.__new__(clsync.ClSync)
+            sync._show_progress = False
+            sync._compare_method = "size"
+            sync._ClSync__exclusion_list = None
+            sync._ClSync__exclude_regex = None
+            sync._cached_free = {"dst102:": 100, "dst101:": 100}
+            sync._frees = None
+            sync._sa_registry = None
+            sync.ls_shallow = lambda _path, **_kwargs: {}
+            sync.get_eligible_remotes = lambda _size: ["dst102:", "dst101:"]
+            copied = []
+
+            def copy(_src, _dst, remote):
+                copied.append(remote)
+                if remote == "dst102:":
+                    raise Exception("googleapi: Error 403, storageQuotaExceeded")
+
+            sync.copy = copy
+            sync.mark_remote_used = lambda _remote, _size: None
+
+            sync.backup(tmp, delete_files=False, dry_run=False)
+
+            self.assertEqual(copied, ["dst102:", "dst101:"])
+            self.assertEqual(sync._cached_free["dst102:"], 0)
 
     def test_backup_continues_when_all_add_candidates_fail(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1268,7 +1379,7 @@ class ServiceAccountCliTest(unittest.TestCase):
             self.assertIn("rclone_move=true", content)
             self.assertIn("delete_files=false", content)
             self.assertIn("debug=true", content)
-            self.assertIn("rclone_sa_count=5", content)
+            self.assertIn("rclone_sa_count=20", content)
             self.assertIn("drive_id=drive-folder", content)
             self.assertIn("rclone_sa_dir=/etc/rclone/sa", content)
             self.assertIn("sa_cache_ttl_hours=72", content)

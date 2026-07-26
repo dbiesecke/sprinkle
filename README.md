@@ -13,7 +13,7 @@ backup and recovery. Sprinkle uses the excellent [RClone](https://rclone.org) so
 ```bash
 # will load 5 sa accounts from /etc/rclone/sa & root_folder it is set to "XXXXX" ( your public gdrive dir)
 
-$ docker run -i -v /etc/rclone:/etc/rclone:ro dbiesecke/sprinkle --rclone-sa-count 5 --drive-id XXXXX -d --rclone-sa-dir /etc/rclone/sa stats
+$ docker run -i -v /etc/rclone:/etc/rclone:ro dbiesecke/sprinkle --rclone-sa-count 20 --drive-id XXXXX -d --rclone-sa-dir /etc/rclone/sa stats
 ```
 
 * import, dedupe, validate, quarantine, and cache Google Drive service account quota data
@@ -26,6 +26,10 @@ $ ./sprinkle/sprinkle.py -d --drive-id YouDriveID backup /Users/user/workspace/M
 ```
 
 `sa-import` validates new accounts with `rclone about --json` and prints per-file progress. If rclone returns an error or quota remains unknown, the account is recorded as invalid and quarantined by default.
+
+For already imported accounts, `--sa-delete-account-not-found` is an explicit cleanup option. It removes
+the managed and source JSON only when Google returns `Invalid grant: account not found`; other validation
+and quota failures remain non-destructive.
 
 * run an auditable monthly Google Drive service-account keepalive through Cron
 
@@ -42,13 +46,15 @@ or quota problem and rerun the backup; already completed files are not uploaded 
 
 Before clustered backups, Sprinkle only generates remotes for active service accounts with a successful,
 positive free-space quota. `sa-stats` refreshes quota data without recursively listing the Drive contents.
+If rclone reports Google `storageQuotaExceeded` during a copy, Sprinkle marks that remote as full and
+immediately falls back to the next capacity-qualified remote.
 
 * create a home-directory configuration with interactive defaults
 
 ```bash
 $ ./sprinkle.py config
 # writes ~/.sprinkle/sprinkle.conf, including:
-# --rclone-sa-count 5 --drive-id XXXXX -d --rclone-sa-dir /etc/rclone/sa
+# --rclone-sa-count 20 --drive-id XXXXX -d --rclone-sa-dir /etc/rclone/sa
 # rclone_env_file=~/.sprinkle/rclone.env
 # sa_cache_ttl_hours=72
 # sa_refresh=stale

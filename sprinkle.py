@@ -194,6 +194,7 @@ OPTIONS:
     --sa-cache-ttl-hours {num}   hours before cached SA quota is stale (default:72)
     --sa-refresh {mode}          SA quota refresh [missing|stale|all|none] (default:stale)
     --sa-clean-invalid {mode}    invalid SA cleanup [none|quarantine|delete] (default:quarantine)
+    --sa-delete-account-not-found delete SA JSON files after a confirmed account-not-found error
     --sa-group-size {num}        preferred SA grouping size for generated operator configs
     --rclone-exe {rclone_exe}    rclone executable (default:rclone)
     --rclone-move                use 'rclone move' instead of 'rclone copy' (default:false)
@@ -594,6 +595,7 @@ def read_args(argv):
     global __sa_cache_ttl_hours
     global __sa_refresh
     global __sa_clean_invalid
+    global __sa_delete_account_not_found
     global __sa_group_size
     global __rclone_sa_dir
     global __rclone_sa_count
@@ -638,6 +640,7 @@ def read_args(argv):
     __sa_cache_ttl_hours = None
     __sa_refresh = None
     __sa_clean_invalid = None
+    __sa_delete_account_not_found = None
     __sa_group_size = None
     __rclone_sa_dir = None
     __rclone_sa_count = None
@@ -662,6 +665,7 @@ def read_args(argv):
                                     "sa-cache-ttl-hours=",
                                     "sa-refresh=",
                                     "sa-clean-invalid=",
+                                    "sa-delete-account-not-found",
                                     "sa-group-size=",
                                     "stats=",
                                     "display-unit=",
@@ -739,6 +743,8 @@ def read_args(argv):
             if arg not in ("none", "quarantine", "delete"):
                 raise Exception("--sa-clean-invalid must be one of none, quarantine, delete")
             __sa_clean_invalid = arg
+        elif opt in ("--sa-delete-account-not-found"):
+            __sa_delete_account_not_found = True
         elif opt in ("--sa-group-size"):
             __sa_group_size = int(arg)
         elif opt in ("--display-unit"):
@@ -842,6 +848,7 @@ def configure(config_file):
         "sa_cache_ttl_hours": service_accounts.DEFAULT_CACHE_TTL_HOURS,
         "sa_refresh": service_accounts.DEFAULT_REFRESH_MODE,
         "sa_clean_invalid": service_accounts.DEFAULT_CLEAN_INVALID,
+        "sa_delete_account_not_found": False,
         "sa_group_size": 50,
         "large_file_threshold_bytes": clsync.DEFAULT_LARGE_FILE_THRESHOLD_BYTES,
         "large_file_min_free_bytes": clsync.DEFAULT_LARGE_FILE_MIN_FREE_BYTES,
@@ -978,6 +985,9 @@ def configure(config_file):
     if __sa_clean_invalid is not None:
         __config['sa_clean_invalid'] = __sa_clean_invalid
 
+    if __sa_delete_account_not_found is not None:
+        __config['sa_delete_account_not_found'] = __sa_delete_account_not_found
+
     if __sa_group_size is not None:
         __config['sa_group_size'] = __sa_group_size
 
@@ -1000,6 +1010,7 @@ def normalize_config_types(config_values):
         'ls_stop_first',
         'check_prereq',
         'daemon_mode',
+        'sa_delete_account_not_found',
     )
     int_fields = (
         'daemon_interval',
@@ -1185,7 +1196,7 @@ def config_command(prompt_func=input, output_path=None):
     rclone_move = _prompt_bool(prompt_func, 'rclone_move: move files instead of copying them', True)
     delete_files = _prompt_bool(prompt_func, 'delete_files: delete files after 1-way sync', False)
     debug = _prompt_bool(prompt_func, 'debug output (-d)', True)
-    rclone_sa_count = _prompt_text(prompt_func, 'rclone_sa_count', '5')
+    rclone_sa_count = _prompt_text(prompt_func, 'rclone_sa_count', '20')
     drive_id = _prompt_text(prompt_func, 'drive_id', 'XXXXX')
     rclone_sa_dir = _prompt_text(prompt_func, 'rclone_sa_dir', '/etc/rclone/sa')
     sa_cache_ttl_hours = _prompt_int(
@@ -1306,6 +1317,8 @@ sa_store=~/.sprinkle/service-accounts
 sa_cache_ttl_hours={sa_cache_ttl_hours}
 sa_refresh={sa_refresh}
 sa_clean_invalid={sa_clean_invalid}
+# Delete managed and source JSON only after "Invalid grant: account not found".
+sa_delete_account_not_found=false
 sa_group_size=50
 ls_stop_first=true
 
@@ -1652,6 +1665,10 @@ def sa_stats():
             quota, error = _refresh_service_account_quota(account)
             registry.update_quota(account['id'], quota, error)
             refreshed += 1
+            quota_row = registry.quota_by_account_id(account['id'])
+        quota_error = None if quota_row is None else quota_row['last_error']
+        if _delete_account_not_found_if_requested(registry, account, quota_error):
+            continue
 
     counts = registry.summary_counts()
     ls_summary = registry.ls_cache_summary()
@@ -1770,9 +1787,11 @@ def _backup_accounts_with_free_space(registry, accounts):
             quota, error = _refresh_service_account_quota(account)
             registry.update_quota(account['id'], quota, error)
             quota_row = registry.quota_by_account_id(account['id'])
+        quota_error = None if quota_row is None else quota_row['last_error']
+        if _delete_account_not_found_if_requested(registry, account, quota_error):
+            continue
         free = None if quota_row is None else quota_row['free']
-        error = None if quota_row is None else quota_row['last_error']
-        if error is not None or free is None or free <= 0:
+        if quota_error is not None or free is None or free <= 0:
             logging.warning(
                 'excluding service account from backup: ' +
                 (account['client_email'] or account['account_key']) +
@@ -1781,6 +1800,26 @@ def _backup_accounts_with_free_space(registry, accounts):
             continue
         eligible.append(account)
     return eligible
+
+
+def _delete_account_not_found_if_requested(registry, account, error):
+    if not __config.get('sa_delete_account_not_found', False):
+        return False
+    if not _is_account_not_found_error(error):
+        return False
+    deleted = registry.delete_active_account(account['id'], str(error))
+    if deleted:
+        logging.warning(
+            'deleted service account after confirmed account-not-found error: ' +
+            (account['client_email'] or account['account_key'])
+        )
+    return deleted
+
+
+def _is_account_not_found_error(error):
+    if error is None:
+        return False
+    return 'invalid grant: account not found' in ' '.join(str(error).lower().split())
 
 
 def _refresh_service_account_file_cache(account):

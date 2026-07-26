@@ -74,18 +74,22 @@ Recommended `sprinkle.conf` values:
 
 ```ini
 drive_id=GDRIVE_FOLDER_ID
-rclone_sa_count=5
+rclone_sa_count=20
 rclone_sa_dir=~/.sprinkle/service-accounts
 sa_db=~/.sprinkle/sa-cache.sqlite3
 sa_store=~/.sprinkle/service-accounts
 sa_cache_ttl_hours=72
 sa_refresh=stale
 sa_clean_invalid=quarantine
+sa_delete_account_not_found=false
 rclone_env_file=~/.sprinkle/rclone.env
 ```
 
 Service-account JSON contains secrets. Do not print, log, or commit it. Imports with unknown quota or
 failed rclone validation are quarantined by default.
+
+Use `--sa-delete-account-not-found` only when source JSON files should be removed after the exact Google
+error `Invalid grant: account not found`. Other quota and credential errors never trigger this deletion.
 
 `backup` refreshes missing or stale quota data before generating its clustered rclone configuration.
 Only active accounts with a successful quota check and positive known free space are included; file-size
@@ -99,3 +103,6 @@ Sprinkle tries every remote with known sufficient free space, starting with the 
 Unknown quota is never used as capacity and is checked again for later files. At the end, unresolved
 operations are reported together and the command exits non-zero, preserving existing SMTP and cron
 failure handling. Fix the reported remote or quota error and rerun the backup.
+
+When rclone returns Google `storageQuotaExceeded`, Sprinkle records `free=0` for that remote in memory
+and the service-account quota cache, then tries the next eligible remote for a new file.
