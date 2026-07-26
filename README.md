@@ -11,7 +11,7 @@ backup and recovery. Sprinkle uses the excellent [RClone](https://rclone.org) so
 * load sa accounts from directory with import, dedupe, gdrive_id option & limiter
 
 ```bash
-# will load 5 sa accounts from /etc/rclone/sa & root_folder it is set to "XXXXX" ( your public gdrive dir)
+# will load 20 SA accounts from /etc/rclone/sa; root_folder is set to "XXXXX" (your public Google Drive directory)
 
 $ docker run -i -v /etc/rclone:/etc/rclone:ro dbiesecke/sprinkle --rclone-sa-count 20 --drive-id XXXXX -d --rclone-sa-dir /etc/rclone/sa stats
 ```
