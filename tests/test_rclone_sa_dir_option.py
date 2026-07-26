@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import test_import_stubs
 import sprinkle
 
 

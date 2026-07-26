@@ -1,3 +1,4 @@
+import test_import_stubs
 import sprinkle
 
 def test_rclone_move_option(tmp_path):
