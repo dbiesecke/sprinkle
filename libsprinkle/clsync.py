@@ -393,31 +393,32 @@ class ClSync:
         return total_size
 
     def get_best_remote(self, requested_size=1):
-        if self._distribution_type == 'mas':
+        remotes = self.get_eligible_remotes(requested_size)
+        if not remotes:
             required_size = self._required_free_for_upload(requested_size)
-            logging.debug(
-                'selecting best remote with the most available space to store size: ' +
-                str(requested_size) + ', required free: ' + str(required_size)
+            raise Exception(
+                'no remote has enough known free space for requested size ' +
+                str(requested_size) + ' with required free ' + str(required_size)
             )
-            best_remote = None
-            highest_size = 0
-            size = 0
-            for remote in self.get_remotes():
-                size = self._known_free_for_remote(remote)
-                logging.debug('free of ' + remote + ' is ' + str(size))
-                if size is not None and size > highest_size:
-                    if required_size <= size:
-                        highest_size = size
-                        best_remote = remote
-            if best_remote is None:
-                raise Exception(
-                    'no remote has enough known free space for requested size ' +
-                    str(requested_size) + ' with required free ' + str(required_size)
-                )
-            return best_remote
-        else:
+        return remotes[0]
+
+    def get_eligible_remotes(self, requested_size=1):
+        if self._distribution_type != 'mas':
             logging.error('distribution mode ' + self._distribution_type + ' not supported.')
             raise Exception('unsupported distribution mode ' + self._distribution_type)
+        required_size = self._required_free_for_upload(requested_size)
+        logging.debug(
+            'selecting remotes with enough available space to store size: ' +
+            str(requested_size) + ', required free: ' + str(required_size)
+        )
+        candidates = []
+        for remote in self.get_remotes():
+            size = self._known_free_for_remote(remote)
+            logging.debug('free of ' + remote + ' is ' + str(size))
+            if size is not None and required_size <= size:
+                candidates.append((size, remote))
+        candidates.sort(reverse=True)
+        return [remote for _size, remote in candidates]
 
     def ensure_remote_has_enough_space(self, remote, requested_size):
         required_size = self._required_free_for_upload(requested_size)
@@ -432,8 +433,11 @@ class ClSync:
     def _known_free_for_remote(self, remote):
         if remote not in self._cached_free:
             quota = self._get_remote_quota(remote)
-            self._cached_free[remote] = self._quota_value(quota, 'free')
-        return self._cached_free[remote]
+            free_size = self._quota_value(quota, 'free')
+            # Unknown quota must be checked again for later files, not cached as capacity.
+            if free_size is not None:
+                self._cached_free[remote] = free_size
+        return self._cached_free.get(remote)
 
     def _required_free_for_upload(self, requested_size):
         requested_size = int(requested_size)
@@ -774,6 +778,22 @@ class ClSync:
             bar = Bar('Progress', max=len(ops), suffix='%(index)d/%(max)d %(percent)d%% [%(elapsed_td)s/%(eta_td)s]')
         if dry_run is True:
             common.print_line('performing a dry run. no changes are committed')
+        failures = []
+
+        def record_failure(op, error, remotes=None):
+            error_text = re.sub(
+                r'(?i)(password|secret|token)=\S+',
+                r'\1=<redacted>',
+                str(error).replace('\\n', ' ').replace('\\r', ' '),
+            )[:300]
+            path = op.src.path + '/' + op.src.name
+            detail = op.operation + ' ' + path
+            if remotes:
+                detail += ' [' + ', '.join(remotes) + ']'
+            detail += ': ' + error_text
+            failures.append(detail)
+            logging.error('backup operation failed: ' + detail)
+
         for op in ops:
             logging.debug('operation: ' + op.operation + ", path: " + op.src.path)
             if self._show_progress:
@@ -783,44 +803,72 @@ class ClSync:
                 bar.message = 'file:' + bar_title
             if op.src.is_dir and op.operation != operation.Operation.REMOVE:
                 logging.debug('skipping directory ' + op.src.path)
-                continue
-            if op.operation == operation.Operation.ADD:
-                if target_remote is None:
-                    best_remote = self.get_best_remote(int(op.src.size))
-                else:
-                    best_remote = target_remote
-                logging.debug('best remote: ' + best_remote)
-                if not self._show_progress:
-                    common.print_line('backing up file ' + op.src.path+'/'+op.src.name +
-                                  ' -> ' + best_remote + op.src.remote_path)
-                if dry_run is False:
-                    self.copy(op.src.path+'/'+op.src.name, op.src.remote_path, best_remote)
-                    if target_remote is None:
-                        self.mark_remote_used(best_remote, int(op.src.size))
-            if op.operation == operation.Operation.UPDATE:
-                if target_remote is None:
-                    self.ensure_remote_has_enough_space(op.src.remote, int(op.src.size))
-                if not self._show_progress:
-                    common.print_line('backing up file ' + op.src.path + '/' + op.src.name +
-                                  ' -> ' + op.src.remote + op.src.remote_path)
-                if dry_run is False:
-                    self.copy(op.src.path + '/' + op.src.name, op.src.remote_path, op.src.remote)
-            if op.operation == operation.Operation.REMOVE and delete_files is True:
-                if not self._show_progress:
-                    common.print_line('removing ' + op.src.remote+op.src.path)
-                if op.src.is_dir:
-                    if dry_run is False:
-                        try:
-                            self.rmdir(op.src.path, op.src.remote)
-                        except Exception as e:
-                            logging.debug(str(e))
-                else:
-                    if dry_run is False:
-                        self.delete_file(op.src.path, op.src.remote)
+            else:
+                if op.operation == operation.Operation.ADD:
+                    candidates = None
+                    try:
+                        if target_remote is None:
+                            candidates = self.get_eligible_remotes(int(op.src.size))
+                        else:
+                            candidates = [target_remote]
+                        if not candidates:
+                            raise Exception('no remote has enough known free space')
+                        if dry_run is True:
+                            candidates = candidates[:1]
+                        copied = False
+                        errors = []
+                        for remote in candidates:
+                            logging.debug('trying remote: ' + remote)
+                            if not self._show_progress:
+                                common.print_line('backing up file ' + op.src.path + '/' + op.src.name +
+                                                  ' -> ' + remote + op.src.remote_path)
+                            if dry_run is True:
+                                copied = True
+                                break
+                            try:
+                                self.copy(op.src.path + '/' + op.src.name, op.src.remote_path, remote)
+                                if target_remote is None:
+                                    self.mark_remote_used(remote, int(op.src.size))
+                                copied = True
+                                break
+                            except Exception as e:
+                                errors.append(e)
+                                logging.warning('copy to ' + remote + ' failed: ' + str(e))
+                        if not copied:
+                            raise Exception('; '.join(str(error) for error in errors))
+                    except Exception as e:
+                        record_failure(op, e, candidates)
+                elif op.operation == operation.Operation.UPDATE:
+                    try:
+                        if target_remote is None:
+                            self.ensure_remote_has_enough_space(op.src.remote, int(op.src.size))
+                        if not self._show_progress:
+                            common.print_line('backing up file ' + op.src.path + '/' + op.src.name +
+                                              ' -> ' + op.src.remote + ':' + op.src.remote_path)
+                        if dry_run is False:
+                            self.copy(op.src.path + '/' + op.src.name, op.src.remote_path, op.src.remote)
+                    except Exception as e:
+                        record_failure(op, e, [op.src.remote])
+                elif op.operation == operation.Operation.REMOVE and delete_files is True:
+                    try:
+                        if not self._show_progress:
+                            common.print_line('removing ' + op.src.remote + op.src.path)
+                        if dry_run is False:
+                            if op.src.is_dir:
+                                self.rmdir(op.src.path, op.src.remote)
+                            else:
+                                self.delete_file(op.src.path, op.src.remote)
+                    except Exception as e:
+                        record_failure(op, e, [op.src.remote])
             if self._show_progress:
                 bar.next()
         if self._show_progress:
             bar.finish()
+        if failures:
+            raise Exception(
+                'backup completed with ' + str(len(failures)) + ' failed operation(s): ' +
+                ' | '.join(failures)
+            )
 
     def parse_backup_target(self, target):
         if target in (None, ''):

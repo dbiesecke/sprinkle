@@ -35,6 +35,11 @@ verifies the SQLite results, maintains a success marker for monitoring, and neve
 
 Sprinkle keeps upload placement capacity-aware for large files: service accounts are selected by known free space, with extra headroom for files of at least 1 GiB so a large movie is not sent to an account that only barely fits it.
 
+Backups continue after individual transfer, quota, update, or deletion failures. New files try each
+capacity-qualified remote in order of available space. Any unresolved operations are summarized at the
+end and return a non-zero status, so scheduled jobs and SMTP alerts remain reliable. Resolve the remote
+or quota problem and rerun the backup; already completed files are not uploaded again.
+
 * create a home-directory configuration with interactive defaults
 
 ```bash

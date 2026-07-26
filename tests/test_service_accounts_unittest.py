@@ -500,7 +500,7 @@ class ClSyncPlacementTest(unittest.TestCase):
             sync._compare_method = "size"
             sync._ClSync__exclusion_list = None
             sync._ClSync__exclude_regex = None
-            sync.get_best_remote = lambda _size: "dst109:"
+            sync.get_eligible_remotes = lambda _size: ["dst109:"]
             sync.mark_remote_used = lambda _remote, _size: None
             shallow_paths = []
             recursive_paths = []
@@ -591,7 +591,7 @@ class ClSyncPlacementTest(unittest.TestCase):
         sync._compare_method = "size"
         sync._ClSync__exclusion_list = None
         sync._ClSync__exclude_regex = None
-        sync.get_best_remote = lambda _size: "dst109:"
+        sync.get_eligible_remotes = lambda _size: ["dst109:"]
         sync.mark_remote_used = lambda _remote, _size: None
         source_calls = []
         target_calls = []
@@ -701,7 +701,7 @@ class ClSyncPlacementTest(unittest.TestCase):
             sync._compare_method = "size"
             sync._ClSync__exclusion_list = None
             sync._ClSync__exclude_regex = None
-            sync.get_best_remote = lambda _size: "dst109:"
+            sync.get_eligible_remotes = lambda _size: ["dst109:"]
             sync.mark_remote_used = lambda _remote, _size: None
             listed_paths = []
             copies = []
@@ -760,6 +760,121 @@ class ClSyncPlacementTest(unittest.TestCase):
 
         with self.assertRaises(Exception):
             sync.ensure_remote_has_enough_space("tight:", 1024)
+
+    def test_unknown_quota_is_not_cached_and_is_retried(self):
+        sync = clsync.ClSync.__new__(clsync.ClSync)
+        sync._cached_free = {}
+        calls = []
+
+        def quota(_remote):
+            calls.append(True)
+            if len(calls) == 1:
+                return None
+            return {"free": 100}
+
+        sync._get_remote_quota = quota
+
+        self.assertIsNone(sync._known_free_for_remote("dst101:"))
+        self.assertEqual(sync._known_free_for_remote("dst101:"), 100)
+        self.assertEqual(len(calls), 2)
+
+    def test_backup_retries_add_on_next_eligible_remote(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            local_file = os.path.join(tmp, "movie.mkv")
+            with open(local_file, "w") as fp:
+                fp.write("synthetic movie")
+            sync = clsync.ClSync.__new__(clsync.ClSync)
+            sync._show_progress = False
+            sync._compare_method = "size"
+            sync._ClSync__exclusion_list = None
+            sync._ClSync__exclude_regex = None
+            sync.ls_shallow = lambda _path, **_kwargs: {}
+            sync.get_eligible_remotes = lambda _size: ["dst102:", "dst101:"]
+            copies = []
+            marked = []
+
+            def copy(src, dst, remote):
+                copies.append((src, dst, remote))
+                if remote == "dst102:":
+                    raise Exception("temporary remote failure")
+
+            sync.copy = copy
+            sync.mark_remote_used = lambda remote, size: marked.append((remote, size))
+
+            sync.backup(tmp, delete_files=False, dry_run=False)
+
+            self.assertEqual([call[2] for call in copies], ["dst102:", "dst101:"])
+            self.assertEqual(marked, [("dst101:", len("synthetic movie"))])
+
+    def test_backup_continues_when_all_add_candidates_fail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first = os.path.join(tmp, "first.mkv")
+            second = os.path.join(tmp, "second.mkv")
+            for path in (first, second):
+                with open(path, "w") as fp:
+                    fp.write("synthetic movie")
+            sync = clsync.ClSync.__new__(clsync.ClSync)
+            sync._show_progress = False
+            sync._compare_method = "size"
+            sync._ClSync__exclusion_list = None
+            sync._ClSync__exclude_regex = None
+            sync.ls_shallow = lambda _path, **_kwargs: {}
+            sync.get_eligible_remotes = lambda _size: ["dst102:", "dst101:"]
+            copied = []
+            marked = []
+
+            def copy(src, _dst, remote):
+                copied.append((os.path.basename(src), remote))
+                if os.path.basename(src) == "first.mkv":
+                    raise Exception("both remotes unavailable")
+
+            sync.copy = copy
+            sync.mark_remote_used = lambda remote, _size: marked.append(remote)
+
+            with self.assertRaisesRegex(Exception, "1 failed operation"):
+                sync.backup(tmp, delete_files=False, dry_run=False)
+
+            self.assertEqual(
+                copied,
+                [("first.mkv", "dst102:"), ("first.mkv", "dst101:"), ("second.mkv", "dst102:")],
+            )
+            self.assertEqual(marked, ["dst102:"])
+
+    def test_backup_continues_after_update_and_delete_failures(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sync = clsync.ClSync.__new__(clsync.ClSync)
+            sync._show_progress = False
+            sync._compare_method = "size"
+            sync._ClSync__exclusion_list = None
+            sync._ClSync__exclude_regex = None
+            sync.index_local_dir = lambda _path, _exclusions: {}
+            sync.ls = lambda _path, **_kwargs: {}
+            update = types.SimpleNamespace(
+                operation="update",
+                src=types.SimpleNamespace(
+                    path=tmp, name="update.mkv", size=10, remote="dst101:", remote_path="/",
+                    is_dir=False,
+                ),
+            )
+            remove = types.SimpleNamespace(
+                operation="remove",
+                src=types.SimpleNamespace(
+                    path="/old.mkv", name="old.mkv", size=0, remote="dst101:", remote_path="/",
+                    is_dir=False,
+                ),
+            )
+            sync.compare_clfiles_for_remote_root = lambda *_args: [update, remove]
+            sync.ensure_remote_has_enough_space = lambda _remote, _size: None
+            sync.copy = lambda *_args: (_ for _ in ()).throw(Exception("update failed"))
+            deleted = []
+            sync.delete_file = lambda path, remote: deleted.append((path, remote)) or (_ for _ in ()).throw(
+                Exception("delete failed")
+            )
+
+            with self.assertRaisesRegex(Exception, "2 failed operation"):
+                sync.backup(tmp, delete_files=True, dry_run=False)
+
+            self.assertEqual(deleted, [("/old.mkv", "dst101:")])
 
 
 class ServiceAccountCliTest(unittest.TestCase):

@@ -80,3 +80,11 @@ rclone_env_file=~/.sprinkle/rclone.env
 
 Service-account JSON contains secrets. Do not print, log, or commit it. Imports with unknown quota or
 failed rclone validation are quarantined by default.
+
+## Backup failures
+
+Backup continues after an individual quota, transfer, update, or deletion failure. For new files,
+Sprinkle tries every remote with known sufficient free space, starting with the most free capacity.
+Unknown quota is never used as capacity and is checked again for later files. At the end, unresolved
+operations are reported together and the command exits non-zero, preserving existing SMTP and cron
+failure handling. Fix the reported remote or quota error and rerun the backup.
