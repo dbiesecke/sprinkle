@@ -244,11 +244,24 @@ total:                           45G                   1G          3
 To backup (sprinkle) a local directory over to clustered volumes, use:
 ##### for Windows:
 ```
-C:\>rclone backup C:\dir_to_backup
+C:\>python sprinkle.py backup C:\dir_to_backup
 ```
 ##### for Linux:
 ```
-$ rclone backup /dir_to_backup
+$ sprinkle.py backup /dir_to_backup
+```
+
+To back up to one explicit rclone target from the normal rclone config, pass the
+target after the local directory:
+
+```
+$ sprinkle.py backup /dir_to_backup hidrive:public/Manga
+```
+
+Both sides can be rclone remotes:
+
+```
+$ sprinkle.py backup hidrive:public/Manga backup:mirror/Manga
 ```
 
 ## Restore

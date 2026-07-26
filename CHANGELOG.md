@@ -6,6 +6,8 @@
 - Added first-use rollout of `~/.sprinkle/rclone.env` with defaults for Google Drive chunk size, size-only comparison, and modtime handling.
 - Added `--progress` as the preferred progress option and `-v`/`--verbose` to set `RCLONE_VERBOSE=1`; version output remains available through `--version`.
 - Fixed rclone JSON parsing when `RCLONE_PROGRESS=1` appends transfer progress to `lsjson` or `about --json` output.
+- Added rclone remote backup sources and explicit targets, such as `backup hidrive:public/Manga backup:mirror/Manga`, using normal rclone remotes.
+- Service-account generated rclone configs now include the existing rclone config while keeping clustered placement limited to generated service-account remotes.
 - Improved service-account file listing behavior so missing Drive folders with `--ls-stop-first` do not scan every service-account remote.
 - Reduced backup listing work for `delete_files=false` by checking only relevant remote parent directories.
 - Added service-account listing cache support and related regression coverage.

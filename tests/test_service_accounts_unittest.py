@@ -283,6 +283,28 @@ class RCloneQuotaTest(unittest.TestCase):
             self.assertIn("service_account_file = " + sa_file, content)
             self.assertIn("root_folder_id = drive-id", content)
 
+    def test_generate_rclone_config_includes_base_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sa_file = os.path.join(tmp, "account.json")
+            base_conf = os.path.join(tmp, "base-rclone.conf")
+            out = os.path.join(tmp, "rclone.conf")
+            write_json(sa_file, make_service_account("one@example.test"))
+            with open(base_conf, "w") as fp:
+                fp.write("[hidrive]\ntype = local\n")
+
+            content, entries = rclone.generate_rclone_config_from_files(
+                [sa_file],
+                out,
+                "drive-id",
+                start_index=1,
+                return_entries=True,
+                base_config_file=base_conf,
+            )
+
+            self.assertEqual(entries, [{"remote": "dst1", "path": sa_file}])
+            self.assertIn("[hidrive]", content)
+            self.assertIn("[dst1]", content)
+
     def test_generate_rclone_config_can_disable_shuffle_for_stable_selection(self):
         with tempfile.TemporaryDirectory() as tmp:
             first = os.path.join(tmp, "b.json")
@@ -482,7 +504,7 @@ class ClSyncPlacementTest(unittest.TestCase):
             shallow_paths = []
             recursive_paths = []
             copies = []
-            sync.ls_shallow = lambda path: shallow_paths.append(path) or {}
+            sync.ls_shallow = lambda path, **_kwargs: shallow_paths.append(path) or {}
             sync.ls = lambda path: recursive_paths.append(path) or {}
             sync.copy = lambda src, dst, remote: copies.append((src, dst, remote))
 
@@ -496,6 +518,120 @@ class ClSyncPlacementTest(unittest.TestCase):
             self.assertEqual(shallow_paths, ["/Movies/Aladin"])
             self.assertEqual(recursive_paths, [])
             self.assertEqual(copies, [(local_file, "/Movies/Aladin", "dst109:")])
+
+    def test_backup_to_explicit_rclone_target_uses_target_remote(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            movie_dir = os.path.join(tmp, "Manga")
+            os.makedirs(movie_dir)
+            local_file = os.path.join(movie_dir, "chapter.cbz")
+            with open(local_file, "w") as fp:
+                fp.write("synthetic manga")
+
+            sync = clsync.ClSync.__new__(clsync.ClSync)
+            sync._show_progress = False
+            sync._compare_method = "size"
+            sync._ClSync__exclusion_list = None
+            sync._ClSync__exclude_regex = None
+            sync.get_best_remote = lambda _size: self.fail("cluster placement should not be used")
+            sync.mark_remote_used = lambda _remote, _size: self.fail("cluster quota should not be updated")
+            shallow_calls = []
+            copies = []
+            sync.ls_shallow = lambda path, **kwargs: shallow_calls.append((
+                path,
+                kwargs.get("remotes"),
+                kwargs.get("normalize_path"),
+            )) or {}
+            sync.copy = lambda src, dst, remote: copies.append((src, dst, remote))
+
+            sync.backup(movie_dir, delete_files=False, dry_run=False, target="hidrive:public/Manga")
+
+            self.assertEqual(shallow_calls, [("public/Manga", ["hidrive:"], False)])
+            self.assertEqual(copies, [(local_file, "public/Manga", "hidrive:")])
+
+    def test_backup_from_rclone_source_to_rclone_target(self):
+        sync = clsync.ClSync.__new__(clsync.ClSync)
+        sync._show_progress = False
+        sync._compare_method = "size"
+        sync._ClSync__exclusion_list = None
+        sync._ClSync__exclude_regex = None
+        sync.get_best_remote = lambda _size: self.fail("cluster placement should not be used")
+        sync.mark_remote_used = lambda _remote, _size: self.fail("cluster quota should not be updated")
+        source_calls = []
+        target_calls = []
+        copies = []
+        payload = json.dumps([{
+            "Path": "chapter.cbz",
+            "Name": "chapter.cbz",
+            "Size": 10,
+            "MimeType": "application/zip",
+            "ModTime": "2024-01-01T00:00:00Z",
+            "IsDir": False,
+            "ID": "file-id",
+        }])
+        sync._rclone = types.SimpleNamespace(
+            lsjson=lambda remote, path, args, _no_error: source_calls.append((remote, path, args)) or payload
+        )
+        sync.ls_shallow = lambda path, **kwargs: target_calls.append((
+            path,
+            kwargs.get("remotes"),
+            kwargs.get("normalize_path"),
+        )) or {}
+        sync.copy = lambda src, dst, remote: copies.append((src, dst, remote))
+
+        sync.backup("hidrive:public/Manga", delete_files=False, dry_run=False, target="backup:mirror/Manga")
+
+        self.assertEqual(source_calls, [("hidrive:", "public/Manga", ["--recursive", "--fast-list"])])
+        self.assertEqual(target_calls, [("mirror/Manga", ["backup:"], False)])
+        self.assertEqual(copies, [("hidrive:public/Manga/chapter.cbz", "mirror/Manga", "backup:")])
+
+    def test_backup_from_rclone_source_to_cluster_uses_source_basename(self):
+        sync = clsync.ClSync.__new__(clsync.ClSync)
+        sync._show_progress = False
+        sync._compare_method = "size"
+        sync._ClSync__exclusion_list = None
+        sync._ClSync__exclude_regex = None
+        sync.get_best_remote = lambda _size: "dst109:"
+        sync.mark_remote_used = lambda _remote, _size: None
+        source_calls = []
+        target_calls = []
+        copies = []
+        payload = json.dumps([{
+            "Path": "chapter.cbz",
+            "Name": "chapter.cbz",
+            "Size": 10,
+            "MimeType": "application/zip",
+            "ModTime": "2024-01-01T00:00:00Z",
+            "IsDir": False,
+            "ID": "file-id",
+        }])
+        sync._rclone = types.SimpleNamespace(
+            lsjson=lambda remote, path, args, _no_error: source_calls.append((remote, path, args)) or payload
+        )
+        sync.ls_shallow = lambda path, **kwargs: target_calls.append((
+            path,
+            kwargs.get("remotes"),
+            kwargs.get("normalize_path"),
+        )) or {}
+        sync.copy = lambda src, dst, remote: copies.append((src, dst, remote))
+
+        sync.backup("hidrive:public/Manga", delete_files=False, dry_run=False)
+
+        self.assertEqual(source_calls, [("hidrive:", "public/Manga", ["--recursive", "--fast-list"])])
+        self.assertEqual(target_calls, [("/Manga", None, True)])
+        self.assertEqual(copies, [("hidrive:public/Manga/chapter.cbz", "/Manga", "dst109:")])
+
+    def test_parse_backup_target_preserves_rclone_path_style(self):
+        sync = clsync.ClSync.__new__(clsync.ClSync)
+
+        self.assertEqual(
+            sync.parse_backup_target("hidrive:public/Manga"),
+            ("hidrive:", "public/Manga"),
+        )
+        self.assertEqual(
+            sync.parse_backup_target("local:/private/tmp/Manga"),
+            ("local:", "/private/tmp/Manga"),
+        )
+        self.assertEqual(sync.get_backup_remote_root_for_remote_source("hidrive:", "public/Manga"), "/Manga")
 
     def test_sa_stats_refreshes_service_account_file_cache(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -568,7 +704,7 @@ class ClSyncPlacementTest(unittest.TestCase):
             sync.mark_remote_used = lambda _remote, _size: None
             listed_paths = []
             copies = []
-            sync.ls_shallow = lambda path: listed_paths.append(path) or {}
+            sync.ls_shallow = lambda path, **_kwargs: listed_paths.append(path) or {}
             sync.copy = lambda src, dst, remote: copies.append((src, dst, remote))
 
             try:
@@ -817,6 +953,62 @@ class ServiceAccountCliTest(unittest.TestCase):
             self.assertIn("root_folder_id = drive-id", content)
             self.assertIn(os.path.abspath(store), content)
             os.unlink(conf_path)
+
+    def test_service_account_config_includes_existing_rclone_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "source")
+            store = os.path.join(tmp, "store")
+            db_path = os.path.join(tmp, "sa.sqlite3")
+            base_conf = os.path.join(tmp, "rclone.conf")
+            os.mkdir(source)
+            write_json(os.path.join(source, "one.json"), make_service_account("one@example.test"))
+            with open(base_conf, "w") as fp:
+                fp.write("[hidrive]\ntype = local\n")
+
+            sprinkle.read_args([
+                "--rclone-conf",
+                base_conf,
+                "--rclone-sa-dir",
+                source,
+                "--rclone-sa-count",
+                "1",
+                "--drive-id",
+                "drive-id",
+                "--rclone-env-file",
+                os.path.join(tmp, "rclone.env"),
+                "--sa-db",
+                db_path,
+                "--sa-store",
+                store,
+                "stats",
+            ])
+            sprinkle.configure(None)
+            sprinkle.prepare_rclone_sa_config()
+            conf_path = getattr(sprinkle, "__rclone_conf")
+            with open(conf_path) as fp:
+                content = fp.read()
+
+            self.assertIn("[hidrive]", content)
+            self.assertIn("[dst101]", content)
+            self.assertEqual(getattr(sprinkle, "__config")["cluster_remotes"], ["dst101:"])
+            os.unlink(conf_path)
+
+    def test_explicit_backup_target_skips_default_service_account_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sprinkle.read_args([
+                "--rclone-sa-dir",
+                os.path.join(tmp, "accounts"),
+                "--rclone-env-file",
+                os.path.join(tmp, "rclone.env"),
+                "backup",
+                "/tmp/local",
+                "hidrive:public/Manga",
+            ])
+            sprinkle.configure(None)
+            sprinkle.prepare_rclone_sa_config()
+
+            self.assertNotIn("rclone_config", getattr(sprinkle, "__config"))
+            self.assertEqual(getattr(sprinkle, "__config")["rclone_sa_dir"], os.path.join(tmp, "accounts"))
 
     def test_backup_without_rclone_sa_dir_uses_default_service_account_store(self):
         with tempfile.TemporaryDirectory() as tmp:

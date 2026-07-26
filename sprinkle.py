@@ -323,24 +323,28 @@ EXAMPLES:
 def usage_backup():
     """
 NAME:
-    sprinkle backup - backs up the local directory to remote volumes
+    sprinkle backup - backs up local or rclone source paths to remote volumes
 
 SYNOPSIS:
-    sprinkle.py [options] backup {local dir}
+    sprinkle.py [options] backup {source} [remote:path]
 
 DESCRIPTION:
-    Backs up the local directory to the remote drives configured in rclone.
-    Hint: backup requires --drive-id <folder-id>. You can also pass
-    --rclone-sa-dir <path>; if omitted, Sprinkle uses the default managed
-    service-account store.
+    Backs up a local directory or rclone source path to clustered service-account
+    remotes, or to one explicit rclone target such as backup:mirror/Manga.
+    Service-account backups require --drive-id <folder-id>. Explicit rclone
+    targets use the normal rclone.conf unless --rclone-conf is supplied.
 
 ARGUMENTS:
-    local dir
-        the local directory to backup
+    source
+        local directory or rclone source path such as hidrive:public/Manga
+    remote:path
+        optional explicit rclone target
 
 EXAMPLES:
     sprinkle.py --drive-id XXXXX backup /backup
+    sprinkle.py --drive-id XXXXX backup hidrive:public/Manga
     sprinkle.py --drive-id XXXXX --rclone-sa-dir /etc/rclone/sa backup /backup
+    sprinkle.py backup hidrive:public/Manga backup:mirror/Manga
     """
     print(usage_backup.__doc__)
     print(usage_options.__doc__)
@@ -1029,6 +1033,8 @@ def verify_configuration():
 
 def prepare_rclone_sa_config():
     global __rclone_conf
+    if len(__args) > 2 and __args[0] == 'backup' and _is_rclone_remote_target(__args[2]):
+        return
     rclone_sa_dir = __config.get('rclone_sa_dir')
     if rclone_sa_dir in (None, ''):
         if len(__args) > 0 and __args[0] == 'backup':
@@ -1046,10 +1052,13 @@ def prepare_rclone_sa_config():
     if drive_id in (None, ''):
         if len(__args) > 0 and __args[0] == 'backup':
             raise Exception(
-                "backup requires --drive-id <folder-id>; optionally pass --rclone-sa-dir <path> "
-                "to override the default service-account store"
+                "backup requires --drive-id <folder-id> for service-account clustered backups; "
+                "alternatively pass a rclone target such as remote:path"
             )
         raise Exception("--drive-id option or drive_id config value is required when using rclone_sa_dir")
+    base_config_file = __config.get('rclone_config')
+    if base_config_file in (None, ''):
+        base_config_file = rclone.default_rclone_config_file()
     fd, tmp_conf = tempfile.mkstemp(prefix="rclone-", suffix=".conf")
     os.close(fd)
     registry = service_accounts.ServiceAccountRegistry(
@@ -1080,10 +1089,16 @@ def prepare_rclone_sa_config():
         max_accounts=_optional_int(__config.get('rclone_sa_count')),
         return_entries=True,
         shuffle=False,
+        base_config_file=base_config_file,
     )
     registry.assign_remote_names(entries)
+    __config['cluster_remotes'] = [entry['remote'] + ':' for entry in entries]
     __rclone_conf = tmp_conf
     __config['rclone_config'] = tmp_conf
+
+
+def _is_rclone_remote_target(target):
+    return target not in (None, '') and ':' in target and not target.startswith('/')
 
 
 def command_needs_rclone_config():
@@ -1379,8 +1394,14 @@ def backup():
         usage_backup()
         sys.exit(-1)
     local_dir = common.remove_ending_slash(__args[1])
-    common.print_line('backing up ' + local_dir + '...')
-    __cl_sync.backup(local_dir, __config['delete_files'], __config['dry_run'])
+    target = None
+    if len(__args) > 2:
+        target = common.remove_ending_slash(__args[2])
+    if target is None:
+        common.print_line('backing up ' + local_dir + '...')
+    else:
+        common.print_line('backing up ' + local_dir + ' to ' + target + '...')
+    __cl_sync.backup(local_dir, __config['delete_files'], __config['dry_run'], target)
 
 
 def restore():

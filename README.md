@@ -99,6 +99,25 @@ From this point, backups and restore can be executed on the clustered storage.
 ./sprinkle.py -c {path to sprinkle.conf} backup {directory to backup}
 ```
 
+You can also bypass clustered placement and back up to one explicit rclone target
+from the normal rclone config:
+
+```
+./sprinkle.py backup /dir_to_backup hidrive:public/Manga
+```
+
+Both source and target can be rclone remotes, so no local staging directory is
+required:
+
+```
+./sprinkle.py backup hidrive:public/Manga backup:mirror/Manga
+```
+
+When Sprinkle generates a temporary service-account rclone config, it also includes
+the existing rclone config, so configured remotes such as `hidrive:` remain
+available. Clustered placement is still limited to the generated service-account
+remotes unless an explicit target is supplied.
+
 Use the builtin --help utility to get additional commands and information.
 
 ```
