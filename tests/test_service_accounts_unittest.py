@@ -626,6 +626,41 @@ class ClSyncPlacementTest(unittest.TestCase):
 
 
 class ServiceAccountCliTest(unittest.TestCase):
+    def test_execute_does_not_pass_rclone_config_to_child(self):
+        old_rclone_config = os.environ.get("RCLONE_CONFIG")
+        try:
+            os.environ["RCLONE_CONFIG"] = "/etc/rclone/stale.conf"
+            result = common.execute([
+                sys.executable,
+                "-c",
+                "import os; print(os.environ.get('RCLONE_CONFIG', ''))",
+            ])
+            self.assertEqual(result["code"], 0)
+            self.assertEqual(result["out"], "\n")
+        finally:
+            if old_rclone_config is None:
+                os.environ.pop("RCLONE_CONFIG", None)
+            else:
+                os.environ["RCLONE_CONFIG"] = old_rclone_config
+
+    def test_rclone_env_file_rejects_rclone_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = os.path.join(tmp, "rclone.env")
+            with open(env_path, "w") as fp:
+                fp.write("RCLONE_CONFIG=/etc/rclone/stale.conf\nRCLONE_DRIVE_CHUNK_SIZE=512M\n")
+            old_rclone_config = os.environ.get("RCLONE_CONFIG")
+            try:
+                os.environ.pop("RCLONE_CONFIG", None)
+                loaded = sprinkle.apply_rclone_env_file(env_path)
+                self.assertNotIn("RCLONE_CONFIG", loaded)
+                self.assertNotIn("RCLONE_CONFIG", os.environ)
+                self.assertEqual(loaded["RCLONE_DRIVE_CHUNK_SIZE"], "512M")
+            finally:
+                if old_rclone_config is None:
+                    os.environ.pop("RCLONE_CONFIG", None)
+                else:
+                    os.environ["RCLONE_CONFIG"] = old_rclone_config
+
     def test_rclone_env_file_rolls_out_and_loads_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:
             env_path = os.path.join(tmp, "rclone.env")

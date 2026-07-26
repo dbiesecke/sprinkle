@@ -43,10 +43,15 @@ def normalize_path(path):
 def execute(command_with_args, no_error=False):
     logging.debug("Invoking : %s", " ".join(command_with_args))
     try:
+        child_env = os.environ.copy()
+        # Sprinkle chooses its rclone config explicitly.  Do not let a shell
+        # inherited RCLONE_CONFIG silently select a stale, unrelated config.
+        child_env.pop("RCLONE_CONFIG", None)
         with subprocess.Popen(
                 command_with_args,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE) as proc:
+                stderr=subprocess.PIPE,
+                env=child_env) as proc:
             (out, err) = proc.communicate()
 
             logging.debug(out[0:128])

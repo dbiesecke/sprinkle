@@ -99,6 +99,9 @@ def apply_rclone_env_file(path):
             if key == "":
                 logging.debug("ignoring empty rclone env key in " + path)
                 continue
+            if key == "RCLONE_CONFIG":
+                logging.warning("ignoring reserved RCLONE_CONFIG in " + path)
+                continue
             value = value.strip()
             os.environ[key] = value
             loaded[key] = value
