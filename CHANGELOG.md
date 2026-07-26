@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.0
+
+- Backup continues after individual remote copy, update, or delete failures and reports a compact failure summary at the end.
+- New uploads fall back to another capacity-qualified remote when a copy fails, including Google Drive `storageQuotaExceeded` responses.
+- Backup service-account selection now accepts only valid accounts with known free capacity; unknown quota never authorizes an upload.
+- Added opt-in `--sa-delete-account-not-found` cleanup for confirmed deleted Google service accounts.
+- Improved service-account status performance by avoiding recursive Drive listings and reduced noisy per-file debug logging.
+- Raised the default generated `rclone_sa_count` from 5 to 20.
+
 ## 1.1.0
 
 - Added rclone environment file support via `rclone_env_file` and `--rclone-env-file`.

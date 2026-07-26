@@ -59,13 +59,13 @@ for the respective operating system:
 ```
 C:\>python sprinkle.py --version
 VERSION:
-    1.1.0, module version: 1.1.0, rclone module version: 1.1.0
+    1.2.0, module version: 1.2.0, rclone module version: 1.2.0
 ```
 ##### for Linux:
 ```
 $  sprinkle.py --version
 VERSION:
-    1.1.0, module version: 1.1.0, rclone module version: 1.1.0
+    1.2.0, module version: 1.2.0, rclone module version: 1.2.0
 ```
 At this point, you can check prerequisites with the following command:
 ```
