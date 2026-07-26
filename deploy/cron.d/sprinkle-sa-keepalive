@@ -1,0 +1,6 @@
+# Install as /etc/cron.d/sprinkle-sa-keepalive after adapting paths.
+# A lock collision exits non-zero and does not update the success marker.
+17 3 1 * * root /usr/bin/flock -n /run/lock/sprinkle-sa-keepalive.lock /usr/local/sbin/sprinkle-sa-keepalive --sprinkle /opt/sprinkle/sprinkle.py --config /etc/sprinkle/sprinkle.conf
+
+# Optional daily freshness check; connect its exit status to the existing monitor.
+47 3 * * * root /usr/local/sbin/check-sprinkle-sa-keepalive --max-age-days 40

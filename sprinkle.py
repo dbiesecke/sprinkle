@@ -6,7 +6,7 @@ __author__ = "Michael Montuori [michael.montuori@gmail.com]"
 __copyright__ = "Copyright 2017 Michael Montuori. All rights reserved."
 __credits__ = ["Warren Crigger"]
 __license__ = "GPLv3"
-__version__ = "1.0"
+__version__ = "1.1"
 __revision__ = "0"
 __docformat__ = "reStructuredText"
 
@@ -33,9 +33,98 @@ except:
 lock = FileLock("sprinkle.lock", timeout=1)
 
 __drive_id = None
+__rclone_env_file = None
+__rclone_verbose = None
+
+DEFAULT_RCLONE_ENV_VALUES = (
+    ("RCLONE_DRIVE_CHUNK_SIZE", "256M"),
+    ("RCLONE_SIZE_ONLY", "1"),
+    ("RCLONE_NO_UPDATE_MODTIME", "1"),
+)
+
+RESERVED_RCLONE_ENV_KEYS = ("RCLONE_CONFIG",)
+
 
 def default_config_path():
     return os.path.join(os.path.expanduser("~"), ".sprinkle", "sprinkle.conf")
+
+
+def resolve_config_path(cli_path=None, for_write=False, environ=None):
+    """Resolve Sprinkle config using CLI, environment, then home precedence."""
+    if cli_path not in (None, ""):
+        return os.path.expanduser(cli_path)
+    if environ is None:
+        environ = os.environ
+    env_path = environ.get("SPRINKLE_CONFIG")
+    if env_path is not None and env_path.strip() != "":
+        return os.path.expanduser(env_path)
+    home_path = default_config_path()
+    if for_write or os.path.isfile(home_path):
+        return home_path
+    return None
+
+
+def default_rclone_env_path():
+    return os.path.join(os.path.expanduser("~"), ".sprinkle", "rclone.env")
+
+
+def default_rclone_env_text():
+    comments = {
+        "RCLONE_DRIVE_CHUNK_SIZE": "Google Drive upload chunk size.",
+        "RCLONE_SIZE_ONLY": "Compare by size only.",
+        "RCLONE_NO_UPDATE_MODTIME": "Do not update remote modtime metadata after upload.",
+    }
+    lines = [
+        "# Sprinkle rclone environment overrides.",
+        "# Lines whose first non-space character is # are ignored.",
+        "# Edit this file to tune rclone without changing Sprinkle commands.",
+        "",
+    ]
+    for key, value in DEFAULT_RCLONE_ENV_VALUES:
+        lines.append("# " + comments[key])
+        lines.append("{}={}".format(key, value))
+    lines.append("")
+    return "\n".join(lines)
+
+
+def ensure_rclone_env_file(path):
+    path = os.path.abspath(os.path.expanduser(path))
+    if os.path.exists(path):
+        return path
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w") as fp:
+        fp.write(default_rclone_env_text())
+    return path
+
+
+def apply_rclone_env_file(path):
+    if path in (None, ""):
+        return {}
+    path = ensure_rclone_env_file(path)
+    loaded = {}
+    with open(path, "r") as fp:
+        for line in fp:
+            line = line.strip()
+            if line == "" or line.startswith("#"):
+                continue
+            if "=" not in line:
+                logging.debug("ignoring invalid rclone env line in " + path)
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if key == "":
+                logging.debug("ignoring empty rclone env key in " + path)
+                continue
+            if key in RESERVED_RCLONE_ENV_KEYS:
+                logging.warning("ignoring reserved rclone environment variable " + key)
+                continue
+            value = value.strip()
+            os.environ[key] = value
+            loaded[key] = value
+    logging.debug("loaded " + str(len(loaded)) + " rclone environment variables from " + path)
+    return loaded
 
 
 def warranty():
@@ -79,7 +168,8 @@ OPTIONS:
     -c, --conf {config file}     configuration file
     -d, --debug                  debug output (default:true)
     -h, --help                   help
-    -v, --version                print version
+    -v, --verbose                set RCLONE_VERBOSE=1 for rclone
+    --version                    print version
     --check-prereq               chech prerequisites
     --comp-method {size|md5}     compare method [size|md5] (default:size)
     --daemon-interval            interval for the daemon to execute in minutes (default:60)
@@ -95,6 +185,7 @@ OPTIONS:
     --log-file {file}            logs output to the specified file
     --no-cache                   turn off caching
     --rclone-conf {config file}  rclone configuration (default:None)
+    --rclone-env-file {file}     file with environment variables for rclone
     --rclone-sa-dir {dir}        build rclone config from service accounts
     --rclone-sa-count {num}      limit number of service accounts used
     --drive-id {id}              Google Drive folder ID for rclone config
@@ -108,7 +199,7 @@ OPTIONS:
     --rclone-move                use 'rclone move' instead of 'rclone copy' (default:false)
     --restore-duplicates         restore files if duplicates are found (default:false)
     --retries {num_retries}      number of retries (default:1)
-    --show-progress              show progress
+    --progress                   show progress
     --single-instance            make sure only 1 concurrent instance of sprinkle is running (default:False)
     --ls-stop-first              stop listing after first remote with files (default:true)
     """
@@ -250,24 +341,28 @@ EXAMPLES:
 def usage_backup():
     """
 NAME:
-    sprinkle backup - backs up the local directory to remote volumes
+    sprinkle backup - backs up local or rclone source paths to remote volumes
 
 SYNOPSIS:
-    sprinkle.py [options] backup {local dir}
+    sprinkle.py [options] backup {source} [remote:path]
 
 DESCRIPTION:
-    Backs up the local directory to the remote drives configured in rclone.
-    Hint: backup requires --drive-id <folder-id>. You can also pass
-    --rclone-sa-dir <path>; if omitted, Sprinkle uses the default managed
-    service-account store.
+    Backs up a local directory or rclone source path to clustered service-account
+    remotes, or to one explicit rclone target such as backup:mirror/Manga.
+    Service-account backups require --drive-id <folder-id>. Explicit rclone
+    targets use the normal rclone.conf unless --rclone-conf is supplied.
 
 ARGUMENTS:
-    local dir
-        the local directory to backup
+    source
+        local directory or rclone source path such as hidrive:public/Manga
+    remote:path
+        optional explicit rclone target
 
 EXAMPLES:
     sprinkle.py --drive-id XXXXX backup /backup
+    sprinkle.py --drive-id XXXXX backup hidrive:public/Manga
     sprinkle.py --drive-id XXXXX --rclone-sa-dir /etc/rclone/sa backup /backup
+    sprinkle.py backup hidrive:public/Manga backup:mirror/Manga
     """
     print(usage_backup.__doc__)
     print(usage_options.__doc__)
@@ -465,6 +560,8 @@ def read_args(argv):
     global __comp_method
     global __rclone_exe
     global __rclone_conf
+    global __rclone_env_file
+    global __rclone_verbose
     global __drive_id
     global __display_unit
     global __rclone_retries
@@ -507,6 +604,8 @@ def read_args(argv):
     __comp_method = None
     __rclone_exe = None
     __rclone_conf = None
+    __rclone_env_file = None
+    __rclone_verbose = None
     __drive_id = None
     __display_unit = None
     __rclone_retries = None
@@ -548,11 +647,13 @@ def read_args(argv):
                                    ["help",
                                     "conf=",
                                     "debug",
+                                    "verbose",
                                     "version",
                                     "dist-type=",
                                     "comp-method=",
                                     "rclone-exe=",
                                     "rclone-conf=",
+                                    "rclone-env-file=",
                                     "rclone-sa-dir=",
                                     "rclone-sa-count=",
                                     "drive-id=",
@@ -567,6 +668,7 @@ def read_args(argv):
                                     "rclone-retries=",
                                     "rclone-move",
                                     "show-progress",
+                                    "progress",
                                     "dry-run",
                                     "delete-files",
                                     "restore-duplicates",
@@ -597,9 +699,11 @@ def read_args(argv):
         if opt in ('-h', '--help'):
             usage()
             sys.exit(0)
-        elif opt in ('-v', '--version'):
+        elif opt == '--version':
             version()
             sys.exit(0)
+        elif opt in ("-v", "--verbose"):
+            __rclone_verbose = True
         elif opt in ("-c", "--conf"):
             __configfile = arg
         elif opt in ("-d", "--debug"):
@@ -612,6 +716,8 @@ def read_args(argv):
             __rclone_exe = arg
         elif opt in ("--rclone-conf"):
             __rclone_conf = arg
+        elif opt in ("--rclone-env-file"):
+            __rclone_env_file = arg
         elif opt in ("--rclone-sa-dir"):
             __rclone_sa_dir = arg
         elif opt in ("--rclone-sa-count"):
@@ -641,7 +747,7 @@ def read_args(argv):
             __display_unit = arg
         elif opt in ("--rclone-retries"):
             __rclone_retries = int(arg)
-        elif opt in ("--show-progress"):
+        elif opt in ("--show-progress", "--progress"):
             __show_progress = True
         elif opt in ("--delete-files"):
             __delete_files = True
@@ -689,10 +795,10 @@ def read_args(argv):
         elif opt in ("--daemon-pidfile"):
             __daemon_pidfile = arg
 
-    if __configfile is None:
-        candidate_config = default_config_path()
-        if os.path.isfile(candidate_config):
-            __configfile = candidate_config
+    __configfile = resolve_config_path(
+        __configfile,
+        for_write=len(args) > 0 and args[0] == 'config',
+    )
 
     if len(args) < 1 and __check_prereq is None:
         usage()
@@ -720,6 +826,7 @@ def configure(config_file):
         "display_unit": "G",
         "rclone_retries": '1',
         "drive_id": None,
+        "rclone_env_file": default_rclone_env_path(),
         "rclone_sa_dir": None,
         "rclone_sa_count": None,
         "log_file": None,
@@ -770,6 +877,9 @@ def configure(config_file):
 
     if __rclone_conf is not None:
         __config['rclone_config'] = __rclone_conf
+
+    if __rclone_env_file is not None:
+        __config['rclone_env_file'] = __rclone_env_file
 
     if __drive_id is not None:
         __config['drive_id'] = __drive_id
@@ -871,6 +981,10 @@ def configure(config_file):
     if __sa_group_size is not None:
         __config['sa_group_size'] = __sa_group_size
 
+    apply_rclone_env_file(__config.get('rclone_env_file'))
+    if __rclone_verbose is True:
+        os.environ["RCLONE_VERBOSE"] = "1"
+
 
 def normalize_config_types(config_values):
     bool_fields = (
@@ -937,6 +1051,8 @@ def verify_configuration():
 
 def prepare_rclone_sa_config():
     global __rclone_conf
+    if len(__args) > 2 and __args[0] == 'backup' and _is_rclone_remote_target(__args[2]):
+        return
     rclone_sa_dir = __config.get('rclone_sa_dir')
     if rclone_sa_dir in (None, ''):
         if len(__args) > 0 and __args[0] == 'backup':
@@ -954,10 +1070,13 @@ def prepare_rclone_sa_config():
     if drive_id in (None, ''):
         if len(__args) > 0 and __args[0] == 'backup':
             raise Exception(
-                "backup requires --drive-id <folder-id>; optionally pass --rclone-sa-dir <path> "
-                "to override the default service-account store"
+                "backup requires --drive-id <folder-id> for service-account clustered backups; "
+                "alternatively pass a rclone target such as remote:path"
             )
         raise Exception("--drive-id option or drive_id config value is required when using rclone_sa_dir")
+    base_config_file = __config.get('rclone_config')
+    if base_config_file in (None, ''):
+        base_config_file = rclone.default_rclone_config_file()
     fd, tmp_conf = tempfile.mkstemp(prefix="rclone-", suffix=".conf")
     os.close(fd)
     registry = service_accounts.ServiceAccountRegistry(
@@ -988,10 +1107,16 @@ def prepare_rclone_sa_config():
         max_accounts=_optional_int(__config.get('rclone_sa_count')),
         return_entries=True,
         shuffle=False,
+        base_config_file=base_config_file,
     )
     registry.assign_remote_names(entries)
+    __config['cluster_remotes'] = [entry['remote'] + ':' for entry in entries]
     __rclone_conf = tmp_conf
     __config['rclone_config'] = tmp_conf
+
+
+def _is_rclone_remote_target(target):
+    return target not in (None, '') and ':' in target and not target.startswith('/')
 
 
 def command_needs_rclone_config():
@@ -1041,7 +1166,7 @@ def init_logging(debug, daemon_mode=False):
 
 
 def config_command(prompt_func=input, output_path=None):
-    target = output_path or default_config_path()
+    target = resolve_config_path(output_path, for_write=True)
     common.print_line('creating Sprinkle configuration at ' + target)
     if os.path.exists(target):
         overwrite = _prompt_bool(prompt_func, 'Overwrite existing config', False)
@@ -1089,6 +1214,8 @@ def config_command(prompt_func=input, output_path=None):
         os.makedirs(parent, exist_ok=True)
     with open(target, 'w') as fp:
         fp.write(content)
+    if os.path.abspath(os.path.expanduser(target)) == os.path.abspath(default_config_path()):
+        ensure_rclone_env_file(default_rclone_env_path())
     common.print_line('wrote ' + target)
     return target
 
@@ -1148,6 +1275,10 @@ debug={debug}
 # rclone_move: move files instead of copying them
 # rclone_move=false (copy files and keep sources) (default)
 rclone_move={rclone_move}
+
+# rclone_env_file: environment variables exported before invoking rclone.
+# Lines starting with # are ignored. The default file is created on first use.
+rclone_env_file=~/.sprinkle/rclone.env
 
 # delete_files: delete files after 1-way sync
 # delete_files=false (leave files not locally present on remote drives)
@@ -1281,8 +1412,14 @@ def backup():
         usage_backup()
         sys.exit(-1)
     local_dir = common.remove_ending_slash(__args[1])
-    common.print_line('backing up ' + local_dir + '...')
-    __cl_sync.backup(local_dir, __config['delete_files'], __config['dry_run'])
+    target = None
+    if len(__args) > 2:
+        target = common.remove_ending_slash(__args[2])
+    if target is None:
+        common.print_line('backing up ' + local_dir + '...')
+    else:
+        common.print_line('backing up ' + local_dir + ' to ' + target + '...')
+    __cl_sync.backup(local_dir, __config['delete_files'], __config['dry_run'], target)
 
 
 def restore():

@@ -6,8 +6,8 @@ __author__ = "Michael Montuori [michael.montuori@gmail.com]"
 __copyright__ = "Copyright 2017 Michael Montuori. All rights reserved."
 __credits__ = ["Warren Crigger"]
 __license__ = "GPLv3"
-__version__ = "1.0"
-__revision__ = "2"
+__version__ = "1.1"
+__revision__ = "0"
 
 import logging
 import json
@@ -15,6 +15,29 @@ import os
 import random
 from libsprinkle import common
 from libsprinkle import exceptions
+
+
+def default_rclone_config_file():
+    if os.environ.get("RCLONE_CONFIG") not in (None, ""):
+        return os.path.expanduser(os.environ.get("RCLONE_CONFIG"))
+    return os.path.join(os.path.expanduser("~"), ".config", "rclone", "rclone.conf")
+
+
+def extract_json_output(text):
+    if text is None:
+        return text
+    if text.strip() == '[':
+        return '[]'
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(text):
+        if char not in ('[', '{'):
+            continue
+        try:
+            value, _end = decoder.raw_decode(text[index:])
+            return json.dumps(value)
+        except ValueError:
+            continue
+    return text
 
 
 def generate_rclone_config(
@@ -25,7 +48,8 @@ def generate_rclone_config(
         prefix="dst",
         start_index=101,
         return_entries=False,
-        shuffle=True):
+        shuffle=True,
+        base_config_file=None):
     """Generate an rclone configuration from service account files.
 
     The function scans ``json_dir`` for ``.json`` files and writes
@@ -70,6 +94,7 @@ def generate_rclone_config(
         start_index=start_index,
         return_entries=return_entries,
         shuffle=shuffle,
+        base_config_file=base_config_file,
     )
 
 
@@ -81,7 +106,8 @@ def generate_rclone_config_from_files(
         prefix="dst",
         start_index=101,
         return_entries=False,
-        shuffle=True):
+        shuffle=True,
+        base_config_file=None):
     """Generate an rclone configuration from explicit service account files."""
     files = [os.path.abspath(path) for path in json_files]
     if shuffle:
@@ -93,6 +119,14 @@ def generate_rclone_config_from_files(
 
     count = start_index - 1
     lines = []
+    if base_config_file not in (None, ""):
+        base_config_file = os.path.expanduser(base_config_file)
+        if os.path.isfile(base_config_file):
+            with open(base_config_file, "r") as base_fp:
+                base_config = base_fp.read().strip()
+            if base_config:
+                lines.extend(base_config.splitlines())
+                lines.append("")
     entries = []
     for filename in files:
         count += 1
@@ -203,10 +237,7 @@ class RClone:
                     raise exceptions.FileNotFoundException(result['error'])
                 else:
                     raise Exception('error getting remote object. ' + result['error'])
-        if 'out' in result and result['out'] == '[\n':
-            lsjson = '[]'
-        else:
-            lsjson = result['out']
+        lsjson = extract_json_output(result.get('out'))
         logging.debug('returning ' + str(lsjson)[0:128])
         return lsjson
 
@@ -233,12 +264,9 @@ class RClone:
                     raise exceptions.FileNotFoundException(result['error'])
                 else:
                     raise Exception('error getting remote object. ' + result['error'])
-        if 'out' in result and result['out'] == '[\n':
-            lsjson = '[]'
-        else:
-            lsjson = result['out']
-        logging.debug('returning ' + str(lsjson)[0:128])
-        return lsjson
+        out = result.get('out', '')
+        logging.debug('returning ' + str(out)[0:128])
+        return out
 
     def get_about_json_with_error(self, remote):
         logging.debug('running about for ' + remote)
@@ -261,7 +289,7 @@ class RClone:
         if result.get('out') in (None, ''):
             return None, 'rclone about returned empty output'
         try:
-            return json.loads(result['out']), None
+            return json.loads(extract_json_output(result['out'])), None
         except Exception as exc:
             return None, 'rclone about returned invalid json: {}'.format(exc.__class__.__name__)
 

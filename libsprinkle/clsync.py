@@ -6,7 +6,7 @@ __author__ = "Michael Montuori [michael.montuori@gmail.com]"
 __copyright__ = "Copyright 2017 Michael Montuori. All rights reserved."
 __credits__ = ["Warren Crigger"]
 __license__ = "GPLv3"
-__version__ = "1.0"
+__version__ = "1.1"
 __revision__ = "0"
 
 import logging
@@ -116,6 +116,8 @@ class ClSync:
 
     def get_remotes(self):
         logging.debug('getting rclone remotes')
+        if self._config.get('cluster_remotes') not in (None, ''):
+            return self._config.get('cluster_remotes')
         if self._remotes is None or self._remote_calls > 100:
             self._remotes = self._rclone.get_remotes()
             self._remote_calls = 0
@@ -128,20 +130,46 @@ class ClSync:
             logging.debug('creating directory ' + remote + directory)
             self._rclone.mkdir(remote, directory)
 
-    def ls(self, file, with_dups=False, regex=None, stop_after_first=None):
-        return self._ls(file, with_dups, regex, stop_after_first, recursive=True)
+    def ls(self, file, with_dups=False, regex=None, stop_after_first=None, remotes=None, normalize_path=True):
+        return self._ls(
+            file,
+            with_dups,
+            regex,
+            stop_after_first,
+            recursive=True,
+            remotes=remotes,
+            normalize_path=normalize_path,
+        )
 
-    def ls_shallow(self, file, with_dups=False, regex=None, stop_after_first=None):
-        return self._ls(file, with_dups, regex, stop_after_first, recursive=False)
+    def ls_shallow(self, file, with_dups=False, regex=None, stop_after_first=None, remotes=None, normalize_path=True):
+        return self._ls(
+            file,
+            with_dups,
+            regex,
+            stop_after_first,
+            recursive=False,
+            remotes=remotes,
+            normalize_path=normalize_path,
+        )
 
-    def _ls(self, file, with_dups=False, regex=None, stop_after_first=None, recursive=True):
+    def _ls(
+            self,
+            file,
+            with_dups=False,
+            regex=None,
+            stop_after_first=None,
+            recursive=True,
+            remotes=None,
+            normalize_path=True):
         logging.debug('lsjson of file: ' + file)
         if stop_after_first is None:
             stop_after_first=self._config['ls_stop_first']
-        if not file.startswith('/'):
+        if normalize_path and not file.startswith('/'):
             logging.debug('adding / ' + file)
             file = '/' + file
-        memory_cache_key = (file, with_dups, regex, stop_after_first, recursive)
+        if remotes is None:
+            remotes = self.get_remotes()
+        memory_cache_key = (file, with_dups, regex, stop_after_first, recursive, tuple(remotes), normalize_path)
         if self._config['no_cache'] is False and memory_cache_key in self._cache:
             logging.debug('serving cached version of file list...')
             self._cache_counter[memory_cache_key] += 1
@@ -156,8 +184,8 @@ class ClSync:
         files = {}
         md5s = None
         if self._compare_method == 'md5':
-            md5s = self.lsmd5(file, stop_after_first)
-        for remote in self.get_remotes():
+            md5s = self.lsmd5(file, stop_after_first, remotes, normalize_path)
+        for remote in remotes:
             common.print_line('retrieving file list from: ' + remote + file + '...')
             logging.debug('getting lsjson from ' + remote + file)
             json_out = self._cached_lsjson(remote, file, recursive)
@@ -277,12 +305,14 @@ class ClSync:
             self._cache[cache_key] = files
             self._cache_counter[cache_key] = 0
 
-    def lsmd5(self, file, stop_after_first=False):
+    def lsmd5(self, file, stop_after_first=False, remotes=None, normalize_path=True):
         logging.debug('lsjson of file: ' + file)
-        if not file.startswith('/'):
+        if normalize_path and not file.startswith('/'):
             file = '/' + file
         files = {}
-        for remote in self.get_remotes():
+        if remotes is None:
+            remotes = self.get_remotes()
+        for remote in remotes:
             common.print_line('retrieving file list from: ' + remote + file + '...')
             logging.debug('getting lsjson from ' + remote + file)
             try:
@@ -363,31 +393,32 @@ class ClSync:
         return total_size
 
     def get_best_remote(self, requested_size=1):
-        if self._distribution_type == 'mas':
+        remotes = self.get_eligible_remotes(requested_size)
+        if not remotes:
             required_size = self._required_free_for_upload(requested_size)
-            logging.debug(
-                'selecting best remote with the most available space to store size: ' +
-                str(requested_size) + ', required free: ' + str(required_size)
+            raise Exception(
+                'no remote has enough known free space for requested size ' +
+                str(requested_size) + ' with required free ' + str(required_size)
             )
-            best_remote = None
-            highest_size = 0
-            size = 0
-            for remote in self.get_remotes():
-                size = self._known_free_for_remote(remote)
-                logging.debug('free of ' + remote + ' is ' + str(size))
-                if size is not None and size > highest_size:
-                    if required_size <= size:
-                        highest_size = size
-                        best_remote = remote
-            if best_remote is None:
-                raise Exception(
-                    'no remote has enough known free space for requested size ' +
-                    str(requested_size) + ' with required free ' + str(required_size)
-                )
-            return best_remote
-        else:
+        return remotes[0]
+
+    def get_eligible_remotes(self, requested_size=1):
+        if self._distribution_type != 'mas':
             logging.error('distribution mode ' + self._distribution_type + ' not supported.')
             raise Exception('unsupported distribution mode ' + self._distribution_type)
+        required_size = self._required_free_for_upload(requested_size)
+        logging.debug(
+            'selecting remotes with enough available space to store size: ' +
+            str(requested_size) + ', required free: ' + str(required_size)
+        )
+        candidates = []
+        for remote in self.get_remotes():
+            size = self._known_free_for_remote(remote)
+            logging.debug('free of ' + remote + ' is ' + str(size))
+            if size is not None and required_size <= size:
+                candidates.append((size, remote))
+        candidates.sort(reverse=True)
+        return [remote for _size, remote in candidates]
 
     def ensure_remote_has_enough_space(self, remote, requested_size):
         required_size = self._required_free_for_upload(requested_size)
@@ -402,8 +433,11 @@ class ClSync:
     def _known_free_for_remote(self, remote):
         if remote not in self._cached_free:
             quota = self._get_remote_quota(remote)
-            self._cached_free[remote] = self._quota_value(quota, 'free')
-        return self._cached_free[remote]
+            free_size = self._quota_value(quota, 'free')
+            # Unknown quota must be checked again for later files, not cached as capacity.
+            if free_size is not None:
+                self._cached_free[remote] = free_size
+        return self._cached_free.get(remote)
 
     def _required_free_for_upload(self, requested_size):
         requested_size = int(requested_size)
@@ -463,6 +497,8 @@ class ClSync:
         common.print_line('indexing local directory: ' + local_dir + '...')
         if self.__exclude_regex is not None:
             regexp = re.compile(self.__exclude_regex)
+        else:
+            regexp = None
         clfiles = {}
         for root, dirs, files in os.walk(local_dir):
             for name in dirs:
@@ -512,6 +548,57 @@ class ClSync:
         logging.debug('retrieved ' + str(len(clfiles)) + ' files')
         return clfiles
 
+    def index_remote_dir(self, remote, remote_path, exclusion_list=None):
+        source = remote + remote_path
+        common.print_line('indexing rclone remote: ' + source + '...')
+        if self.__exclude_regex is not None:
+            regexp = re.compile(self.__exclude_regex)
+        else:
+            regexp = None
+        clfiles = {}
+        try:
+            json_out = self._rclone.lsjson(remote, remote_path, ['--recursive', '--fast-list'], True)
+        except exceptions.FileNotFoundException:
+            json_out = '[]'
+        rows = json.loads(json_out)
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            full_path = self._join_rclone_path(remote_path, row.get('Path', ''))
+            source_key = remote + full_path
+            if exclusion_list is not None:
+                exclusion_found = False
+                for exclusion in exclusion_list:
+                    if exclusion in source_key:
+                        exclusion_found = True
+                if exclusion_found is True:
+                    logging.debug('exclusion ' + exclusion + ' applied for path ' + source_key)
+                    continue
+            if regexp is not None and regexp.search(source_key) is not None:
+                logging.debug('regexp match for path: ' + source_key)
+                continue
+            tmp_clfile = clfile.ClFile()
+            tmp_clfile.remote = remote
+            tmp_clfile.is_dir = row.get('IsDir')
+            tmp_clfile.path = remote + os.path.dirname(full_path).replace('\\', '/')
+            tmp_clfile.name = row.get('Name')
+            tmp_clfile.size = row.get('Size')
+            tmp_clfile.mime_type = row.get('MimeType')
+            tmp_clfile.mod_time = row.get('ModTime')
+            tmp_clfile.id = row.get('ID')
+            clfiles[common.normalize_path(source_key)] = tmp_clfile
+        logging.debug('retrieved ' + str(len(clfiles)) + ' remote files')
+        return clfiles
+
+    def _join_rclone_path(self, base, path):
+        base = (base or '').replace('\\', '/')
+        path = (path or '').replace('\\', '/')
+        if base in ('', '/'):
+            if base == '/' and not path.startswith('/'):
+                return '/' + path
+            return path
+        return base.rstrip('/') + '/' + path.lstrip('/')
+
     def compare_clfiles(self, local_dir, local_clfiles, remote_clfiles, delete_file=True):
         remote_root = self.get_backup_remote_root(local_dir)
         return self.compare_clfiles_for_remote_root(
@@ -528,7 +615,8 @@ class ClSync:
             local_clfiles,
             remote_clfiles,
             delete_file=True,
-            remote_root=None):
+            remote_root=None,
+            source_is_remote=False):
         common.print_line('calculating differences...')
         logging.debug('comparing clfiles')
         logging.debug('local directory: ' + local_dir)
@@ -540,7 +628,7 @@ class ClSync:
         for local_path in local_clfiles:
             local_clfile = local_clfiles[local_path]
             full_path = local_clfile.path + '/' + local_clfile.name
-            remote_key = self.remote_key_for_local_path(local_dir, full_path, remote_root)
+            remote_key = self.remote_key_for_source_path(local_dir, full_path, remote_root, source_is_remote)
             local_remote_keys[remote_key] = local_clfile
         operations = []
         for local_path in local_clfiles:
@@ -548,10 +636,11 @@ class ClSync:
             if local_clfile.is_dir:
                 continue
             logging.debug('checking local clfile: ' + local_path + " name: " + local_clfile.name)
-            remote_name = self.remote_key_for_local_path(
+            remote_name = self.remote_key_for_source_path(
                 local_dir,
                 local_clfile.path + '/' + local_clfile.name,
                 remote_root,
+                source_is_remote,
             )
             remote_path = os.path.dirname(remote_name).replace('\\', '/')
             logging.debug('remote name: ' + remote_name)
@@ -608,7 +697,14 @@ class ClSync:
         common.print_line('found ' + str(len(operations)) + ' differences')
         return operations
 
-    def ls_matching_local_files(self, local_dir, local_clfiles, remote_root=None):
+    def ls_matching_local_files(
+            self,
+            local_dir,
+            local_clfiles,
+            remote_root=None,
+            remotes=None,
+            normalize_path=True,
+            source_is_remote=False):
         if remote_root is None:
             remote_root = self.get_backup_remote_root(local_dir)
         wanted_by_parent = {}
@@ -616,45 +712,88 @@ class ClSync:
             local_clfile = local_clfiles[local_path]
             if local_clfile.is_dir:
                 continue
-            remote_key = self.remote_key_for_local_path(
+            remote_key = self.remote_key_for_source_path(
                 local_dir,
                 local_clfile.path + '/' + local_clfile.name,
                 remote_root,
+                source_is_remote,
             )
             remote_parent = os.path.dirname(remote_key).replace('\\', '/')
             wanted_by_parent.setdefault(remote_parent, set()).add(remote_key)
 
         remote_clfiles = {}
         for remote_parent in sorted(wanted_by_parent):
-            parent_files = self.ls_shallow(remote_parent)
+            parent_files = self.ls_shallow(remote_parent, remotes=remotes, normalize_path=normalize_path)
             for remote_key in wanted_by_parent[remote_parent]:
                 if remote_key in parent_files:
                     remote_clfiles[remote_key] = parent_files[remote_key]
         return remote_clfiles
 
-    def backup(self, local_dir, delete_files=True, dry_run=False):
+    def backup(self, local_dir, delete_files=True, dry_run=False, target=None):
         logging.debug('backing up directory ' + local_dir)
-        if not common.is_dir(local_dir):
+        source_remote, source_path = self.parse_backup_target(local_dir)
+        source_is_remote = source_remote is not None
+        if source_is_remote and self._compare_method == 'md5':
+            raise Exception("rclone remote source backup supports compare_method=size")
+        if not source_is_remote and not common.is_dir(local_dir):
             logging.error("local directory " + local_dir + " not found. Cannot continue!")
             raise Exception("Local directory " + local_dir + " not found")
-        remote_root = self.get_backup_remote_root(local_dir)
-        logging.debug('backup remote root: ' + remote_root)
-        local_clfiles = self.index_local_dir(local_dir, self.__exclusion_list)
-        if delete_files is True or self._compare_method == 'md5':
-            remote_clfiles = self.ls(remote_root)
+        target_remote, target_path = self.parse_backup_target(target)
+        if target_path is None:
+            if source_is_remote:
+                remote_root = self.get_backup_remote_root_for_remote_source(source_remote, source_path)
+            else:
+                remote_root = self.get_backup_remote_root(local_dir)
         else:
-            remote_clfiles = self.ls_matching_local_files(local_dir, local_clfiles, remote_root)
+            remote_root = target_path
+        logging.debug('backup remote root: ' + remote_root)
+        if source_is_remote:
+            local_clfiles = self.index_remote_dir(source_remote, source_path, self.__exclusion_list)
+            source_root = source_remote + source_path
+        else:
+            local_clfiles = self.index_local_dir(local_dir, self.__exclusion_list)
+            source_root = local_dir
+        target_remotes = [target_remote] if target_remote is not None else None
+        normalize_remote_path = target_remote is None
+        if delete_files is True or self._compare_method == 'md5':
+            remote_clfiles = self.ls(remote_root, remotes=target_remotes, normalize_path=normalize_remote_path)
+        else:
+            remote_clfiles = self.ls_matching_local_files(
+                source_root,
+                local_clfiles,
+                remote_root,
+                target_remotes,
+                normalize_remote_path,
+                source_is_remote,
+            )
         ops = self.compare_clfiles_for_remote_root(
-            local_dir,
+            source_root,
             local_clfiles,
             remote_clfiles,
             delete_files,
             remote_root,
+            source_is_remote,
         )
         if self._show_progress:
             bar = Bar('Progress', max=len(ops), suffix='%(index)d/%(max)d %(percent)d%% [%(elapsed_td)s/%(eta_td)s]')
         if dry_run is True:
             common.print_line('performing a dry run. no changes are committed')
+        failures = []
+
+        def record_failure(op, error, remotes=None):
+            error_text = re.sub(
+                r'(?i)(password|secret|token)=\S+',
+                r'\1=<redacted>',
+                str(error).replace('\\n', ' ').replace('\\r', ' '),
+            )[:300]
+            path = op.src.path + '/' + op.src.name
+            detail = op.operation + ' ' + path
+            if remotes:
+                detail += ' [' + ', '.join(remotes) + ']'
+            detail += ': ' + error_text
+            failures.append(detail)
+            logging.error('backup operation failed: ' + detail)
+
         for op in ops:
             logging.debug('operation: ' + op.operation + ", path: " + op.src.path)
             if self._show_progress:
@@ -664,39 +803,90 @@ class ClSync:
                 bar.message = 'file:' + bar_title
             if op.src.is_dir and op.operation != operation.Operation.REMOVE:
                 logging.debug('skipping directory ' + op.src.path)
-                continue
-            if op.operation == operation.Operation.ADD:
-                best_remote = self.get_best_remote(int(op.src.size))
-                logging.debug('best remote: ' + best_remote)
-                if not self._show_progress:
-                    common.print_line('backing up file ' + op.src.path+'/'+op.src.name +
-                                  ' -> ' + best_remote+':'+op.src.remote_path)
-                if dry_run is False:
-                    self.copy(op.src.path+'/'+op.src.name, op.src.remote_path, best_remote)
-                    self.mark_remote_used(best_remote, int(op.src.size))
-            if op.operation == operation.Operation.UPDATE:
-                self.ensure_remote_has_enough_space(op.src.remote, int(op.src.size))
-                if not self._show_progress:
-                    common.print_line('backing up file ' + op.src.path + '/' + op.src.name +
-                                  ' -> ' + op.src.remote + ':' + op.src.remote_path)
-                if dry_run is False:
-                    self.copy(op.src.path + '/' + op.src.name, op.src.remote_path, op.src.remote)
-            if op.operation == operation.Operation.REMOVE and delete_files is True:
-                if not self._show_progress:
-                    common.print_line('removing ' + op.src.remote+op.src.path)
-                if op.src.is_dir:
-                    if dry_run is False:
-                        try:
-                            self.rmdir(op.src.path, op.src.remote)
-                        except Exception as e:
-                            logging.debug(str(e))
-                else:
-                    if dry_run is False:
-                        self.delete_file(op.src.path, op.src.remote)
+            else:
+                if op.operation == operation.Operation.ADD:
+                    candidates = None
+                    try:
+                        if target_remote is None:
+                            candidates = self.get_eligible_remotes(int(op.src.size))
+                        else:
+                            candidates = [target_remote]
+                        if not candidates:
+                            raise Exception('no remote has enough known free space')
+                        if dry_run is True:
+                            candidates = candidates[:1]
+                        copied = False
+                        errors = []
+                        for remote in candidates:
+                            logging.debug('trying remote: ' + remote)
+                            if not self._show_progress:
+                                common.print_line('backing up file ' + op.src.path + '/' + op.src.name +
+                                                  ' -> ' + remote + op.src.remote_path)
+                            if dry_run is True:
+                                copied = True
+                                break
+                            try:
+                                self.copy(op.src.path + '/' + op.src.name, op.src.remote_path, remote)
+                                if target_remote is None:
+                                    self.mark_remote_used(remote, int(op.src.size))
+                                copied = True
+                                break
+                            except Exception as e:
+                                errors.append(e)
+                                logging.warning('copy to ' + remote + ' failed: ' + str(e))
+                        if not copied:
+                            raise Exception('; '.join(str(error) for error in errors))
+                    except Exception as e:
+                        record_failure(op, e, candidates)
+                elif op.operation == operation.Operation.UPDATE:
+                    try:
+                        if target_remote is None:
+                            self.ensure_remote_has_enough_space(op.src.remote, int(op.src.size))
+                        if not self._show_progress:
+                            common.print_line('backing up file ' + op.src.path + '/' + op.src.name +
+                                              ' -> ' + op.src.remote + ':' + op.src.remote_path)
+                        if dry_run is False:
+                            self.copy(op.src.path + '/' + op.src.name, op.src.remote_path, op.src.remote)
+                    except Exception as e:
+                        record_failure(op, e, [op.src.remote])
+                elif op.operation == operation.Operation.REMOVE and delete_files is True:
+                    try:
+                        if not self._show_progress:
+                            common.print_line('removing ' + op.src.remote + op.src.path)
+                        if dry_run is False:
+                            if op.src.is_dir:
+                                self.rmdir(op.src.path, op.src.remote)
+                            else:
+                                self.delete_file(op.src.path, op.src.remote)
+                    except Exception as e:
+                        record_failure(op, e, [op.src.remote])
             if self._show_progress:
                 bar.next()
         if self._show_progress:
             bar.finish()
+        if failures:
+            raise Exception(
+                'backup completed with ' + str(len(failures)) + ' failed operation(s): ' +
+                ' | '.join(failures)
+            )
+
+    def parse_backup_target(self, target):
+        if target in (None, ''):
+            return None, None
+        target = target.replace('\\', '/')
+        if ':' in target and not target.startswith('/'):
+            remote, path = target.split(':', 1)
+            if remote == '':
+                raise Exception("invalid backup target " + target)
+            return remote + ':', path
+        path = '/' + target.strip('/')
+        return None, path
+
+    def get_backup_remote_root_for_remote_source(self, remote, path):
+        path = (path or '').replace('\\', '/').strip('/')
+        if path == '':
+            return '/' + remote.rstrip(':')
+        return '/' + os.path.basename(path)
 
     def get_backup_remote_root(self, local_dir):
         abs_local_dir = os.path.realpath(local_dir).replace('\\', '/')
@@ -712,6 +902,24 @@ class ClSync:
         if remote_root is None:
             remote_root = self.get_backup_remote_root(local_dir)
         rel_path = os.path.relpath(os.path.realpath(path), os.path.realpath(local_dir)).replace('\\', '/')
+        if rel_path == '.':
+            return remote_root
+        return common.normalize_path(remote_root.rstrip('/') + '/' + rel_path)
+
+    def remote_key_for_source_path(self, source_root, path, remote_root=None, source_is_remote=False):
+        if not source_is_remote:
+            return self.remote_key_for_local_path(source_root, path, remote_root)
+        if remote_root is None:
+            remote, remote_path = self.parse_backup_target(source_root)
+            remote_root = self.get_backup_remote_root_for_remote_source(remote, remote_path)
+        source_root = source_root.replace('\\', '/').rstrip('/')
+        path = path.replace('\\', '/')
+        if path == source_root:
+            return remote_root
+        if source_root != '' and path.startswith(source_root + '/'):
+            rel_path = path[len(source_root) + 1:]
+        else:
+            rel_path = os.path.basename(path)
         if rel_path == '.':
             return remote_root
         return common.normalize_path(remote_root.rstrip('/') + '/' + rel_path)

@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import test_import_stubs
 import sprinkle
 
 
@@ -25,6 +26,8 @@ def test_rclone_sa_dir_option(tmp_path):
         str(sa_dir),
         "--rclone-sa-count",
         "1",
+        "--rclone-env-file",
+        str(tmp_path / "rclone.env"),
         "--drive-id",
         "drive-id",
         "ls",

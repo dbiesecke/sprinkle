@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""Run a read-only service-account refresh and verify every active account."""
+
+import argparse
+import configparser
+import datetime
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+
+
+DEFAULT_CONFIG = "/etc/sprinkle/sprinkle.conf"
+DEFAULT_DATABASE = "~/.sprinkle/sa-cache.sqlite3"
+DEFAULT_MARKER = "/var/lib/sprinkle/sa-keepalive.last-success"
+DEFAULT_SPRINKLE = "/usr/local/lib/sprinkle/sprinkle.py"
+DEFAULT_TIMEOUT_SECONDS = 21600
+LOG_TAG = "sprinkle-sa-keepalive"
+
+
+def utcnow():
+    return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def read_database_path(config_path, override=None):
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
+    parser = configparser.RawConfigParser()
+    with open(config_path, "r") as handle:
+        parser.read_string("[MAIN]\n" + handle.read())
+    value = parser.get("MAIN", "sa_db", fallback=DEFAULT_DATABASE)
+    return os.path.abspath(os.path.expanduser(value))
+
+
+def reason_code(error, last_about_at, started_at):
+    if error:
+        text = str(error).lower()
+        if "credential" in text or "invalid_grant" in text or "invalid_client" in text or "jwt" in text:
+            return "credentials_rejected"
+        if "project" in text and ("deleted" in text or "disabled" in text or "not available" in text):
+            return "project_unavailable"
+        if "service_disabled" in text or "accessnotconfigured" in text or "drive api" in text:
+            return "drive_api_unavailable"
+        if "executable not found" in text or "no such file" in text:
+            return "rclone_unavailable"
+        if "unknown quota" in text:
+            return "quota_unknown"
+        if "not found" in text or "notfound" in text:
+            return "resource_not_found"
+        return "refresh_error"
+    if last_about_at is None:
+        return "never_refreshed"
+    if last_about_at < started_at:
+        return "not_refreshed_this_run"
+    return "unknown"
+
+
+def inspect_accounts(database, started_at):
+    uri = "file:{}?mode=ro".format(database)
+    with sqlite3.connect(uri, uri=True) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            """
+            SELECT a.client_email, a.project_id, q.last_about_at, q.last_error
+            FROM accounts a
+            LEFT JOIN quota_cache q ON q.account_id = a.id
+            WHERE a.status = 'active'
+            ORDER BY a.client_email, a.id
+            """
+        ).fetchall()
+    failures = []
+    for row in rows:
+        last_about_at = row["last_about_at"]
+        error = row["last_error"]
+        if error is not None or last_about_at is None or last_about_at < started_at:
+            failures.append({
+                "client_email": row["client_email"] or "UNKNOWN",
+                "project_id": row["project_id"] or "UNKNOWN",
+                "reason": reason_code(error, last_about_at, started_at),
+            })
+    return len(rows), failures
+
+
+def write_marker(path, payload):
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=".sa-keepalive-", dir=directory)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w") as handle:
+            json.dump(payload, handle, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+class Reporter(object):
+    def __init__(self, logger_path):
+        self.logger_path = logger_path
+
+    def emit(self, message):
+        safe = " ".join(str(message).split())
+        print(safe, file=sys.stderr)
+        if self.logger_path:
+            try:
+                subprocess.run(
+                    [self.logger_path, "-t", LOG_TAG, "--", safe],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+            except OSError:
+                pass
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--sprinkle", default=DEFAULT_SPRINKLE)
+    parser.add_argument("--config", default=DEFAULT_CONFIG)
+    parser.add_argument("--database", help="override sa_db from the Sprinkle config")
+    parser.add_argument("--marker", default=DEFAULT_MARKER)
+    parser.add_argument("--python", default=sys.executable)
+    parser.add_argument("--logger", default="/usr/bin/logger")
+    parser.add_argument("--no-syslog", action="store_true")
+    parser.add_argument("--timeout-seconds", type=int, default=DEFAULT_TIMEOUT_SECONDS)
+    return parser.parse_args(argv)
+
+
+def run(argv=None):
+    os.umask(0o077)
+    args = parse_args(argv)
+    reporter = Reporter(None if args.no_syslog else args.logger)
+    started_at = utcnow()
+    started_monotonic = time.monotonic()
+    reporter.emit("event=start started_at={} status=running".format(started_at))
+
+    try:
+        database = read_database_path(args.config, args.database)
+        command = [
+            args.python,
+            os.path.abspath(args.sprinkle),
+            "--conf",
+            os.path.abspath(args.config),
+            "--sa-refresh=all",
+            "sa-stats",
+        ]
+        try:
+            process = subprocess.run(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=args.timeout_seconds,
+                check=False,
+            )
+            command_status = process.returncode
+        except subprocess.TimeoutExpired:
+            command_status = 124
+
+        total, failures = inspect_accounts(database, started_at)
+        succeeded = total - len(failures)
+        for failure in failures:
+            reporter.emit(
+                "event=account status=failed client_email={} project_id={} reason={}".format(
+                    failure["client_email"], failure["project_id"], failure["reason"]
+                )
+            )
+
+        duration = int(time.monotonic() - started_monotonic)
+        if command_status != 0 or total == 0 or failures:
+            reporter.emit(
+                "event=complete status=failed total={} succeeded={} failed={} "
+                "command_status={} duration_seconds={}".format(
+                    total, succeeded, len(failures), command_status, duration
+                )
+            )
+            return 1
+
+        completed_at = utcnow()
+        write_marker(args.marker, {
+            "completed_at": completed_at,
+            "duration_seconds": duration,
+            "succeeded": succeeded,
+            "total": total,
+        })
+        reporter.emit(
+            "event=complete status=success total={} succeeded={} failed=0 "
+            "command_status=0 duration_seconds={}".format(total, succeeded, duration)
+        )
+        return 0
+    except Exception as error:
+        duration = int(time.monotonic() - started_monotonic)
+        reporter.emit(
+            "event=complete status=failed total=0 succeeded=0 failed=0 "
+            "reason=operational_error error_type={} duration_seconds={}".format(
+                error.__class__.__name__, duration
+            )
+        )
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(run())

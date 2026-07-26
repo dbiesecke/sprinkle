@@ -59,13 +59,13 @@ for the respective operating system:
 ```
 C:\>python sprinkle.py --version
 VERSION:
-    1.0.0, module version: 1.0.0, rclone module version: 1.0.2
+    1.1.0, module version: 1.1.0, rclone module version: 1.1.0
 ```
 ##### for Linux:
 ```
 $  sprinkle.py --version
 VERSION:
-    1.0.0, module version: 1.0.0, rclone module version: 1.0.2
+    1.1.0, module version: 1.1.0, rclone module version: 1.1.0
 ```
 At this point, you can check prerequisites with the following command:
 ```
@@ -129,6 +129,16 @@ values have to be tweaked for specific installations. All values in sprinkle.con
 The recommended way to create a local configuration is the interactive config command. By default it
 writes to `~/.sprinkle/sprinkle.conf`.
 
+Sprinkle uses the same path precedence for reading and writing configuration:
+
+1. `-c/--conf`
+2. a non-empty `SPRINKLE_CONFIG`
+3. `~/.sprinkle/sprinkle.conf`
+
+For normal commands an explicitly selected CLI or environment file must exist. The Home file is
+loaded automatically when present and otherwise remains optional. The Docker image deliberately sets
+`SPRINKLE_CONFIG=/config/sprinkle.conf` so `/config` can be mounted as persistent configuration.
+
 ##### interactive configuration:
 ```
 $ python3 sprinkle.py config
@@ -148,6 +158,10 @@ The generated config can also store defaults equivalent to:
 ```
 --rclone-sa-count 5 --drive-id GDRIVE_FOLDER_ID -d --rclone-sa-dir /etc/rclone/sa
 ```
+
+Sprinkle never passes an inherited `RCLONE_CONFIG` to rclone. The key is also ignored when it appears
+in `rclone.env`. Select a classic rclone file with `--rclone-conf` or `rclone_config`; service-account
+operations generate a temporary configuration and pass it explicitly with `--config`.
 
 For example, the **debug** value
 ##### sprinkle.conf debug value:
@@ -244,11 +258,24 @@ total:                           45G                   1G          3
 To backup (sprinkle) a local directory over to clustered volumes, use:
 ##### for Windows:
 ```
-C:\>rclone backup C:\dir_to_backup
+C:\>python sprinkle.py backup C:\dir_to_backup
 ```
 ##### for Linux:
 ```
-$ rclone backup /dir_to_backup
+$ sprinkle.py backup /dir_to_backup
+```
+
+To back up to one explicit rclone target from the normal rclone config, pass the
+target after the local directory:
+
+```
+$ sprinkle.py backup /dir_to_backup hidrive:public/Manga
+```
+
+Both sides can be rclone remotes:
+
+```
+$ sprinkle.py backup hidrive:public/Manga backup:mirror/Manga
 ```
 
 ## Restore

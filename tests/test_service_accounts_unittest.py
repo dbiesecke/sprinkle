@@ -5,6 +5,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -222,6 +223,45 @@ class RCloneQuotaTest(unittest.TestCase):
         self.assertIn("credentials rejected", friendly)
         self.assertIn("one@example.test", friendly)
 
+    def test_lsjson_ignores_rclone_progress_output(self):
+        old_execute = common.execute
+
+        def fake_execute(_command, no_error=False):
+            return {
+                "code": 0,
+                "out": "[\n]\nTransferred:   \t          0 B / 0 B, -, 0 B/s, ETA -\nElapsed time:         1.7s\n",
+                "error": "",
+            }
+
+        try:
+            common.execute = fake_execute
+            rc = rclone.RClone()
+            out = rc.lsjson("dst101:", "/Movies/Aladin", ["--fast-list"], True)
+        finally:
+            common.execute = old_execute
+
+        self.assertEqual(json.loads(out), [])
+
+    def test_about_json_ignores_rclone_progress_output(self):
+        old_execute = common.execute
+
+        def fake_execute(_command, no_error=False):
+            return {
+                "code": 0,
+                "out": '{"total": 100, "free": 75}\nTransferred:   \t0 B / 0 B, -, 0 B/s, ETA -\n',
+                "error": "",
+            }
+
+        try:
+            common.execute = fake_execute
+            rc = rclone.RClone()
+            quota, error = rc.get_about_json_with_error("dst101:")
+        finally:
+            common.execute = old_execute
+
+        self.assertIsNone(error)
+        self.assertEqual(quota["free"], 75)
+
     def test_unknown_quota_reason_requires_total_and_free(self):
         self.assertIn("missing total,free", sprinkle._quota_unknown_reason({"used": 1}))
         self.assertIsNone(sprinkle._quota_unknown_reason({"total": 100, "free": 0}))
@@ -243,6 +283,28 @@ class RCloneQuotaTest(unittest.TestCase):
             self.assertEqual(entries, [{"remote": "dst1", "path": sa_file}])
             self.assertIn("service_account_file = " + sa_file, content)
             self.assertIn("root_folder_id = drive-id", content)
+
+    def test_generate_rclone_config_includes_base_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sa_file = os.path.join(tmp, "account.json")
+            base_conf = os.path.join(tmp, "base-rclone.conf")
+            out = os.path.join(tmp, "rclone.conf")
+            write_json(sa_file, make_service_account("one@example.test"))
+            with open(base_conf, "w") as fp:
+                fp.write("[hidrive]\ntype = local\n")
+
+            content, entries = rclone.generate_rclone_config_from_files(
+                [sa_file],
+                out,
+                "drive-id",
+                start_index=1,
+                return_entries=True,
+                base_config_file=base_conf,
+            )
+
+            self.assertEqual(entries, [{"remote": "dst1", "path": sa_file}])
+            self.assertIn("[hidrive]", content)
+            self.assertIn("[dst1]", content)
 
     def test_generate_rclone_config_can_disable_shuffle_for_stable_selection(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -438,12 +500,12 @@ class ClSyncPlacementTest(unittest.TestCase):
             sync._compare_method = "size"
             sync._ClSync__exclusion_list = None
             sync._ClSync__exclude_regex = None
-            sync.get_best_remote = lambda _size: "dst109:"
+            sync.get_eligible_remotes = lambda _size: ["dst109:"]
             sync.mark_remote_used = lambda _remote, _size: None
             shallow_paths = []
             recursive_paths = []
             copies = []
-            sync.ls_shallow = lambda path: shallow_paths.append(path) or {}
+            sync.ls_shallow = lambda path, **_kwargs: shallow_paths.append(path) or {}
             sync.ls = lambda path: recursive_paths.append(path) or {}
             sync.copy = lambda src, dst, remote: copies.append((src, dst, remote))
 
@@ -457,6 +519,120 @@ class ClSyncPlacementTest(unittest.TestCase):
             self.assertEqual(shallow_paths, ["/Movies/Aladin"])
             self.assertEqual(recursive_paths, [])
             self.assertEqual(copies, [(local_file, "/Movies/Aladin", "dst109:")])
+
+    def test_backup_to_explicit_rclone_target_uses_target_remote(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            movie_dir = os.path.join(tmp, "Manga")
+            os.makedirs(movie_dir)
+            local_file = os.path.join(movie_dir, "chapter.cbz")
+            with open(local_file, "w") as fp:
+                fp.write("synthetic manga")
+
+            sync = clsync.ClSync.__new__(clsync.ClSync)
+            sync._show_progress = False
+            sync._compare_method = "size"
+            sync._ClSync__exclusion_list = None
+            sync._ClSync__exclude_regex = None
+            sync.get_best_remote = lambda _size: self.fail("cluster placement should not be used")
+            sync.mark_remote_used = lambda _remote, _size: self.fail("cluster quota should not be updated")
+            shallow_calls = []
+            copies = []
+            sync.ls_shallow = lambda path, **kwargs: shallow_calls.append((
+                path,
+                kwargs.get("remotes"),
+                kwargs.get("normalize_path"),
+            )) or {}
+            sync.copy = lambda src, dst, remote: copies.append((src, dst, remote))
+
+            sync.backup(movie_dir, delete_files=False, dry_run=False, target="hidrive:public/Manga")
+
+            self.assertEqual(shallow_calls, [("public/Manga", ["hidrive:"], False)])
+            self.assertEqual(copies, [(local_file, "public/Manga", "hidrive:")])
+
+    def test_backup_from_rclone_source_to_rclone_target(self):
+        sync = clsync.ClSync.__new__(clsync.ClSync)
+        sync._show_progress = False
+        sync._compare_method = "size"
+        sync._ClSync__exclusion_list = None
+        sync._ClSync__exclude_regex = None
+        sync.get_best_remote = lambda _size: self.fail("cluster placement should not be used")
+        sync.mark_remote_used = lambda _remote, _size: self.fail("cluster quota should not be updated")
+        source_calls = []
+        target_calls = []
+        copies = []
+        payload = json.dumps([{
+            "Path": "chapter.cbz",
+            "Name": "chapter.cbz",
+            "Size": 10,
+            "MimeType": "application/zip",
+            "ModTime": "2024-01-01T00:00:00Z",
+            "IsDir": False,
+            "ID": "file-id",
+        }])
+        sync._rclone = types.SimpleNamespace(
+            lsjson=lambda remote, path, args, _no_error: source_calls.append((remote, path, args)) or payload
+        )
+        sync.ls_shallow = lambda path, **kwargs: target_calls.append((
+            path,
+            kwargs.get("remotes"),
+            kwargs.get("normalize_path"),
+        )) or {}
+        sync.copy = lambda src, dst, remote: copies.append((src, dst, remote))
+
+        sync.backup("hidrive:public/Manga", delete_files=False, dry_run=False, target="backup:mirror/Manga")
+
+        self.assertEqual(source_calls, [("hidrive:", "public/Manga", ["--recursive", "--fast-list"])])
+        self.assertEqual(target_calls, [("mirror/Manga", ["backup:"], False)])
+        self.assertEqual(copies, [("hidrive:public/Manga/chapter.cbz", "mirror/Manga", "backup:")])
+
+    def test_backup_from_rclone_source_to_cluster_uses_source_basename(self):
+        sync = clsync.ClSync.__new__(clsync.ClSync)
+        sync._show_progress = False
+        sync._compare_method = "size"
+        sync._ClSync__exclusion_list = None
+        sync._ClSync__exclude_regex = None
+        sync.get_eligible_remotes = lambda _size: ["dst109:"]
+        sync.mark_remote_used = lambda _remote, _size: None
+        source_calls = []
+        target_calls = []
+        copies = []
+        payload = json.dumps([{
+            "Path": "chapter.cbz",
+            "Name": "chapter.cbz",
+            "Size": 10,
+            "MimeType": "application/zip",
+            "ModTime": "2024-01-01T00:00:00Z",
+            "IsDir": False,
+            "ID": "file-id",
+        }])
+        sync._rclone = types.SimpleNamespace(
+            lsjson=lambda remote, path, args, _no_error: source_calls.append((remote, path, args)) or payload
+        )
+        sync.ls_shallow = lambda path, **kwargs: target_calls.append((
+            path,
+            kwargs.get("remotes"),
+            kwargs.get("normalize_path"),
+        )) or {}
+        sync.copy = lambda src, dst, remote: copies.append((src, dst, remote))
+
+        sync.backup("hidrive:public/Manga", delete_files=False, dry_run=False)
+
+        self.assertEqual(source_calls, [("hidrive:", "public/Manga", ["--recursive", "--fast-list"])])
+        self.assertEqual(target_calls, [("/Manga", None, True)])
+        self.assertEqual(copies, [("hidrive:public/Manga/chapter.cbz", "/Manga", "dst109:")])
+
+    def test_parse_backup_target_preserves_rclone_path_style(self):
+        sync = clsync.ClSync.__new__(clsync.ClSync)
+
+        self.assertEqual(
+            sync.parse_backup_target("hidrive:public/Manga"),
+            ("hidrive:", "public/Manga"),
+        )
+        self.assertEqual(
+            sync.parse_backup_target("local:/private/tmp/Manga"),
+            ("local:", "/private/tmp/Manga"),
+        )
+        self.assertEqual(sync.get_backup_remote_root_for_remote_source("hidrive:", "public/Manga"), "/Manga")
 
     def test_sa_stats_refreshes_service_account_file_cache(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -494,6 +670,8 @@ class ClSyncPlacementTest(unittest.TestCase):
                     store,
                     "--sa-refresh",
                     "all",
+                    "--rclone-env-file",
+                    os.path.join(tmp, "rclone.env"),
                     "sa-stats",
                 ])
                 sprinkle.configure(None)
@@ -523,11 +701,11 @@ class ClSyncPlacementTest(unittest.TestCase):
             sync._compare_method = "size"
             sync._ClSync__exclusion_list = None
             sync._ClSync__exclude_regex = None
-            sync.get_best_remote = lambda _size: "dst109:"
+            sync.get_eligible_remotes = lambda _size: ["dst109:"]
             sync.mark_remote_used = lambda _remote, _size: None
             listed_paths = []
             copies = []
-            sync.ls_shallow = lambda path: listed_paths.append(path) or {}
+            sync.ls_shallow = lambda path, **_kwargs: listed_paths.append(path) or {}
             sync.copy = lambda src, dst, remote: copies.append((src, dst, remote))
 
             try:
@@ -583,8 +761,308 @@ class ClSyncPlacementTest(unittest.TestCase):
         with self.assertRaises(Exception):
             sync.ensure_remote_has_enough_space("tight:", 1024)
 
+    def test_unknown_quota_is_not_cached_and_is_retried(self):
+        sync = clsync.ClSync.__new__(clsync.ClSync)
+        sync._cached_free = {}
+        calls = []
+
+        def quota(_remote):
+            calls.append(True)
+            if len(calls) == 1:
+                return None
+            return {"free": 100}
+
+        sync._get_remote_quota = quota
+
+        self.assertIsNone(sync._known_free_for_remote("dst101:"))
+        self.assertEqual(sync._known_free_for_remote("dst101:"), 100)
+        self.assertEqual(len(calls), 2)
+
+    def test_backup_retries_add_on_next_eligible_remote(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            local_file = os.path.join(tmp, "movie.mkv")
+            with open(local_file, "w") as fp:
+                fp.write("synthetic movie")
+            sync = clsync.ClSync.__new__(clsync.ClSync)
+            sync._show_progress = False
+            sync._compare_method = "size"
+            sync._ClSync__exclusion_list = None
+            sync._ClSync__exclude_regex = None
+            sync.ls_shallow = lambda _path, **_kwargs: {}
+            sync.get_eligible_remotes = lambda _size: ["dst102:", "dst101:"]
+            copies = []
+            marked = []
+
+            def copy(src, dst, remote):
+                copies.append((src, dst, remote))
+                if remote == "dst102:":
+                    raise Exception("temporary remote failure")
+
+            sync.copy = copy
+            sync.mark_remote_used = lambda remote, size: marked.append((remote, size))
+
+            sync.backup(tmp, delete_files=False, dry_run=False)
+
+            self.assertEqual([call[2] for call in copies], ["dst102:", "dst101:"])
+            self.assertEqual(marked, [("dst101:", len("synthetic movie"))])
+
+    def test_backup_continues_when_all_add_candidates_fail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first = os.path.join(tmp, "first.mkv")
+            second = os.path.join(tmp, "second.mkv")
+            for path in (first, second):
+                with open(path, "w") as fp:
+                    fp.write("synthetic movie")
+            sync = clsync.ClSync.__new__(clsync.ClSync)
+            sync._show_progress = False
+            sync._compare_method = "size"
+            sync._ClSync__exclusion_list = None
+            sync._ClSync__exclude_regex = None
+            sync.ls_shallow = lambda _path, **_kwargs: {}
+            sync.get_eligible_remotes = lambda _size: ["dst102:", "dst101:"]
+            copied = []
+            marked = []
+
+            def copy(src, _dst, remote):
+                copied.append((os.path.basename(src), remote))
+                if os.path.basename(src) == "first.mkv":
+                    raise Exception("both remotes unavailable")
+
+            sync.copy = copy
+            sync.mark_remote_used = lambda remote, _size: marked.append(remote)
+
+            with self.assertRaisesRegex(Exception, "1 failed operation"):
+                sync.backup(tmp, delete_files=False, dry_run=False)
+
+            self.assertEqual(
+                copied,
+                [("first.mkv", "dst102:"), ("first.mkv", "dst101:"), ("second.mkv", "dst102:")],
+            )
+            self.assertEqual(marked, ["dst102:"])
+
+    def test_backup_continues_after_update_and_delete_failures(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sync = clsync.ClSync.__new__(clsync.ClSync)
+            sync._show_progress = False
+            sync._compare_method = "size"
+            sync._ClSync__exclusion_list = None
+            sync._ClSync__exclude_regex = None
+            sync.index_local_dir = lambda _path, _exclusions: {}
+            sync.ls = lambda _path, **_kwargs: {}
+            update = types.SimpleNamespace(
+                operation="update",
+                src=types.SimpleNamespace(
+                    path=tmp, name="update.mkv", size=10, remote="dst101:", remote_path="/",
+                    is_dir=False,
+                ),
+            )
+            remove = types.SimpleNamespace(
+                operation="remove",
+                src=types.SimpleNamespace(
+                    path="/old.mkv", name="old.mkv", size=0, remote="dst101:", remote_path="/",
+                    is_dir=False,
+                ),
+            )
+            sync.compare_clfiles_for_remote_root = lambda *_args: [update, remove]
+            sync.ensure_remote_has_enough_space = lambda _remote, _size: None
+            sync.copy = lambda *_args: (_ for _ in ()).throw(Exception("update failed"))
+            deleted = []
+            sync.delete_file = lambda path, remote: deleted.append((path, remote)) or (_ for _ in ()).throw(
+                Exception("delete failed")
+            )
+
+            with self.assertRaisesRegex(Exception, "2 failed operation"):
+                sync.backup(tmp, delete_files=True, dry_run=False)
+
+            self.assertEqual(deleted, [("/old.mkv", "dst101:")])
+
 
 class ServiceAccountCliTest(unittest.TestCase):
+    def test_service_account_about_uses_and_removes_generated_config(self):
+        old_execute = common.execute
+        old_config = getattr(sprinkle, "__config", None)
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp:
+            account_path = os.path.join(tmp, "account.json")
+            write_json(account_path, make_service_account("one@example.test"))
+
+            def fake_execute(command, no_error=False):
+                config_index = command.index("--config")
+                generated = command[config_index + 1]
+                self.assertTrue(os.path.isfile(generated))
+                calls.append((list(command), generated))
+                return {
+                    "code": 0,
+                    "out": json.dumps({"total": 100, "used": 25, "free": 75}),
+                    "error": "",
+                }
+
+            try:
+                common.execute = fake_execute
+                setattr(sprinkle, "__config", {
+                    "drive_id": "drive-id",
+                    "rclone_retries": "1",
+                })
+                quota, error = sprinkle._refresh_service_account_quota({
+                    "managed_path": account_path,
+                    "client_email": "one@example.test",
+                    "project_id": "synthetic-project",
+                })
+            finally:
+                common.execute = old_execute
+                setattr(sprinkle, "__config", old_config)
+
+            self.assertIsNone(error)
+            self.assertEqual(quota["free"], 75)
+            self.assertEqual(calls[0][0][1], "about")
+            self.assertFalse(os.path.exists(calls[0][1]))
+
+    def test_rclone_subprocess_does_not_inherit_rclone_config(self):
+        old_config = os.environ.get("RCLONE_CONFIG")
+        try:
+            os.environ["RCLONE_CONFIG"] = "/production/old-rclone.conf"
+            process = mock.MagicMock()
+            process.__enter__.return_value = process
+            process.communicate.return_value = (b"", b"")
+            process.returncode = 0
+
+            with mock.patch.object(common.subprocess, "Popen", return_value=process) as popen:
+                rclone.RClone().get_version()
+
+            child_env = popen.call_args.kwargs["env"]
+            self.assertNotIn("RCLONE_CONFIG", child_env)
+            self.assertEqual(os.environ["RCLONE_CONFIG"], "/production/old-rclone.conf")
+        finally:
+            if old_config is None:
+                os.environ.pop("RCLONE_CONFIG", None)
+            else:
+                os.environ["RCLONE_CONFIG"] = old_config
+
+    def test_rclone_env_file_rolls_out_and_loads_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = os.path.join(tmp, "rclone.env")
+            keys = [key for key, _value in sprinkle.DEFAULT_RCLONE_ENV_VALUES]
+            old_env = dict((key, os.environ.get(key)) for key in keys)
+            try:
+                for key in keys:
+                    os.environ.pop(key, None)
+
+                loaded = sprinkle.apply_rclone_env_file(env_path)
+
+                self.assertTrue(os.path.exists(env_path))
+                with open(env_path) as fp:
+                    content = fp.read()
+                self.assertIn("# Lines whose first non-space character is # are ignored.", content)
+                self.assertEqual(loaded["RCLONE_DRIVE_CHUNK_SIZE"], "256M")
+                self.assertEqual(os.environ["RCLONE_SIZE_ONLY"], "1")
+                self.assertEqual(os.environ["RCLONE_NO_UPDATE_MODTIME"], "1")
+            finally:
+                for key, value in old_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+
+    def test_rclone_env_file_ignores_comments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = os.path.join(tmp, "rclone.env")
+            with open(env_path, "w") as fp:
+                fp.write("\n".join([
+                    "# RCLONE_SIZE_ONLY=0",
+                    "  # RCLONE_NO_UPDATE_MODTIME=0",
+                    "RCLONE_DRIVE_CHUNK_SIZE=512M",
+                    "RCLONE_EXTRA=value=with=equals",
+                    "RCLONE_CONFIG=/must/not/be/used.conf",
+                    "",
+                ]))
+            keys = [
+                "RCLONE_SIZE_ONLY",
+                "RCLONE_NO_UPDATE_MODTIME",
+                "RCLONE_DRIVE_CHUNK_SIZE",
+                "RCLONE_EXTRA",
+                "RCLONE_CONFIG",
+            ]
+            old_env = dict((key, os.environ.get(key)) for key in keys)
+            try:
+                for key in keys:
+                    os.environ.pop(key, None)
+
+                loaded = sprinkle.apply_rclone_env_file(env_path)
+
+                self.assertNotIn("RCLONE_SIZE_ONLY", loaded)
+                self.assertNotIn("RCLONE_NO_UPDATE_MODTIME", loaded)
+                self.assertEqual(os.environ["RCLONE_DRIVE_CHUNK_SIZE"], "512M")
+                self.assertEqual(os.environ["RCLONE_EXTRA"], "value=with=equals")
+                self.assertNotIn("RCLONE_CONFIG", loaded)
+                self.assertNotIn("RCLONE_CONFIG", os.environ)
+            finally:
+                for key, value in old_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+
+    def test_configure_rolls_out_default_rclone_env_file(self):
+        old_home = os.environ.get("HOME")
+        keys = [key for key, _value in sprinkle.DEFAULT_RCLONE_ENV_VALUES]
+        old_env = dict((key, os.environ.get(key)) for key in keys)
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                os.environ["HOME"] = tmp
+                for key in keys:
+                    os.environ.pop(key, None)
+
+                sprinkle.read_args(["stats"])
+                sprinkle.configure(None)
+
+                env_path = os.path.join(tmp, ".sprinkle", "rclone.env")
+                self.assertTrue(os.path.exists(env_path))
+                self.assertEqual(os.environ["RCLONE_DRIVE_CHUNK_SIZE"], "256M")
+                self.assertEqual(getattr(sprinkle, "__config")["rclone_env_file"], env_path)
+            finally:
+                if old_home is None:
+                    os.environ.pop("HOME", None)
+                else:
+                    os.environ["HOME"] = old_home
+                for key, value in old_env.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+
+    def test_dash_v_sets_rclone_verbose(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_verbose = os.environ.get("RCLONE_VERBOSE")
+            try:
+                os.environ.pop("RCLONE_VERBOSE", None)
+                sprinkle.read_args([
+                    "-v",
+                    "--rclone-env-file",
+                    os.path.join(tmp, "rclone.env"),
+                    "stats",
+                ])
+                sprinkle.configure(None)
+
+                self.assertEqual(os.environ["RCLONE_VERBOSE"], "1")
+            finally:
+                if old_verbose is None:
+                    os.environ.pop("RCLONE_VERBOSE", None)
+                else:
+                    os.environ["RCLONE_VERBOSE"] = old_verbose
+
+    def test_progress_option_sets_show_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sprinkle.read_args([
+                "--progress",
+                "--rclone-env-file",
+                os.path.join(tmp, "rclone.env"),
+                "backup",
+                "/tmp/local",
+            ])
+            sprinkle.configure(None)
+
+            self.assertTrue(getattr(sprinkle, "__config")["show_progress"])
+
     def test_rclone_sa_dir_imports_deduped_managed_accounts(self):
         with tempfile.TemporaryDirectory() as tmp:
             source = os.path.join(tmp, "source")
@@ -602,6 +1080,8 @@ class ServiceAccountCliTest(unittest.TestCase):
                 "1",
                 "--drive-id",
                 "drive-id",
+                "--rclone-env-file",
+                os.path.join(tmp, "rclone.env"),
                 "--sa-db",
                 db_path,
                 "--sa-store",
@@ -618,6 +1098,62 @@ class ServiceAccountCliTest(unittest.TestCase):
             self.assertIn("root_folder_id = drive-id", content)
             self.assertIn(os.path.abspath(store), content)
             os.unlink(conf_path)
+
+    def test_service_account_config_includes_existing_rclone_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "source")
+            store = os.path.join(tmp, "store")
+            db_path = os.path.join(tmp, "sa.sqlite3")
+            base_conf = os.path.join(tmp, "rclone.conf")
+            os.mkdir(source)
+            write_json(os.path.join(source, "one.json"), make_service_account("one@example.test"))
+            with open(base_conf, "w") as fp:
+                fp.write("[hidrive]\ntype = local\n")
+
+            sprinkle.read_args([
+                "--rclone-conf",
+                base_conf,
+                "--rclone-sa-dir",
+                source,
+                "--rclone-sa-count",
+                "1",
+                "--drive-id",
+                "drive-id",
+                "--rclone-env-file",
+                os.path.join(tmp, "rclone.env"),
+                "--sa-db",
+                db_path,
+                "--sa-store",
+                store,
+                "stats",
+            ])
+            sprinkle.configure(None)
+            sprinkle.prepare_rclone_sa_config()
+            conf_path = getattr(sprinkle, "__rclone_conf")
+            with open(conf_path) as fp:
+                content = fp.read()
+
+            self.assertIn("[hidrive]", content)
+            self.assertIn("[dst101]", content)
+            self.assertEqual(getattr(sprinkle, "__config")["cluster_remotes"], ["dst101:"])
+            os.unlink(conf_path)
+
+    def test_explicit_backup_target_skips_default_service_account_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sprinkle.read_args([
+                "--rclone-sa-dir",
+                os.path.join(tmp, "accounts"),
+                "--rclone-env-file",
+                os.path.join(tmp, "rclone.env"),
+                "backup",
+                "/tmp/local",
+                "hidrive:public/Manga",
+            ])
+            sprinkle.configure(None)
+            sprinkle.prepare_rclone_sa_config()
+
+            self.assertNotIn("rclone_config", getattr(sprinkle, "__config"))
+            self.assertEqual(getattr(sprinkle, "__config")["rclone_sa_dir"], os.path.join(tmp, "accounts"))
 
     def test_backup_without_rclone_sa_dir_uses_default_service_account_store(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -639,6 +1175,8 @@ class ServiceAccountCliTest(unittest.TestCase):
                 sprinkle.read_args([
                     "--drive-id",
                     "drive-id",
+                    "--rclone-env-file",
+                    os.path.join(tmp, "rclone.env"),
                     "--sa-db",
                     db_path,
                     "--sa-store",
@@ -687,12 +1225,15 @@ class ServiceAccountCliTest(unittest.TestCase):
             self.assertIn("sa_refresh=stale", content)
             self.assertIn("sa_clean_invalid=quarantine", content)
             self.assertIn("ls_stop_first=true", content)
+            self.assertIn("rclone_env_file=~/.sprinkle/rclone.env", content)
             self.assertIn("large_file_threshold_bytes=1073741824", content)
 
     def test_config_command_defaults_to_home_sprinkle_config_path(self):
         old_home = os.environ.get("HOME")
+        old_config = os.environ.get("SPRINKLE_CONFIG")
         with tempfile.TemporaryDirectory() as tmp:
             os.environ["HOME"] = tmp
+            os.environ.pop("SPRINKLE_CONFIG", None)
             answers = iter(["", "", "", "", "", "", "", "", ""])
 
             def prompt(_message):
@@ -702,11 +1243,88 @@ class ServiceAccountCliTest(unittest.TestCase):
                 target = sprinkle.config_command(prompt)
                 self.assertEqual(target, os.path.join(tmp, ".sprinkle", "sprinkle.conf"))
                 self.assertTrue(os.path.exists(target))
+                self.assertTrue(os.path.exists(os.path.join(tmp, ".sprinkle", "rclone.env")))
             finally:
                 if old_home is None:
                     os.environ.pop("HOME", None)
                 else:
                     os.environ["HOME"] = old_home
+                if old_config is None:
+                    os.environ.pop("SPRINKLE_CONFIG", None)
+                else:
+                    os.environ["SPRINKLE_CONFIG"] = old_config
+
+    def test_config_path_precedence_is_cli_then_environment_then_home(self):
+        old_home = os.environ.get("HOME")
+        old_config = os.environ.get("SPRINKLE_CONFIG")
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                os.environ["HOME"] = tmp
+                home_config = os.path.join(tmp, ".sprinkle", "sprinkle.conf")
+                env_config = os.path.join(tmp, "environment.conf")
+                os.makedirs(os.path.dirname(home_config))
+                for path in (home_config, env_config):
+                    with open(path, "w") as fp:
+                        fp.write("debug=false\n")
+                os.environ["SPRINKLE_CONFIG"] = env_config
+
+                sprinkle.read_args(["stats"])
+                self.assertEqual(getattr(sprinkle, "__configfile"), env_config)
+
+                sprinkle.read_args(["-c", "~/cli.conf", "stats"])
+                self.assertEqual(getattr(sprinkle, "__configfile"), os.path.join(tmp, "cli.conf"))
+                self.assertEqual(
+                    sprinkle.resolve_config_path("relative.conf", environ={}),
+                    "relative.conf",
+                )
+
+                os.environ.pop("SPRINKLE_CONFIG", None)
+                sprinkle.read_args(["stats"])
+                self.assertEqual(getattr(sprinkle, "__configfile"), home_config)
+            finally:
+                if old_home is None:
+                    os.environ.pop("HOME", None)
+                else:
+                    os.environ["HOME"] = old_home
+                if old_config is None:
+                    os.environ.pop("SPRINKLE_CONFIG", None)
+                else:
+                    os.environ["SPRINKLE_CONFIG"] = old_config
+
+    def test_missing_environment_config_is_an_explicit_error(self):
+        old_config = os.environ.get("SPRINKLE_CONFIG")
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "missing.conf")
+            try:
+                os.environ["SPRINKLE_CONFIG"] = missing
+                sprinkle.read_args(["stats"])
+                with self.assertRaisesRegex(Exception, "not found"):
+                    sprinkle.configure(getattr(sprinkle, "__configfile"))
+            finally:
+                if old_config is None:
+                    os.environ.pop("SPRINKLE_CONFIG", None)
+                else:
+                    os.environ["SPRINKLE_CONFIG"] = old_config
+
+    def test_config_command_uses_sprinkle_config_override(self):
+        old_config = os.environ.get("SPRINKLE_CONFIG")
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "nested", "sprinkle.conf")
+            answers = iter(["", "", "", "", "", "", "", "", ""])
+
+            def prompt(_message):
+                return next(answers)
+
+            try:
+                os.environ["SPRINKLE_CONFIG"] = target
+                written = sprinkle.config_command(prompt)
+                self.assertEqual(written, target)
+                self.assertTrue(os.path.isfile(target))
+            finally:
+                if old_config is None:
+                    os.environ.pop("SPRINKLE_CONFIG", None)
+                else:
+                    os.environ["SPRINKLE_CONFIG"] = old_config
 
     def test_config_file_service_account_defaults_generate_rclone_config(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -725,6 +1343,7 @@ class ServiceAccountCliTest(unittest.TestCase):
                     "rclone_sa_count=1",
                     "drive_id=drive-id",
                     "rclone_sa_dir=" + source,
+                    "rclone_env_file=" + os.path.join(tmp, "rclone.env"),
                     "sa_db=" + db_path,
                     "sa_store=" + store,
                 ]))

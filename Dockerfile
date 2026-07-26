@@ -4,7 +4,6 @@ FROM python:3.11
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    RCLONE_CONFIG=/config/rclone.conf \
     SPRINKLE_CONFIG=/config/sprinkle.conf \
     TZ=Etc/UTC
 

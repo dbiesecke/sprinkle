@@ -21,11 +21,24 @@ $ docker run -i -v /etc/rclone:/etc/rclone:ro dbiesecke/sprinkle --rclone-sa-cou
 ```bash
 $ ./sprinkle.py sa-import /etc/rclone/sa
 $ ./sprinkle.py --drive-id XXXXX sa-stats
+$ ./sprinkle/sprinkle.py -d --drive-id YouDriveID backup /Users/user/workspace/Movies/Aladin
+
 ```
 
 `sa-import` validates new accounts with `rclone about --json` and prints per-file progress. If rclone returns an error or quota remains unknown, the account is recorded as invalid and quarantined by default.
 
+* run an auditable monthly Google Drive service-account keepalive through Cron
+
+For unattended monthly authentication checks, install the operational runner described in
+[docs/sa-keepalive.md](docs/sa-keepalive.md). It forces a read-only refresh for every active account,
+verifies the SQLite results, maintains a success marker for monitoring, and never logs key material.
+
 Sprinkle keeps upload placement capacity-aware for large files: service accounts are selected by known free space, with extra headroom for files of at least 1 GiB so a large movie is not sent to an account that only barely fits it.
+
+Backups continue after individual transfer, quota, update, or deletion failures. New files try each
+capacity-qualified remote in order of available space. Any unresolved operations are summarized at the
+end and return a non-zero status, so scheduled jobs and SMTP alerts remain reliable. Resolve the remote
+or quota problem and rerun the backup; already completed files are not uploaded again.
 
 * create a home-directory configuration with interactive defaults
 
@@ -33,10 +46,34 @@ Sprinkle keeps upload placement capacity-aware for large files: service accounts
 $ ./sprinkle.py config
 # writes ~/.sprinkle/sprinkle.conf, including:
 # --rclone-sa-count 5 --drive-id XXXXX -d --rclone-sa-dir /etc/rclone/sa
+# rclone_env_file=~/.sprinkle/rclone.env
 # sa_cache_ttl_hours=72
 # sa_refresh=stale
 # sa_clean_invalid=quarantine
 ```
+
+Sprinkle resolves its configuration in this order: `-c/--conf`, then a non-empty
+`SPRINKLE_CONFIG`, then `~/.sprinkle/sprinkle.conf`. The `config` command uses the
+same order when choosing where to write. An explicit CLI or environment path must
+exist for normal commands; the Home file is optional.
+
+`~/.sprinkle/rclone.env` is created on first use and exports rclone tuning defaults
+such as `RCLONE_DRIVE_CHUNK_SIZE=256M`, `RCLONE_SIZE_ONLY=1`, and
+`RCLONE_NO_UPDATE_MODTIME=1`. Lines beginning with `#` are ignored.
+`RCLONE_CONFIG` is reserved and ignored, including when inherited from production
+or written into `rclone.env`. Use `--rclone-conf`, `rclone_config`, or Sprinkle's
+generated service-account configuration instead.
+
+The Docker image sets `SPRINKLE_CONFIG=/config/sprinkle.conf`, so a mounted
+`/config` directory intentionally overrides the Home default:
+
+```bash
+docker run --rm \
+  -v "$PWD/config:/config" \
+  dbiesecke/sprinkle config
+```
+
+See [docs/usage.md](docs/usage.md) for configuration and service-account examples.
 
 
 
@@ -51,7 +88,7 @@ Features:
 
 The easiest way to install Sprinkle and all prerequisites is via PyPI with:
 ```
-pip3 install sprinkle-py
+pip3 install git https://gitlab.com/dbiesecke/sprinkle.git
 ```
 
 Or by cloning the repository to your running machine, but make sure prerequisites are met:
@@ -60,7 +97,8 @@ git clone https://gitlab.com/dbiesecke/sprinkle.git
 cd sprinkle
 sprinkle.py config
 sprinkle.py sa-import /your/sa/accounts
-sprinkle.py sa-stats 
+sprinkle.py sa-stats
+sprinkle.py -d --drive-id YourDrive backup Movies/Aladin  
 ```
 A more comprehensive guide can be found [here](https://dbiesecke.github.io/sprinkle/docs/guide)
 
@@ -94,6 +132,25 @@ From this point, backups and restore can be executed on the clustered storage.
 ./sprinkle.py -c {path to sprinkle.conf} backup {directory to backup}
 ```
 
+You can also bypass clustered placement and back up to one explicit rclone target
+from the normal rclone config:
+
+```
+./sprinkle.py backup /dir_to_backup hidrive:public/Manga
+```
+
+Both source and target can be rclone remotes, so no local staging directory is
+required:
+
+```
+./sprinkle.py backup hidrive:public/Manga backup:mirror/Manga
+```
+
+When Sprinkle generates a temporary service-account rclone config, it also includes
+the existing rclone config, so configured remotes such as `hidrive:` remain
+available. Clustered placement is still limited to the generated service-account
+remotes unless an explicit target is supplied.
+
 Use the builtin --help utility to get additional commands and information.
 
 ```
@@ -104,9 +161,10 @@ and the command specific help.
 
 ```
     -c, --conf {config file}     configuration file
-    -d, --debug                  debug output
+    -d, --debug                  debug output (default:true)
     -h, --help                   help
-    -v, --version                print version
+    -v, --verbose                set RCLONE_VERBOSE=1 for rclone
+    --version                    print version
     --check-prereq               chech prerequisites
     --comp-method {size|md5}     compare method [size|md5] (default:size)
     --daemon-interval            interval for the daemon to execute in minutes (default:60)
@@ -122,6 +180,7 @@ and the command specific help.
     --log-file {file}            logs output to the specified file
     --no-cache                   turn off caching
     --rclone-conf {config file}  rclone configuration (default:None)
+    --rclone-env-file {file}     file with environment variables for rclone
     --rclone-sa-dir {dir}        build rclone config from service accounts
     --rclone-sa-count {num}      limit number of service accounts used
     --drive-id {id}              Google Drive folder ID for rclone config
@@ -135,9 +194,9 @@ and the command specific help.
     --rclone-move                use 'rclone move' instead of 'rclone copy' (default:false)
     --restore-duplicates         restore files if duplicates are found (default:false)
     --retries {num_retries}      number of retries (default:1)
-    --show-progress              show progress
+    --progress                   show progress
     --single-instance            make sure only 1 concurrent instance of sprinkle is running (default:False)
-    --ls-stop-first             stop listing after first remote with files
+    --ls-stop-first              stop listing after first remote with files (default:true)
     
 ```
 
@@ -150,7 +209,3 @@ and the command specific help.
 
 This project is licensed under the GPLv3 License - see the
 [LICENSE](https://www.gnu.org/licenses/gpl-3.0.en.html) file for details
-
-## Acknowledgments
-
-* Warren Crigger for development support
