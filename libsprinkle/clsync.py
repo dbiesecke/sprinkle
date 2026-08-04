@@ -202,7 +202,7 @@ class ClSync:
                 tmp_file.mime_type = tmp_json_file['MimeType']
                 tmp_file.mod_time = tmp_json_file['ModTime']
                 tmp_file.is_dir = tmp_json_file['IsDir']
-                tmp_file.id = tmp_json_file['ID']
+                tmp_file.id = tmp_json_file.get('ID')
                 key = file + '/' + tmp_json_file['Path']
                 if regexp is not None and regexp.search(key) is None:
                     logging.debug('skipping ' + key + '...')

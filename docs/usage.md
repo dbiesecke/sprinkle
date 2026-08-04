@@ -107,3 +107,16 @@ failure handling. Fix the reported remote or quota error and rerun the backup.
 
 When rclone returns Google `storageQuotaExceeded`, Sprinkle records `free=0` for that remote in memory
 and the service-account quota cache, then tries the next eligible remote for a new file.
+
+## Explicit classic rclone targets
+
+Backups to an explicit classic rclone target support backends without object IDs,
+including rclone's `local` backend:
+
+```bash
+python3 sprinkle.py backup /data/Manga local:/srv/backups/Manga
+```
+
+With `delete_files=true`, files and directories removed from the source are also
+removed from the target. With `delete_files=false`, additional target objects are
+left untouched.

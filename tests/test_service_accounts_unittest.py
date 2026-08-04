@@ -1,8 +1,10 @@
 import json
 import os
+import shutil
 import stat
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
@@ -597,6 +599,207 @@ class ClSyncPlacementTest(unittest.TestCase):
 
         self.assertIn("/Movies/Aladin/movie.mkv", files)
         self.assertEqual(calls, [("dst101:", "/Movies/Aladin", ["--fast-list"])])
+
+    def test_lsjson_accepts_files_and_directories_without_ids(self):
+        sync = clsync.ClSync.__new__(clsync.ClSync)
+        sync._config = {
+            "no_cache": False,
+            "ls_stop_first": False,
+        }
+        sync._sa_registry = None
+        sync._sa_refresh = "stale"
+        sync._compare_method = "size"
+        sync._cache = {}
+        sync._cache_counter = {}
+        sync._cache_invalidation_max = 10
+        sync.get_remotes = lambda: ["local:"]
+        payload = json.dumps([
+            {
+                "Path": "movie.mkv",
+                "Name": "movie.mkv",
+                "Size": 10,
+                "MimeType": "video/x-matroska",
+                "ModTime": "2024-01-01T00:00:00Z",
+                "IsDir": False,
+            },
+            {
+                "Path": "extras",
+                "Name": "extras",
+                "Size": -1,
+                "MimeType": "inode/directory",
+                "ModTime": "2024-01-01T00:00:00Z",
+                "IsDir": True,
+            },
+            {
+                "Path": "drive-file.mkv",
+                "Name": "drive-file.mkv",
+                "Size": 20,
+                "MimeType": "video/x-matroska",
+                "ModTime": "2024-01-01T00:00:00Z",
+                "IsDir": False,
+                "ID": "drive-file-id",
+            },
+        ])
+        sync._rclone = types.SimpleNamespace(lsjson=lambda *_args: payload)
+
+        files = sync.ls("/Movies/Aladin")
+
+        self.assertIsNone(files["/Movies/Aladin/movie.mkv"].id)
+        self.assertIsNone(files["/Movies/Aladin/extras"].id)
+        self.assertEqual(files["/Movies/Aladin/drive-file.mkv"].id, "drive-file-id")
+
+    def test_backup_with_delete_files_removes_idless_file_and_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "source")
+            target = os.path.join(tmp, "target")
+            os.makedirs(source)
+            os.makedirs(target)
+            keep_path = os.path.join(source, "keep.txt")
+            with open(keep_path, "w") as fp:
+                fp.write("keep")
+
+            sync = clsync.ClSync.__new__(clsync.ClSync)
+            sync._show_progress = False
+            sync._compare_method = "size"
+            sync._ClSync__exclusion_list = None
+            sync._ClSync__exclude_regex = None
+            sync._config = {"no_cache": True, "ls_stop_first": False}
+            sync._sa_registry = None
+            sync._sa_refresh = "stale"
+            sync._cache = {}
+            sync._cache_counter = {}
+            sync._cache_invalidation_max = 10
+            payload = json.dumps([
+                {
+                    "Path": "keep.txt",
+                    "Name": "keep.txt",
+                    "Size": 4,
+                    "MimeType": "text/plain",
+                    "ModTime": "2024-01-01T00:00:00Z",
+                    "IsDir": False,
+                },
+                {
+                    "Path": "removed.txt",
+                    "Name": "removed.txt",
+                    "Size": 7,
+                    "MimeType": "text/plain",
+                    "ModTime": "2024-01-01T00:00:00Z",
+                    "IsDir": False,
+                },
+                {
+                    "Path": "orphan-dir",
+                    "Name": "orphan-dir",
+                    "Size": -1,
+                    "MimeType": "inode/directory",
+                    "ModTime": "2024-01-01T00:00:00Z",
+                    "IsDir": True,
+                },
+            ])
+            sync._rclone = types.SimpleNamespace(lsjson=lambda *_args: payload)
+            deleted = []
+            removed_dirs = []
+            sync.delete_file = lambda path, remote: deleted.append((path, remote))
+            sync.rmdir = lambda path, remote: removed_dirs.append((path, remote))
+            sync.copy = lambda *_args: self.fail("matching source file should not be copied")
+
+            sync.backup(source, delete_files=True, dry_run=False, target="local:" + target)
+
+            self.assertEqual(deleted, [(target + "/removed.txt", "local:")])
+            self.assertEqual(removed_dirs, [(target + "/orphan-dir", "local:")])
+
+    def test_backup_without_delete_files_accepts_idless_shallow_listing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "source")
+            target = os.path.join(tmp, "target")
+            os.makedirs(source)
+            os.makedirs(target)
+            with open(os.path.join(source, "keep.txt"), "w") as fp:
+                fp.write("keep")
+
+            sync = clsync.ClSync.__new__(clsync.ClSync)
+            sync._show_progress = False
+            sync._compare_method = "size"
+            sync._ClSync__exclusion_list = None
+            sync._ClSync__exclude_regex = None
+            sync._config = {"no_cache": True, "ls_stop_first": False}
+            sync._sa_registry = None
+            sync._sa_refresh = "stale"
+            sync._cache = {}
+            sync._cache_counter = {}
+            sync._cache_invalidation_max = 10
+            payload = json.dumps([{
+                "Path": "keep.txt",
+                "Name": "keep.txt",
+                "Size": 4,
+                "MimeType": "text/plain",
+                "ModTime": "2024-01-01T00:00:00Z",
+                "IsDir": False,
+            }])
+            calls = []
+            sync._rclone = types.SimpleNamespace(
+                lsjson=lambda remote, path, args, _no_error: calls.append((remote, path, args)) or payload
+            )
+            sync.copy = lambda *_args: self.fail("matching source file should not be copied")
+            sync.delete_file = lambda *_args: self.fail("delete_files=False must not delete files")
+            sync.rmdir = lambda *_args: self.fail("delete_files=False must not delete directories")
+
+            sync.backup(source, delete_files=False, dry_run=False, target="local:" + target)
+
+            self.assertEqual(calls, [("local:", target, ["--fast-list"])])
+
+    @unittest.skipUnless(shutil.which("rclone"), "rclone is required for the local backend integration test")
+    def test_real_local_remote_backup_without_ids(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "source")
+            target = os.path.join(tmp, "target")
+            config_path = os.path.join(tmp, "rclone-test.conf")
+            os.makedirs(source)
+            os.makedirs(target)
+            with open(config_path, "w") as fp:
+                fp.write("[local_source]\ntype = local\n\n[local_target]\ntype = local\n")
+
+            for name, content in (("keep.txt", "keep"), ("removed.txt", "remove me")):
+                path = os.path.join(source, name)
+                with open(path, "w") as fp:
+                    fp.write(content)
+                old_time = time.time() - (7 * 60 * 60)
+                os.utime(path, (old_time, old_time))
+
+            config = {
+                "rclone_config": config_path,
+                "distribution_type": "mas",
+                "compare_method": "size",
+                "rclone_retries": "1",
+                "show_progress": False,
+                "daemon_interval": 60,
+                "no_cache": True,
+                "ls_stop_first": False,
+                "rclone_move": False,
+            }
+            sync = clsync.ClSync(config)
+            explicit_target = "local_target:" + target
+
+            sync.backup(source, delete_files=True, dry_run=False, target=explicit_target)
+            self.assertTrue(os.path.isfile(os.path.join(target, "keep.txt")))
+            self.assertTrue(os.path.isfile(os.path.join(target, "removed.txt")))
+
+            os.remove(os.path.join(source, "removed.txt"))
+            os.mkdir(os.path.join(target, "orphan-dir"))
+            listing = json.loads(sync._rclone.lsjson(
+                "local_target:", target, ["--recursive", "--fast-list"], True
+            ))
+            self.assertTrue(listing)
+            self.assertTrue(all("ID" not in row for row in listing))
+
+            sync.backup(source, delete_files=True, dry_run=False, target=explicit_target)
+            self.assertFalse(os.path.exists(os.path.join(target, "removed.txt")))
+            self.assertFalse(os.path.exists(os.path.join(target, "orphan-dir")))
+
+            extra_path = os.path.join(target, "extra.txt")
+            with open(extra_path, "w") as fp:
+                fp.write("must remain")
+            sync.backup(source, delete_files=False, dry_run=False, target=explicit_target)
+            self.assertTrue(os.path.isfile(extra_path))
 
     def test_backup_without_delete_files_uses_shallow_remote_listings(self):
         with tempfile.TemporaryDirectory() as tmp:

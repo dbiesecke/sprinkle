@@ -156,6 +156,9 @@ required:
 ./sprinkle.py backup hidrive:public/Manga backup:mirror/Manga
 ```
 
+Explicit targets also support classic rclone backends that do not expose object
+IDs, including absolute local targets such as `local:/srv/backups/Manga`.
+
 When Sprinkle generates a temporary service-account rclone config, it also includes
 the existing rclone config, so configured remotes such as `hidrive:` remain
 available. Clustered placement is still limited to the generated service-account
