@@ -34,6 +34,20 @@ docker run --rm \
   dbiesecke/sprinkle config
 ```
 
+## Backup to an explicit rclone remote
+
+Use `remote:path` for an exact destination, or a bare `remote:` for its root:
+
+```bash
+python3 sprinkle.py backup /local/movie.mkv hidrive:
+python3 sprinkle.py backup /local/roms hidrive:
+python3 sprinkle.py backup /local/roms hidrive:/archive
+```
+
+The first command copies `movie.mkv` to `hidrive:/movie.mkv`. The second copies the directory beneath
+`hidrive:/roms/`; the third copies its contents beneath `hidrive:/archive/`. Single-file backups never
+delete unrelated objects from the target directory.
+
 ## Rclone configuration isolation
 
 Sprinkle ignores `RCLONE_CONFIG` from both the process environment and `rclone_env_file`. This avoids
@@ -113,8 +127,9 @@ service-account rclone-config generation. Prefer the `SPRINKLE_RCLONE_RC_PASSWOR
 storing an RC password in a config file.
 
 Service-account JSON contains secrets. Do not print, log, or commit it. Duplicate account JSON is counted and
-skipped without adding a managed file or SQLite account record. Imports with unknown quota or failed rclone
-validation are quarantined by default.
+skipped without adding a managed file or SQLite account record. When RC is configured, `sa-import` validates the
+candidate through `operations/about` on its prospective stable `dstNNN` remote; provision the identical mapping on
+the RC server first. Imports with unknown quota or failed validation are quarantined by default.
 
 Use `--sa-delete-account-not-found` only when source JSON files should be removed after the exact Google
 error `Invalid grant: account not found`. Other quota and credential errors never trigger this deletion.

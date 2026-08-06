@@ -22,10 +22,16 @@ $ docker run -i -v /etc/rclone:/etc/rclone:ro dbiesecke/sprinkle --rclone-sa-cou
 $ ./sprinkle.py sa-import /etc/rclone/sa
 $ ./sprinkle.py --drive-id XXXXX sa-stats
 $ ./sprinkle/sprinkle.py -d --drive-id YouDriveID backup /Users/user/workspace/Movies/Aladin
+$ ./sprinkle.py backup /local/movie.mkv hidrive:
+$ ./sprinkle.py backup /local/roms hidrive:
 
 ```
 
-`sa-import` validates new accounts with `rclone about --json` and prints per-file progress. Duplicate account JSON is counted and skipped without creating an additional managed file or SQLite account record. If rclone returns an error or quota remains unknown, the account is recorded as invalid and quarantined by default.
+`sa-import` validates new accounts with `rclone about --json` and prints per-file progress. With RC configured it instead uses `operations/about` on the candidate's prospective stable `dstNNN` remote; the RC server must provision that same mapping first. Duplicate account JSON is counted and skipped without creating an additional managed file or SQLite account record. If validation fails or quota remains unknown, the account is quarantined by default.
+
+An explicit rclone target accepts both `remote:path` and a bare `remote:`. A local file sent to `hidrive:`
+lands in the remote root. A local directory sent to `hidrive:` lands under a same-named folder, while
+`hidrive:/archive` uses `/archive` exactly. Single-file backups never delete other objects in the target.
 
 For already imported accounts, `--sa-delete-account-not-found` is an explicit cleanup option. It removes
 the managed and source JSON only when Google returns `Invalid grant: account not found`; other validation

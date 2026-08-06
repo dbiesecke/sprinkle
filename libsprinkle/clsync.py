@@ -602,6 +602,23 @@ class ClSync:
         logging.debug('retrieved ' + str(len(clfiles)) + ' files')
         return clfiles
 
+    def index_local_file(self, local_file, exclusion_list=None):
+        common.print_line('indexing local file: ' + local_file + '...')
+        full_path = os.path.abspath(local_file)
+        if exclusion_list is not None and any(exclusion in full_path for exclusion in exclusion_list):
+            return {}
+        if self.__exclude_regex is not None and re.search(self.__exclude_regex, full_path) is not None:
+            return {}
+        tmp_clfile = clfile.ClFile()
+        tmp_clfile.is_dir = False
+        tmp_clfile.path = os.path.dirname(full_path)
+        tmp_clfile.name = os.path.basename(full_path)
+        tmp_clfile.size = os.stat(full_path).st_size
+        tmp_clfile.mod_time = os.stat(full_path).st_mtime
+        if self._compare_method == 'md5':
+            tmp_clfile.md5 = common.get_md5(full_path)
+        return {common.normalize_path(full_path): tmp_clfile}
+
     def index_remote_dir(self, remote, remote_path, exclusion_list=None):
         source = remote + remote_path
         common.print_line('indexing rclone remote: ' + source + '...')
@@ -785,6 +802,7 @@ class ClSync:
         logging.debug('backing up directory ' + local_dir)
         source_remote, source_path = self.parse_backup_target(local_dir)
         source_is_remote = source_remote is not None
+        source_is_local_file = not source_is_remote and os.path.isfile(local_dir)
         if not source_is_remote and getattr(getattr(self, '_rclone', None), '_rc_url', None) is not None:
             rc_local_remote = self._config.get('rclone_rc_local_remote')
             if rc_local_remote in (None, ''):
@@ -796,27 +814,35 @@ class ClSync:
             source_is_remote = True
         if source_is_remote and self._compare_method == 'md5':
             raise Exception("rclone remote source backup supports compare_method=size")
-        if not source_is_remote and not common.is_dir(local_dir):
-            logging.error("local directory " + local_dir + " not found. Cannot continue!")
-            raise Exception("Local directory " + local_dir + " not found")
+        if not source_is_remote and not common.is_dir(local_dir) and not source_is_local_file:
+            logging.error("local source " + local_dir + " not found. Cannot continue!")
+            raise Exception("Local source " + local_dir + " not found")
         target_remote, target_path = self.parse_backup_target(target)
         if target_path is None:
             if source_is_remote:
                 remote_root = self.get_backup_remote_root_for_remote_source(source_remote, source_path)
+            elif source_is_local_file:
+                remote_root = ''
             else:
                 remote_root = self.get_backup_remote_root(local_dir)
+        elif target_remote is not None and target_path == '' and not source_is_remote and not source_is_local_file:
+            remote_root = '/' + os.path.basename(os.path.abspath(local_dir))
         else:
             remote_root = target_path
         logging.debug('backup remote root: ' + remote_root)
         if source_is_remote:
             local_clfiles = self.index_remote_dir(source_remote, source_path, self.__exclusion_list)
             source_root = source_remote + source_path
+        elif source_is_local_file:
+            local_clfiles = self.index_local_file(local_dir, self.__exclusion_list)
+            source_root = os.path.dirname(os.path.abspath(local_dir))
         else:
             local_clfiles = self.index_local_dir(local_dir, self.__exclusion_list)
             source_root = local_dir
         target_remotes = [target_remote] if target_remote is not None else None
         normalize_remote_path = target_remote is None
-        if delete_files is True or self._compare_method == 'md5':
+        effective_delete_files = delete_files and not source_is_local_file
+        if effective_delete_files is True or self._compare_method == 'md5':
             remote_clfiles = self.ls(remote_root, remotes=target_remotes, normalize_path=normalize_remote_path)
         else:
             remote_clfiles = self.ls_matching_local_files(
@@ -831,7 +857,7 @@ class ClSync:
             source_root,
             local_clfiles,
             remote_clfiles,
-            delete_files,
+            effective_delete_files,
             remote_root,
             source_is_remote,
         )

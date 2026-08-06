@@ -357,25 +357,27 @@ NAME:
     sprinkle backup - backs up local or rclone source paths to remote volumes
 
 SYNOPSIS:
-    sprinkle.py [options] backup {source} [remote:path]
+    sprinkle.py [options] backup {source} [remote[:path]]
 
 DESCRIPTION:
     Backs up a local directory or rclone source path to clustered service-account
-    remotes, or to one explicit rclone target such as backup:mirror/Manga.
+    remotes, or to one explicit rclone target such as backup:mirror/Manga or hidrive:.
     Service-account backups require --drive-id <folder-id>. Explicit rclone
     targets use the normal rclone.conf unless --rclone-conf is supplied.
 
 ARGUMENTS:
     source
-        local directory or rclone source path such as hidrive:public/Manga
-    remote:path
-        optional explicit rclone target
+        local file, local directory, or rclone source path such as hidrive:public/Manga
+    remote[:path]
+        optional explicit rclone target; a bare remote such as hidrive: is its root
 
 EXAMPLES:
     sprinkle.py --drive-id XXXXX backup /backup
     sprinkle.py --drive-id XXXXX backup hidrive:public/Manga
     sprinkle.py --drive-id XXXXX --rclone-sa-dir /etc/rclone/sa backup /backup
     sprinkle.py backup hidrive:public/Manga backup:mirror/Manga
+    sprinkle.py backup /local/movie.mkv hidrive:
+    sprinkle.py backup /local/roms hidrive:
     """
     print(usage_backup.__doc__)
     print(usage_options.__doc__)
@@ -473,9 +475,9 @@ SYNOPSIS:
 
 DESCRIPTION:
     Recursively imports valid service account JSON files into Sprinkle's managed store.
-    Duplicates are recorded but not copied again. New accounts are validated with
-    rclone about --json during import. Invalid accounts and unknown quota results are
-    quarantined by default.
+    Duplicates are skipped without a new account record. New accounts are validated with
+    rclone about --json, or through the configured RC server. Invalid accounts and unknown
+    quota results are quarantined by default.
 
 EXAMPLES:
     sprinkle.py --drive-id XXXXX sa-import /Users/user/workspace/svcacc
@@ -1116,10 +1118,7 @@ def _parse_bool(value):
 
 
 def verify_configuration():
-    config_for_log = dict(__config)
-    if config_for_log.get('rclone_rc_password') not in (None, ''):
-        config_for_log['rclone_rc_password'] = '<redacted>'
-    logging.debug('verifying configuration ' + str(config_for_log))
+    logging.debug('verifying configuration ' + str(_config_for_log(__config)))
     if __config['smtp_enable'] is True:
         if 'smtp_from' not in __config:
             raise Exception('smtp_from value is None')
@@ -1141,6 +1140,14 @@ def verify_configuration():
     if __daemon_mode is True and os.access(os.path.dirname(__config['daemon_pidfile']), os.W_OK) is not True:
         logging.warning('cannot write to pidfile "' + __config['daemon_pidfile'] + '" switching to /tmp/sprinkle.pid')
         __config['daemon_pidfile'] = '/tmp/sprinkle.pid'
+
+
+def _config_for_log(config_values):
+    result = dict(config_values)
+    for field in ('rclone_rc_password', 'smtp_password'):
+        if result.get(field) not in (None, ''):
+            result[field] = '<redacted>'
+    return result
 
 
 def prepare_rclone_sa_config():
@@ -1678,7 +1685,18 @@ def _sa_import_progress(event):
     common.print_line(message)
 
 
-def _service_account_live_validator(path, payload):
+def _service_account_live_validator(path, payload, registry=None):
+    if __config.get('rclone_rc_url') not in (None, ''):
+        if registry is None:
+            return None, 'rclone rc service account validation requires a registry'
+        remote = _rc_remote_name_for_candidate(registry, payload)
+        quota, error = _rclone_rc_about(remote + ':')
+        if error is not None:
+            return None, error
+        unknown_reason = _quota_unknown_reason(quota)
+        if unknown_reason is not None:
+            return None, unknown_reason
+        return quota, None
     fd, tmp_conf = tempfile.mkstemp(prefix="rclone-sa-import-", suffix=".conf")
     os.close(fd)
     try:
@@ -1764,12 +1782,16 @@ def sa_import():
         usage_sa_import()
         sys.exit(-1)
     registry = _service_account_registry()
+    if __config.get('rclone_rc_url') not in (None, ''):
+        registry.assign_stable_remote_names()
     result = registry.import_paths(
         __args[1:],
         __config['sa_clean_invalid'],
-        validator=_service_account_live_validator,
+        validator=lambda path, payload: _service_account_live_validator(path, payload, registry),
         progress=_sa_import_progress,
     )
+    if __config.get('rclone_rc_url') not in (None, ''):
+        registry.assign_stable_remote_names()
     common.print_line('service account import complete')
     common.print_line('scanned:      ' + str(result.scanned))
     common.print_line('validated:    ' + str(result.validated))
@@ -1938,6 +1960,15 @@ def _refresh_service_account_quota(account):
             os.unlink(tmp_conf)
         except Exception:
             pass
+
+
+def _rc_remote_name_for_candidate(registry, payload):
+    """Return the stable RC name the candidate receives if the import succeeds."""
+    client_email = payload.get('client_email')
+    if client_email in (None, ''):
+        raise ValueError('service account is missing client_email')
+    emails = [account['client_email'] for account in registry.active_accounts()]
+    return 'dst{}'.format(101 + sum(email < client_email for email in emails))
 
 
 def _rclone_rc_about(remote):
@@ -2143,7 +2174,7 @@ def main(argv):
         check_prerequisites()
         sys.exit(0)
     check_single_instance()
-    logging.debug('config: ' + str(__config))
+    logging.debug('config: ' + str(_config_for_log(__config)))
 
     if __log_file is not None:
         print('sprinkle is logging to file ' + __log_file + '...')

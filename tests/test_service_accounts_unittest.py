@@ -958,6 +958,56 @@ class ClSyncPlacementTest(unittest.TestCase):
             self.assertEqual(shallow_calls, [("public/Manga", ["hidrive:"], False)])
             self.assertEqual(copies, [(local_file, "public/Manga", "hidrive:")])
 
+    def test_backup_local_file_to_remote_root_does_not_delete_other_objects(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            local_file = os.path.join(tmp, "movie.mkv")
+            with open(local_file, "w") as fp:
+                fp.write("synthetic movie")
+            sync = clsync.ClSync.__new__(clsync.ClSync)
+            sync._show_progress = False
+            sync._compare_method = "size"
+            sync._ClSync__exclusion_list = None
+            sync._ClSync__exclude_regex = None
+            sync._rclone = types.SimpleNamespace(mkdir=lambda *_args: None)
+            sync.get_best_remote = lambda _size: self.fail("cluster placement should not be used")
+            sync.mark_remote_used = lambda _remote, _size: self.fail("cluster quota should not be updated")
+            shallow_calls = []
+            copies = []
+            sync.ls_shallow = lambda path, **kwargs: shallow_calls.append((path, kwargs["remotes"], kwargs["normalize_path"])) or {
+                "/unrelated.mkv": types.SimpleNamespace(is_dir=False, path="/", name="unrelated.mkv", remote="hidrive:")
+            }
+            sync.copy = lambda src, dst, remote: copies.append((src, dst, remote))
+
+            sync.backup(local_file, delete_files=True, dry_run=False, target="hidrive:")
+
+            self.assertEqual(shallow_calls, [("/", ["hidrive:"], False)])
+            self.assertEqual(copies, [(local_file, "/", "hidrive:")])
+
+    def test_backup_directory_to_bare_remote_creates_basename_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "roms")
+            os.mkdir(source)
+            local_file = os.path.join(source, "game.zip")
+            with open(local_file, "w") as fp:
+                fp.write("synthetic game")
+            sync = clsync.ClSync.__new__(clsync.ClSync)
+            sync._show_progress = False
+            sync._compare_method = "size"
+            sync._ClSync__exclusion_list = None
+            sync._ClSync__exclude_regex = None
+            sync._rclone = types.SimpleNamespace(mkdir=lambda *_args: None)
+            sync.get_best_remote = lambda _size: self.fail("cluster placement should not be used")
+            sync.mark_remote_used = lambda _remote, _size: self.fail("cluster quota should not be updated")
+            listed = []
+            copies = []
+            sync.ls = lambda path, **kwargs: listed.append((path, kwargs["remotes"], kwargs["normalize_path"])) or {}
+            sync.copy = lambda src, dst, remote: copies.append((src, dst, remote))
+
+            sync.backup(source, delete_files=True, dry_run=False, target="hidrive:")
+
+            self.assertEqual(listed, [("/roms", ["hidrive:"], False)])
+            self.assertEqual(copies, [(local_file, "/roms", "hidrive:")])
+
     def test_backup_from_rclone_source_to_rclone_target(self):
         sync = clsync.ClSync.__new__(clsync.ClSync)
         sync._show_progress = False
@@ -1057,6 +1107,7 @@ class ClSyncPlacementTest(unittest.TestCase):
             sync.parse_backup_target("hidrive:public/Manga"),
             ("hidrive:", "public/Manga"),
         )
+        self.assertEqual(sync.parse_backup_target("hidrive:"), ("hidrive:", ""))
         self.assertEqual(
             sync.parse_backup_target("local:/private/tmp/Manga"),
             ("local:", "/private/tmp/Manga"),
@@ -1194,6 +1245,34 @@ class ClSyncPlacementTest(unittest.TestCase):
         self.assertTrue(request.get_header("Authorization").startswith("Basic "))
         self.assertEqual(timeout, 12)
 
+    def test_rc_sa_import_validator_uses_prospective_stable_remote(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "source")
+            store = os.path.join(tmp, "store")
+            db_path = os.path.join(tmp, "sa.sqlite3")
+            os.mkdir(source)
+            existing_path = os.path.join(source, "existing.json")
+            candidate_path = os.path.join(source, "candidate.json")
+            write_json(existing_path, make_service_account("one@example.test"))
+            candidate = make_service_account("two@example.test", "two-key")
+            write_json(candidate_path, candidate)
+            registry = service_accounts.ServiceAccountRegistry(db_path, store)
+            registry.import_paths([existing_path])
+            previous_config = sprinkle.__dict__.get("__config")
+            calls = []
+            try:
+                sprinkle.__dict__["__config"] = {"rclone_rc_url": "https://rc.example.test"}
+                old_about = sprinkle._rclone_rc_about
+                sprinkle._rclone_rc_about = lambda remote: (calls.append(remote) or ({"total": 100, "free": 80}, None))
+                quota, error = sprinkle._service_account_live_validator(candidate_path, candidate, registry)
+            finally:
+                sprinkle._rclone_rc_about = old_about
+                sprinkle.__dict__["__config"] = previous_config
+
+            self.assertIsNone(error)
+            self.assertEqual(quota["free"], 80)
+            self.assertEqual(calls, ["dst102:"])
+
     def test_rclone_transport_routes_operations_through_rc(self):
         calls = []
 
@@ -1245,6 +1324,36 @@ class ClSyncPlacementTest(unittest.TestCase):
             "srcFs": "/srv/source/movie.mkv", "dstFs": "dst101:/movies"
         }, 9))
         self.assertEqual(calls[3][0], "deletefile")
+
+    def test_rclone_rc_lsjson_normalizes_paths_to_requested_directory(self):
+        class Response(object):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps({"list": [{
+                    "Path": "shared/downloads/roms/GBA/game.zip",
+                    "Name": "game.zip",
+                    "Size": 10,
+                    "IsDir": False,
+                }]}).encode("utf-8")
+
+        rc = rclone.RClone(rc_url="https://rc.example.test")
+        with mock.patch.object(rclone.urllib_request, "urlopen", return_value=Response()):
+            rows = json.loads(rc.lsjson("mylocal:", "/shared/downloads/roms", ["--recursive"], True))
+
+        self.assertEqual(rows[0]["Path"], "GBA/game.zip")
+
+    def test_config_log_redacts_rc_and_smtp_passwords(self):
+        logged = sprinkle._config_for_log({
+            "rclone_rc_password": "rc-secret",
+            "smtp_password": "smtp-secret",
+        })
+        self.assertEqual(logged["rclone_rc_password"], "<redacted>")
+        self.assertEqual(logged["smtp_password"], "<redacted>")
 
     def test_rc_refresh_requires_a_mapped_remote_without_cli_fallback(self):
         previous_config = sprinkle.__dict__.get("__config")

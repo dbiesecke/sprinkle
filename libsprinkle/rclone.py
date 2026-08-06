@@ -276,9 +276,20 @@ class RClone:
                     'remote': directory.lstrip('/'),
                     'opt': options,
                 })
-                return json.dumps(result.get('list', []))
+                prefix = directory.strip('/')
+                rows = []
+                for item in result.get('list', []):
+                    row = dict(item)
+                    path = row.get('Path', '')
+                    if prefix and path == prefix:
+                        row['Path'] = ''
+                    elif prefix and path.startswith(prefix + '/'):
+                        row['Path'] = path[len(prefix) + 1:]
+                    rows.append(row)
+                return json.dumps(rows)
             except Exception as exc:
                 if no_error:
+                    logging.warning('rclone RC list failed for %s%s: %s', remote, directory, str(exc)[:300])
                     return '[]'
                 raise
         command_with_args = []
