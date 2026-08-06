@@ -53,6 +53,7 @@ class ClSync:
         if self._distribution_type == 'mas':
             self._cached_free = {}
         self._run_unavailable_remotes = {}
+        self._run_quota_exhausted_remotes = set()
         self._sa_registry = None
         self._sa_refresh = config.get('sa_refresh', service_accounts.DEFAULT_REFRESH_MODE)
         self._large_file_threshold_bytes = int(config.get(
@@ -430,6 +431,8 @@ class ClSync:
         for remote in self.get_remotes():
             if remote in getattr(self, '_run_unavailable_remotes', {}):
                 continue
+            if remote in getattr(self, '_run_quota_exhausted_remotes', set()):
+                continue
             size = self._known_free_for_remote(remote)
             logging.debug('free of ' + remote + ' is ' + str(size))
             if size is not None and required_size <= size:
@@ -506,6 +509,11 @@ class ClSync:
 
     def mark_remote_quota_exhausted(self, remote):
         """Exclude a remote after Google confirms that its quota is exhausted."""
+        exhausted = getattr(self, '_run_quota_exhausted_remotes', None)
+        if exhausted is None:
+            exhausted = set()
+            self._run_quota_exhausted_remotes = exhausted
+        exhausted.add(remote)
         self._cached_free[remote] = 0
         if getattr(self, '_frees', None) is not None and remote in self._frees:
             self._frees[remote] = 0
@@ -918,6 +926,8 @@ class ClSync:
                     try:
                         if target_remote is None:
                             candidates = self.get_eligible_remotes(int(op.src.size))
+                            exhausted = getattr(self, '_run_quota_exhausted_remotes', set())
+                            candidates = [remote for remote in candidates if remote not in exhausted]
                         else:
                             candidates = [target_remote]
                         if not candidates:

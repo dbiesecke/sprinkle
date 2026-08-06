@@ -153,7 +153,8 @@ Unknown quota is never used as capacity and is checked again for later files. At
 operations are reported together and the command exits non-zero, preserving existing SMTP and cron
 failure handling. Fix the reported remote or quota error and rerun the backup.
 When rclone returns Google `storageQuotaExceeded`, Sprinkle records `free=0` for that remote in memory
-and the service-account quota cache, then tries the next eligible remote for a new file.
+and the service-account quota cache, excludes it for the remainder of that backup run, then tries the next eligible
+remote for a new file.
 Other RC transfer failures do not falsify the quota cache: Sprinkle excludes the failed remote only for
 the current backup run, preventing repeated attempts for every later file. A later run checks it again.
 

@@ -1599,6 +1599,24 @@ class ClSyncPlacementTest(unittest.TestCase):
         self.assertEqual(sync.get_eligible_remotes(1), ["dst101:"])
         self.assertEqual(sync._cached_free["dst102:"], 100)
 
+    def test_quota_exhaustion_excludes_remote_for_the_remainder_of_the_run(self):
+        sync = clsync.ClSync.__new__(clsync.ClSync)
+        sync._distribution_type = "mas"
+        sync._cached_free = {"dst102:": 100, "dst101:": 100}
+        sync._run_unavailable_remotes = {}
+        sync._run_quota_exhausted_remotes = set()
+        sync._frees = None
+        sync._sa_registry = None
+        sync._large_file_threshold_bytes = 1024
+        sync._large_file_min_free_bytes = 100
+        sync._large_file_min_free_percent = 10
+        sync.get_remotes = lambda: ["dst102:", "dst101:"]
+
+        sync.mark_remote_quota_exhausted("dst101:")
+
+        self.assertEqual(sync.get_eligible_remotes(1), ["dst102:"])
+        self.assertEqual(sync._cached_free["dst101:"], 0)
+
     def test_backup_progress_escapes_percent_in_filename(self):
         class FormattingBar(object):
             def __init__(self, *_args, **_kwargs):
