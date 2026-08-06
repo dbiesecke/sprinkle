@@ -272,12 +272,43 @@ class ServiceAccountRegistryTest(unittest.TestCase):
             self.assertEqual(len(registry.active_accounts()), 0)
             self.assertEqual(registry.all_account_stats()[0]["status"], "invalid")
             output = "\n".join(logs.output)
-            self.assertIn("removed service account file after --sa-delete-account-not-found: " + source_file, output)
-            self.assertIn("removed service account file after --sa-delete-account-not-found: " + managed_file, output)
+            self.assertIn("removed service account file during explicit service-account cleanup: " + source_file, output)
+            self.assertIn("removed service account file during explicit service-account cleanup: " + managed_file, output)
 
     def test_account_not_found_detection_rejects_other_invalid_grants(self):
         self.assertTrue(sprinkle._is_account_not_found_error("Invalid grant: account not found"))
         self.assertFalse(sprinkle._is_account_not_found_error("Invalid grant: Invalid JWT Signature"))
+
+    def test_rc_http_500_cleanup_is_explicit_and_refreshes_all_accounts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "source")
+            os.mkdir(source)
+            source_file = os.path.join(source, "one.json")
+            write_json(source_file, make_service_account("one@example.test"))
+            registry = service_accounts.ServiceAccountRegistry(
+                os.path.join(tmp, "sa.sqlite3"), os.path.join(tmp, "store")
+            )
+            registry.import_paths([source])
+            account = registry.active_accounts()[0]
+            managed_file = account["managed_path"]
+            old_config = getattr(sprinkle, "__config", None)
+            old_refresh = sprinkle._refresh_service_account_quota
+            try:
+                setattr(sprinkle, "__config", {
+                    "sa_refresh": "none",
+                    "sa_delete_rc_http_500": True,
+                })
+                sprinkle._refresh_service_account_quota = lambda _account: (
+                    None, "rclone RC operations/about failed: HTTP 500"
+                )
+                self.assertEqual(sprinkle._backup_accounts_with_free_space(registry, [account]), [])
+            finally:
+                sprinkle._refresh_service_account_quota = old_refresh
+                setattr(sprinkle, "__config", old_config)
+
+            self.assertFalse(os.path.exists(source_file))
+            self.assertFalse(os.path.exists(managed_file))
+            self.assertEqual(len(registry.active_accounts()), 0)
 
     def test_account_not_found_marks_account_invalid_without_delete_option(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1341,6 +1372,28 @@ class ClSyncPlacementTest(unittest.TestCase):
         }, 9))
         self.assertEqual(calls[3][0], "deletefile")
 
+    def test_rc_cluster_operations_apply_configured_drive_root_only_to_destinations(self):
+        calls = []
+        rc = rclone.RClone(
+            rc_url="https://rc.example.test",
+            rc_drive_id="drive-folder-id",
+            rc_drive_remotes=["dst101:", "dst102:"],
+        )
+        rc._rc_call = lambda endpoint, payload=None: calls.append((endpoint, payload)) or {"list": []}
+
+        rc.lsjson("dst101:", "/roms", ["--recursive"])
+        rc.mkdir("dst101:", "/roms/GG")
+        rc.copy("mylocal:/shared/downloads/game.gg", "dst101:/roms/GG")
+        rc.delete_file("dst101:", "/roms/GG/game.gg")
+
+        self.assertEqual(calls[0][1]["fs"], "dst101,root_folder_id=drive-folder-id:")
+        self.assertEqual(calls[1][1]["fs"], "dst101,root_folder_id=drive-folder-id:")
+        self.assertEqual(calls[2][1], {
+            "srcFs": "mylocal:/shared/downloads/game.gg",
+            "dstFs": "dst101,root_folder_id=drive-folder-id:/roms/GG",
+        })
+        self.assertEqual(calls[3][1]["fs"], "dst101,root_folder_id=drive-folder-id:")
+
     def test_rclone_rc_lsjson_normalizes_paths_to_requested_directory(self):
         class Response(object):
             def __enter__(self):
@@ -1393,6 +1446,7 @@ class ClSyncPlacementTest(unittest.TestCase):
             sprinkle.read_args([
                 "--rclone-rc-url", "https://rc.example.test",
                 "--rclone-rc-remotes", "dst101,dst102:",
+                "--drive-id", "drive-id",
                 "--rclone-env-file", os.path.join(tmp, "rclone.env"),
                 "backup", "/server-visible/source",
             ])
@@ -1404,6 +1458,25 @@ class ClSyncPlacementTest(unittest.TestCase):
                 ["dst101:", "dst102:"],
             )
             self.assertIsNone(sprinkle.__dict__["__config"]["rclone_config"])
+
+    def test_rc_cluster_remotes_require_drive_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sprinkle.read_args([
+                "--rclone-rc-url", "https://rc.example.test",
+                "--rclone-rc-remotes", "dst101",
+                "--rclone-env-file", os.path.join(tmp, "rclone.env"),
+                "backup", "/server-visible/source",
+            ])
+            sprinkle.configure(None)
+
+            with self.assertRaisesRegex(Exception, "requires --drive-id"):
+                sprinkle.prepare_rclone_sa_config()
+
+    def test_rc_http_500_cleanup_option_is_parsed(self):
+        sprinkle.read_args(["--sa-delete-rc-http-500", "sa-stats"])
+        sprinkle.configure(None)
+
+        self.assertTrue(sprinkle.__dict__["__config"]["sa_delete_rc_http_500"])
 
     def test_backup_preserves_cwd_relative_directory_in_remote_destination(self):
         with tempfile.TemporaryDirectory() as tmp:

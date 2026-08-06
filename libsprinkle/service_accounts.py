@@ -717,7 +717,7 @@ class ServiceAccountRegistry(object):
             try:
                 os.remove(path)
                 logging.debug(
-                    'removed service account file after --sa-delete-account-not-found: %s',
+                    'removed service account file during explicit service-account cleanup: %s',
                     path,
                 )
             except FileNotFoundError:

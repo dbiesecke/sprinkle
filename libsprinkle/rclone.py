@@ -185,7 +185,8 @@ def generate_rclone_combine_config(upstreams, output_file, group_size=50, prefix
 class RClone:
 
     def __init__(self, config_file=None, rclone_exe="rclone", rclone_retries="1",
-                 rc_url=None, rc_user=None, rc_password=None, rc_timeout_seconds=30):
+                 rc_url=None, rc_user=None, rc_password=None, rc_timeout_seconds=30,
+                 rc_drive_id=None, rc_drive_remotes=None):
         logging.debug('constructing RClone')
         if rc_url in (None, '') and config_file is not None and not common.is_file(config_file):
             logging.error("configuration file " + str(config_file) + " not found. Cannot continue!")
@@ -201,6 +202,10 @@ class RClone:
         self._rc_user = rc_user
         self._rc_password = rc_password
         self._rc_timeout_seconds = int(rc_timeout_seconds)
+        self._rc_drive_id = rc_drive_id
+        self._rc_drive_remotes = set(
+            str(remote).rstrip(':') for remote in (rc_drive_remotes or []) if remote
+        )
 
     def _rc_call(self, endpoint, payload=None):
         if self._rc_url is None:
@@ -249,7 +254,17 @@ class RClone:
 
     def _rc_file_system(self, path):
         """Return an RC fs reference; local absolute paths are RC-host paths."""
-        return path
+        if ':' not in path:
+            return path
+        remote, suffix = path.split(':', 1)
+        return self._rc_remote(remote + ':') + suffix
+
+    def _rc_remote(self, remote):
+        """Apply the configured Drive root only to Sprinkle cluster remotes."""
+        name = str(remote).rstrip(':')
+        if self._rc_drive_id in (None, '') or name not in self._rc_drive_remotes:
+            return remote
+        return name + ',root_folder_id=' + str(self._rc_drive_id) + ':'
 
     def get_remotes(self, extra_args=[]):
         logging.debug('listing remotes')
@@ -287,7 +302,7 @@ class RClone:
             }
             try:
                 result = self._rc_call('operations/list', {
-                    'fs': remote,
+                    'fs': self._rc_remote(remote),
                     'remote': directory.lstrip('/'),
                     'opt': options,
                 })
@@ -336,7 +351,7 @@ class RClone:
         if self._rc_url is not None:
             try:
                 result = self._rc_call('operations/hashsum', {
-                    'fs': remote + directory,
+                    'fs': self._rc_file_system(remote + directory),
                     'hashType': 'MD5',
                 })
                 return '\n'.join(result.get('hashsum', []))
@@ -373,7 +388,7 @@ class RClone:
         logging.debug('running about for ' + remote)
         if self._rc_url is not None:
             try:
-                return self._rc_call('operations/about', {'fs': remote}), None
+                return self._rc_call('operations/about', {'fs': self._rc_remote(remote)}), None
             except Exception as exc:
                 return None, str(exc)
         command_with_args = []
@@ -418,7 +433,7 @@ class RClone:
     def mkdir(self, remote, directory):
         logging.debug('running mkdir for ' + remote + ":" + directory)
         if self._rc_url is not None:
-            self._rc_call('operations/mkdir', {'fs': remote, 'remote': directory.lstrip('/')})
+            self._rc_call('operations/mkdir', {'fs': self._rc_remote(remote), 'remote': directory.lstrip('/')})
             return []
         command_with_args = []
         command_with_args.append(self._rclone_exe)
@@ -442,7 +457,7 @@ class RClone:
     def rmdir(self, remote, directory):
         logging.debug('running rmdir for ' + remote + ":" + directory)
         if self._rc_url is not None:
-            self._rc_call('operations/rmdir', {'fs': remote, 'remote': directory.lstrip('/')})
+            self._rc_call('operations/rmdir', {'fs': self._rc_remote(remote), 'remote': directory.lstrip('/')})
             return []
         command_with_args = []
         command_with_args.append(self._rclone_exe)
@@ -456,9 +471,9 @@ class RClone:
         command_with_args.append(remote + directory)
         result = common.execute(command_with_args)
         logging.debug('result: ' + str(result))
-        if result['error'] != '':
+        if result.get('code', 0) != 0:
             logging.error('error getting remotes objects')
-            raise Exception('error getting remote object. ' + result['error'])
+            raise Exception('error getting remote object. ' + (result.get('error') or result.get('out') or 'rclone rmdir failed'))
         out = result['out'].splitlines()
         logging.debug('returning ' + str(out))
         return out
@@ -503,7 +518,7 @@ class RClone:
     def delete_file(self, remote, file):
         logging.debug('running deleteFile for ' + remote + ":" + file)
         if self._rc_url is not None:
-            self._rc_call('operations/deletefile', {'fs': remote, 'remote': file.lstrip('/')})
+            self._rc_call('operations/deletefile', {'fs': self._rc_remote(remote), 'remote': file.lstrip('/')})
             return []
         command_with_args = []
         command_with_args.append(self._rclone_exe)
@@ -527,7 +542,7 @@ class RClone:
     def delete(self, remote, file):
         logging.debug('running delete for ' + remote + ":" + file)
         if self._rc_url is not None:
-            self._rc_call('operations/delete', {'fs': remote + file})
+            self._rc_call('operations/delete', {'fs': self._rc_file_system(remote + file)})
             return []
         command_with_args = []
         command_with_args.append(self._rclone_exe)

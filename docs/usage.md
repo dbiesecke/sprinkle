@@ -125,6 +125,9 @@ protected by TLS plus authentication; do not commit
 credentials. Set `rclone_rc_remotes` to use pre-provisioned RC destinations directly and skip local
 service-account rclone-config generation. Prefer the `SPRINKLE_RCLONE_RC_PASSWORD` environment variable over
 storing an RC password in a config file.
+For clustered Google Drive backups, `drive_id` is required even in RC mode. Sprinkle passes it as rclone's
+per-remote `root_folder_id` override for every configured `dst*` destination, while leaving `mylocal:` and
+explicit non-cluster remotes unchanged.
 
 Service-account JSON contains secrets. Do not print, log, or commit it. Duplicate account JSON is counted and
 skipped without adding a managed file or SQLite account record. When RC is configured, `sa-import` validates the
@@ -133,6 +136,8 @@ the RC server first. Imports with unknown quota or failed validation are quarant
 
 Use `--sa-delete-account-not-found` only when source JSON files should be removed after the exact Google
 error `Invalid grant: account not found`. Other quota and credential errors never trigger this deletion.
+Use `--sa-delete-rc-http-500` only for an intentional destructive cleanup: it refreshes all active accounts
+and removes the managed and source JSON files for accounts whose RC quota request returns HTTP 500.
 Known invalid accounts are skipped during later backups, avoiding repeated `rclone about` calls.
 
 `backup` refreshes missing or stale quota data before generating its clustered rclone configuration.

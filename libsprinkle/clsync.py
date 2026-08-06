@@ -110,6 +110,8 @@ class ClSync:
                 rc_user=self._config.get('rclone_rc_user'),
                 rc_password=self._config.get('rclone_rc_password'),
                 rc_timeout_seconds=self._config.get('rclone_rc_timeout_seconds', 30),
+                rc_drive_id=self._config.get('drive_id'),
+                rc_drive_remotes=self._config.get('cluster_remotes'),
             )
         else:
             self._rclone = rclone.RClone(
@@ -118,6 +120,8 @@ class ClSync:
                 self._config.get('rclone_rc_user'),
                 self._config.get('rclone_rc_password'),
                 self._config.get('rclone_rc_timeout_seconds', 30),
+                self._config.get('drive_id'),
+                self._config.get('cluster_remotes'),
             )
 
         if 'rclone_move' in config:

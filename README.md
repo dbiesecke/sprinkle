@@ -36,6 +36,9 @@ lands in the remote root. A local directory sent to `hidrive:` lands under a sam
 For already imported accounts, `--sa-delete-account-not-found` is an explicit cleanup option. It removes
 the managed and source JSON only when Google returns `Invalid grant: account not found`; other validation
 and quota failures remain non-destructive.
+`--sa-delete-rc-http-500` is a separate destructive option: it refreshes every active account and removes
+only accounts whose RC quota request explicitly returns HTTP 500. Use it only when that response is known
+to identify a permanently bad service account.
 Known invalid accounts are skipped during later backups, so they do not trigger repeated quota checks.
 
 * run an auditable monthly Google Drive service-account keepalive through Cron
@@ -71,6 +74,8 @@ reads `/path` as `mylocal:/path` on the RC host. Keep RC private, protected by T
 commit its credentials. Prefer `SPRINKLE_RCLONE_RC_PASSWORD` over storing the password in a config file.
 
 Set `rclone_rc_remotes=dst101,dst102` when those remotes are already provisioned on the RC server. This
+mode still requires `drive_id`: Sprinkle applies it as rclone's `root_folder_id` override to each clustered
+destination, so backup data stays under that Drive folder even if the server remote has a different root.
 uses them directly for clustered backups and avoids generating a local service-account rclone config.
 
 * create a home-directory configuration with interactive defaults

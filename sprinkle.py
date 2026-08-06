@@ -206,6 +206,7 @@ OPTIONS:
     --sa-refresh {mode}          SA quota refresh [missing|stale|all|none] (default:stale)
     --sa-clean-invalid {mode}    invalid SA cleanup [none|quarantine|delete] (default:quarantine)
     --sa-delete-account-not-found delete SA JSON files after a confirmed account-not-found error
+    --sa-delete-rc-http-500      delete imported SA JSON files after a confirmed RC HTTP 500
     --sa-group-size {num}        preferred SA grouping size for generated operator configs
     --sa-stats-workers {num}     parallel SA quota requests (default:4)
     --rclone-exe {rclone_exe}    rclone executable (default:rclone)
@@ -610,6 +611,7 @@ def read_args(argv):
     global __sa_refresh
     global __sa_clean_invalid
     global __sa_delete_account_not_found
+    global __sa_delete_rc_http_500
     global __sa_group_size
     global __rclone_sa_dir
     global __rclone_sa_count
@@ -662,6 +664,7 @@ def read_args(argv):
     __sa_refresh = None
     __sa_clean_invalid = None
     __sa_delete_account_not_found = None
+    __sa_delete_rc_http_500 = None
     __sa_group_size = None
     __rclone_sa_dir = None
     __rclone_sa_count = None
@@ -700,6 +703,7 @@ def read_args(argv):
                                     "sa-refresh=",
                                     "sa-clean-invalid=",
                                     "sa-delete-account-not-found",
+                                    "sa-delete-rc-http-500",
                                     "sa-group-size=",
                                     "sa-stats-workers=",
                                     "stats=",
@@ -792,6 +796,8 @@ def read_args(argv):
             __sa_clean_invalid = arg
         elif opt in ("--sa-delete-account-not-found"):
             __sa_delete_account_not_found = True
+        elif opt in ("--sa-delete-rc-http-500"):
+            __sa_delete_rc_http_500 = True
         elif opt in ("--sa-group-size"):
             __sa_group_size = int(arg)
         elif opt in ("--sa-stats-workers"):
@@ -904,6 +910,7 @@ def configure(config_file):
         "sa_refresh": service_accounts.DEFAULT_REFRESH_MODE,
         "sa_clean_invalid": service_accounts.DEFAULT_CLEAN_INVALID,
         "sa_delete_account_not_found": False,
+        "sa_delete_rc_http_500": False,
         "sa_group_size": 50,
         "sa_stats_workers": 4,
         "large_file_threshold_bytes": clsync.DEFAULT_LARGE_FILE_THRESHOLD_BYTES,
@@ -1062,6 +1069,9 @@ def configure(config_file):
     if __sa_delete_account_not_found is not None:
         __config['sa_delete_account_not_found'] = __sa_delete_account_not_found
 
+    if __sa_delete_rc_http_500 is not None:
+        __config['sa_delete_rc_http_500'] = __sa_delete_rc_http_500
+
     if __sa_group_size is not None:
         __config['sa_group_size'] = __sa_group_size
 
@@ -1088,6 +1098,7 @@ def normalize_config_types(config_values):
         'check_prereq',
         'daemon_mode',
         'sa_delete_account_not_found',
+        'sa_delete_rc_http_500',
     )
     int_fields = (
         'daemon_interval',
@@ -1156,6 +1167,10 @@ def prepare_rclone_sa_config():
             and not _is_sprinkle_service_account_target(__args[2])):
         return
     if __config.get('rclone_rc_url') not in (None, '') and __config.get('rclone_rc_remotes') not in (None, ''):
+        if __config.get('drive_id') in (None, ''):
+            raise Exception(
+                "backup requires --drive-id <folder-id> when using rclone_rc_remotes for clustered backups"
+            )
         remotes = [remote.strip().rstrip(':') + ':'
                    for remote in str(__config['rclone_rc_remotes']).split(',') if remote.strip()]
         if not remotes:
@@ -1453,6 +1468,8 @@ sa_store=~/.sprinkle/service-accounts
 sa_cache_ttl_hours={sa_cache_ttl_hours}
 sa_refresh={sa_refresh}
 sa_clean_invalid={sa_clean_invalid}
+sa_delete_account_not_found=false
+sa_delete_rc_http_500=false
 # Delete managed and source JSON only after "Invalid grant: account not found".
 sa_delete_account_not_found=false
 sa_group_size=50
@@ -1809,7 +1826,7 @@ def sa_stats():
     registry = _service_account_registry()
     if __config.get('rclone_rc_url') not in (None, ''):
         registry.assign_stable_remote_names()
-    refresh_mode = __config['sa_refresh']
+    refresh_mode = 'all' if __config.get('sa_delete_rc_http_500', False) else __config['sa_refresh']
     if globals().get('__sa_refresh') is None and refresh_mode == service_accounts.DEFAULT_REFRESH_MODE:
         refresh_mode = 'stale'
     refreshed = 0
@@ -2001,7 +2018,7 @@ def _rclone_rc_about(remote):
 def _backup_accounts_with_free_space(registry, accounts):
     """Return active accounts whose current quota can safely receive an upload."""
     eligible = []
-    refresh_mode = __config['sa_refresh']
+    refresh_mode = 'all' if __config.get('sa_delete_rc_http_500', False) else __config['sa_refresh']
     for account in accounts:
         quota_row = registry.quota_by_account_id(account['id'])
         if registry.should_refresh(quota_row, refresh_mode):
@@ -2037,7 +2054,23 @@ def _delete_account_not_found_if_requested(registry, account, error):
     return deleted
 
 
+def _delete_account_rc_http_500_if_requested(registry, account, error):
+    if not __config.get('sa_delete_rc_http_500', False):
+        return False
+    if not _is_rc_http_500_error(error):
+        return False
+    deleted = registry.delete_active_account(account['id'], str(error))
+    if deleted:
+        logging.warning(
+            'deleted service account after confirmed rclone RC HTTP 500: ' +
+            (account['client_email'] or account['account_key'])
+        )
+    return deleted
+
+
 def _handle_account_not_found(registry, account, error):
+    if _delete_account_rc_http_500_if_requested(registry, account, error):
+        return True
     if not _is_account_not_found_error(error):
         return False
     if _delete_account_not_found_if_requested(registry, account, error):
@@ -2055,6 +2088,13 @@ def _is_account_not_found_error(error):
     if error is None:
         return False
     return 'invalid grant: account not found' in ' '.join(str(error).lower().split())
+
+
+def _is_rc_http_500_error(error):
+    if error is None:
+        return False
+    text = ' '.join(str(error).lower().split())
+    return 'rclone rc' in text and 'http 500' in text
 
 
 def _refresh_service_account_file_cache(account):
