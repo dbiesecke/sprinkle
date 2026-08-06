@@ -54,6 +54,7 @@ class ClSync:
             self._cached_free = {}
         self._run_unavailable_remotes = {}
         self._run_quota_exhausted_remotes = set()
+        self._run_quota_error_remotes = {}
         self._sa_registry = None
         self._sa_refresh = config.get('sa_refresh', service_accounts.DEFAULT_REFRESH_MODE)
         self._large_file_threshold_bytes = int(config.get(
@@ -433,6 +434,8 @@ class ClSync:
                 continue
             if remote in getattr(self, '_run_quota_exhausted_remotes', set()):
                 continue
+            if remote in getattr(self, '_run_quota_error_remotes', {}):
+                continue
             size = self._known_free_for_remote(remote)
             logging.debug('free of ' + remote + ' is ' + str(size))
             if size is not None and required_size <= size:
@@ -534,6 +537,20 @@ class ClSync:
                 unavailable[remote],
             )
 
+    def mark_remote_quota_error_for_run(self, remote, error):
+        """Avoid repeated failing quota requests without inventing a quota value."""
+        unavailable = getattr(self, '_run_quota_error_remotes', None)
+        if unavailable is None:
+            unavailable = {}
+            self._run_quota_error_remotes = unavailable
+        if remote not in unavailable:
+            unavailable[remote] = str(error)[:300]
+            logging.warning(
+                'excluding %s for the remainder of this backup run after quota query failure: %s',
+                remote,
+                unavailable[remote],
+            )
+
     def _is_storage_quota_exceeded(self, error):
         text = str(error).lower()
         return (
@@ -549,11 +566,19 @@ class ClSync:
                 return self._quota_from_row(cached)
             if cached is not None and self._sa_refresh == 'none':
                 return self._quota_from_row(cached)
+        quota_error = None
         try:
-            quota = self._rclone.get_about_json(remote, True)
+            get_with_error = getattr(self._rclone, 'get_about_json_with_error', None)
+            if get_with_error is not None:
+                quota, quota_error = get_with_error(remote)
+            else:
+                quota = self._rclone.get_about_json(remote, True)
         except Exception as e:
-            logging.debug('error refreshing quota for ' + remote + ': ' + str(e))
             quota = None
+            quota_error = str(e)
+        if quota_error is not None:
+            logging.debug('error refreshing quota for ' + remote + ': ' + str(quota_error))
+            self.mark_remote_quota_error_for_run(remote, quota_error)
         if self._sa_registry is not None and cached is not None:
             if quota is None:
                 self._sa_registry.update_quota_for_remote(remote, None, 'rclone about failed')

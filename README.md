@@ -59,7 +59,8 @@ If rclone reports Google `storageQuotaExceeded` during a copy, Sprinkle marks th
 `free=0` in the quota cache, and excludes it for the remainder of that backup run before trying the next eligible
 remote. A different RC transfer error
 only excludes that remote for the current backup run, so repeated files do not retry it indefinitely; a
-new Sprinkle run considers it again after its normal quota check.
+new Sprinkle run considers it again after its normal quota check. A failed quota query also excludes that
+remote only for the current run, while retaining its quota as unknown rather than marking it full.
 
 After a successful clustered add or update, Sprinkle confirms the target file and applies its observed
 size delta to cached `used` and `free` values. Successful file deletions release their known old size.

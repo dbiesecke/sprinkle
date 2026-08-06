@@ -1617,6 +1617,30 @@ class ClSyncPlacementTest(unittest.TestCase):
         self.assertEqual(sync.get_eligible_remotes(1), ["dst102:"])
         self.assertEqual(sync._cached_free["dst101:"], 0)
 
+    def test_quota_query_failure_is_attempted_once_per_backup_run(self):
+        sync = clsync.ClSync.__new__(clsync.ClSync)
+        sync._distribution_type = "mas"
+        sync._cached_free = {}
+        sync._run_unavailable_remotes = {}
+        sync._run_quota_exhausted_remotes = set()
+        sync._run_quota_error_remotes = {}
+        sync._frees = None
+        sync._sa_registry = None
+        sync._sa_refresh = "stale"
+        sync._large_file_threshold_bytes = 1024
+        sync._large_file_min_free_bytes = 100
+        sync._large_file_min_free_percent = 10
+        sync.get_remotes = lambda: ["dst102:"]
+        calls = []
+        sync._rclone = types.SimpleNamespace(
+            get_about_json_with_error=lambda remote: calls.append(remote) or (None, "RC timeout")
+        )
+
+        self.assertEqual(sync.get_eligible_remotes(1), [])
+        self.assertEqual(sync.get_eligible_remotes(1), [])
+        self.assertEqual(calls, ["dst102:"])
+        self.assertNotIn("dst102:", sync._cached_free)
+
     def test_backup_progress_escapes_percent_in_filename(self):
         class FormattingBar(object):
             def __init__(self, *_args, **_kwargs):
