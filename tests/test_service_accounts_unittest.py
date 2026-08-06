@@ -1379,12 +1379,19 @@ class ClSyncPlacementTest(unittest.TestCase):
             rc_drive_id="drive-folder-id",
             rc_drive_remotes=["dst101:", "dst102:"],
         )
-        rc._rc_call = lambda endpoint, payload=None: calls.append((endpoint, payload)) or {"list": []}
+        def rc_call(endpoint, payload=None):
+            calls.append((endpoint, payload))
+            if endpoint == "operations/about":
+                return {"total": 100, "free": 80}
+            return {"list": []}
+
+        rc._rc_call = rc_call
 
         rc.lsjson("dst101:", "/roms", ["--recursive"])
         rc.mkdir("dst101:", "/roms/GG")
         rc.copy("mylocal:/shared/downloads/game.gg", "dst101:/roms/GG")
         rc.delete_file("dst101:", "/roms/GG/game.gg")
+        rc.get_about_json("dst101:")
 
         self.assertEqual(calls[0][1]["fs"], "dst101,root_folder_id=drive-folder-id:")
         self.assertEqual(calls[1][1]["fs"], "dst101,root_folder_id=drive-folder-id:")
@@ -1393,6 +1400,7 @@ class ClSyncPlacementTest(unittest.TestCase):
             "dstFs": "dst101,root_folder_id=drive-folder-id:/roms/GG",
         })
         self.assertEqual(calls[3][1]["fs"], "dst101,root_folder_id=drive-folder-id:")
+        self.assertEqual(calls[4][1]["fs"], "dst101:")
 
     def test_rclone_rc_lsjson_normalizes_paths_to_requested_directory(self):
         class Response(object):

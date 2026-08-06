@@ -388,7 +388,9 @@ class RClone:
         logging.debug('running about for ' + remote)
         if self._rc_url is not None:
             try:
-                return self._rc_call('operations/about', {'fs': self._rc_remote(remote)}), None
+                # Drive quota belongs to the account, not to its selected root folder.
+                # Some RC servers block while creating an overridden Drive filesystem here.
+                return self._rc_call('operations/about', {'fs': remote}), None
             except Exception as exc:
                 return None, str(exc)
         command_with_args = []
