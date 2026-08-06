@@ -1667,6 +1667,27 @@ class ClSyncPlacementTest(unittest.TestCase):
 
             sync._rclone.mkdir.assert_called_once_with("dst101:", "/" + os.path.basename(tmp))
 
+    def test_file_target_conflict_uses_one_stable_replacement_directory(self):
+        sync = clsync.ClSync.__new__(clsync.ClSync)
+        calls = []
+
+        def mkdir(remote, directory):
+            calls.append((remote, directory))
+            if directory == "/roms/7800":
+                raise Exception("rclone RC operations/mkdir failed: HTTP 500 is a file not a directory")
+
+        sync._rclone = types.SimpleNamespace(mkdir=mkdir)
+
+        replacement = sync._ensure_target_directory("dst101:", "/roms/7800")
+        repeated = sync._ensure_target_directory("dst101:", "/roms/7800")
+
+        self.assertEqual(replacement, "/roms/7800.sprinkle-folder")
+        self.assertEqual(repeated, replacement)
+        self.assertEqual(calls, [
+            ("dst101:", "/roms/7800"),
+            ("dst101:", "/roms/7800.sprinkle-folder"),
+        ])
+
     def test_rclone_move_accepts_successful_stderr_progress_output(self):
         rc = rclone.RClone()
         with mock.patch.object(rclone.common, "execute", return_value={

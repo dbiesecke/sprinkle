@@ -53,6 +53,8 @@ Backups continue after individual transfer, quota, update, or deletion failures.
 capacity-qualified remote in order of available space. Any unresolved operations are summarized at the
 end and return a non-zero status, so scheduled jobs and SMTP alerts remain reliable. Resolve the remote
 or quota problem and rerun the backup; already completed files are not uploaded again.
+If a required target directory is occupied by a file, Sprinkle leaves that file untouched and writes the
+source directory into a sibling directory named `<name>.sprinkle-folder` instead.
 
 Before clustered backups, Sprinkle only generates remotes for active service accounts with a successful,
 positive free-space quota. `sa-stats` refreshes quota data without recursively listing the Drive contents.

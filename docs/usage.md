@@ -152,6 +152,8 @@ Sprinkle tries every remote with known sufficient free space, starting with the 
 Unknown quota is never used as capacity and is checked again for later files. At the end, unresolved
 operations are reported together and the command exits non-zero, preserving existing SMTP and cron
 failure handling. Fix the reported remote or quota error and rerun the backup.
+If a destination directory name is already occupied by a file, Sprinkle preserves that file and creates a
+stable sibling target directory such as `/roms/7800.sprinkle-folder` for the affected source directory.
 
 When rclone returns Google `storageQuotaExceeded`, Sprinkle records `free=0` for that remote in memory
 and the service-account quota cache, then tries the next eligible remote for a new file.
