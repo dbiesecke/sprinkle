@@ -1358,6 +1358,7 @@ class ClSyncPlacementTest(unittest.TestCase):
                 {"Name": "movie.mkv", "Size": 10, "IsDir": False}
             ])
             rc.copy("/srv/source/movie.mkv", "dst101:/movies")
+            rc.move("/srv/source/other.mkv", "dst101:/movies")
             rc.delete_file("dst101:", "/movies/movie.mkv")
 
         self.assertEqual(calls[0][0], "listremotes")
@@ -1367,10 +1368,15 @@ class ClSyncPlacementTest(unittest.TestCase):
             "remote": "movies",
             "opt": {"recurse": True, "showOrigIDs": True},
         })
-        self.assertEqual(calls[2], ("copy", {
-            "srcFs": "/srv/source/movie.mkv", "dstFs": "dst101:/movies"
+        self.assertEqual(calls[2], ("copyfile", {
+            "srcFs": "/srv/source", "srcRemote": "movie.mkv",
+            "dstFs": "dst101:/movies", "dstRemote": "movie.mkv",
         }, 9))
-        self.assertEqual(calls[3][0], "deletefile")
+        self.assertEqual(calls[3], ("movefile", {
+            "srcFs": "/srv/source", "srcRemote": "other.mkv",
+            "dstFs": "dst101:/movies", "dstRemote": "other.mkv",
+        }, 9))
+        self.assertEqual(calls[4][0], "deletefile")
 
     def test_rc_cluster_operations_apply_configured_drive_root_only_to_destinations(self):
         calls = []
@@ -1395,10 +1401,12 @@ class ClSyncPlacementTest(unittest.TestCase):
 
         self.assertEqual(calls[0][1]["fs"], "dst101,root_folder_id=drive-folder-id:")
         self.assertEqual(calls[1][1]["fs"], "dst101,root_folder_id=drive-folder-id:")
-        self.assertEqual(calls[2][1], {
-            "srcFs": "mylocal:/shared/downloads/game.gg",
+        self.assertEqual(calls[2], ("operations/copyfile", {
+            "srcFs": "mylocal:/shared/downloads",
+            "srcRemote": "game.gg",
             "dstFs": "dst101,root_folder_id=drive-folder-id:/roms/GG",
-        })
+            "dstRemote": "game.gg",
+        }))
         self.assertEqual(calls[3][1]["fs"], "dst101,root_folder_id=drive-folder-id:")
         self.assertEqual(calls[4][1]["fs"], "dst101:")
 
@@ -1666,27 +1674,6 @@ class ClSyncPlacementTest(unittest.TestCase):
                 sync.backup(tmp, delete_files=False, dry_run=False)
 
             sync._rclone.mkdir.assert_called_once_with("dst101:", "/" + os.path.basename(tmp))
-
-    def test_file_target_conflict_uses_one_stable_replacement_directory(self):
-        sync = clsync.ClSync.__new__(clsync.ClSync)
-        calls = []
-
-        def mkdir(remote, directory):
-            calls.append((remote, directory))
-            if directory == "/roms/7800":
-                raise Exception("rclone RC operations/mkdir failed: HTTP 500 is a file not a directory")
-
-        sync._rclone = types.SimpleNamespace(mkdir=mkdir)
-
-        replacement = sync._ensure_target_directory("dst101:", "/roms/7800")
-        repeated = sync._ensure_target_directory("dst101:", "/roms/7800")
-
-        self.assertEqual(replacement, "/roms/7800.sprinkle-folder")
-        self.assertEqual(repeated, replacement)
-        self.assertEqual(calls, [
-            ("dst101:", "/roms/7800"),
-            ("dst101:", "/roms/7800.sprinkle-folder"),
-        ])
 
     def test_rclone_move_accepts_successful_stderr_progress_output(self):
         rc = rclone.RClone()

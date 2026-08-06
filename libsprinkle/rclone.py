@@ -259,6 +259,13 @@ class RClone:
         remote, suffix = path.split(':', 1)
         return self._rc_remote(remote + ':') + suffix
 
+    def _rc_file_parts(self, path):
+        """Split a single-file path into the RC filesystem and its file name."""
+        filesystem, separator, remote = str(path).rpartition('/')
+        if separator == '' or remote == '':
+            raise Exception('rclone RC file operation requires a file path: ' + str(path))
+        return self._rc_file_system(filesystem or '/'), remote
+
     def _rc_remote(self, remote):
         """Apply the configured Drive root only to Sprinkle cluster remotes."""
         name = str(remote).rstrip(':')
@@ -569,7 +576,14 @@ class RClone:
         logging.debug('running copy from ' + src + " to " + dst)
         if self._rc_url is not None:
             try:
-                self._rc_call('sync/copy', {'srcFs': self._rc_file_system(src), 'dstFs': self._rc_file_system(dst)})
+                src_fs, src_remote = self._rc_file_parts(src)
+                dst_fs, _ = self._rc_file_parts(dst + '/' + src_remote)
+                self._rc_call('operations/copyfile', {
+                    'srcFs': src_fs,
+                    'srcRemote': src_remote,
+                    'dstFs': dst_fs,
+                    'dstRemote': src_remote,
+                })
                 return []
             except Exception:
                 if no_error:
@@ -605,7 +619,14 @@ class RClone:
     def move(self, src, dst, extra_args=[]):
         logging.debug('running move from ' + src + " to " + dst)
         if self._rc_url is not None:
-            self._rc_call('sync/move', {'srcFs': self._rc_file_system(src), 'dstFs': self._rc_file_system(dst)})
+            src_fs, src_remote = self._rc_file_parts(src)
+            dst_fs, _ = self._rc_file_parts(dst + '/' + src_remote)
+            self._rc_call('operations/movefile', {
+                'srcFs': src_fs,
+                'srcRemote': src_remote,
+                'dstFs': dst_fs,
+                'dstRemote': src_remote,
+            })
             return []
         command_with_args = []
         command_with_args.append(self._rclone_exe)

@@ -501,38 +501,8 @@ class ClSync:
     def _ensure_target_directory(self, remote, directory):
         """Create the destination before a transfer, retaining it after a failed copy."""
         mkdir = getattr(getattr(self, '_rclone', None), 'mkdir', None)
-        if mkdir is None:
-            return directory
-        conflict_directories = getattr(self, '_target_directory_conflicts', None)
-        if conflict_directories is None:
-            conflict_directories = {}
-            self._target_directory_conflicts = conflict_directories
-        key = (remote, directory)
-        if key in conflict_directories:
-            return conflict_directories[key]
-        try:
+        if mkdir is not None:
             mkdir(remote, directory)
-            return directory
-        except Exception as exc:
-            if 'is a file not a directory' not in str(exc).lower():
-                raise
-        base = directory.rstrip('/') or '/'
-        for index in range(1, 101):
-            suffix = '.sprinkle-folder' if index == 1 else '.sprinkle-folder-{}'.format(index)
-            replacement = base + suffix
-            try:
-                mkdir(remote, replacement)
-            except Exception as exc:
-                if 'is a file not a directory' in str(exc).lower():
-                    continue
-                raise
-            conflict_directories[key] = replacement
-            logging.warning(
-                'target %s%s is a file; using replacement directory %s%s',
-                remote, directory, remote, replacement,
-            )
-            return replacement
-        raise Exception('could not create replacement directory for ' + remote + directory)
 
     def mark_remote_quota_exhausted(self, remote):
         """Exclude a remote after Google confirms that its quota is exhausted."""
@@ -965,8 +935,8 @@ class ClSync:
                                 copied = True
                                 break
                             try:
-                                target_directory = self._ensure_target_directory(remote, op.src.remote_path)
-                                self.copy(op.src.path + '/' + op.src.name, target_directory, remote)
+                                self._ensure_target_directory(remote, op.src.remote_path)
+                                self.copy(op.src.path + '/' + op.src.name, op.src.remote_path, remote)
                             except Exception as e:
                                 errors.append(e)
                                 if self._is_storage_quota_exceeded(e):
@@ -979,7 +949,7 @@ class ClSync:
                                 continue
                             if target_remote is None:
                                 self._record_confirmed_transfer(
-                                    remote, target_directory, op.src.name, 0, op.src.size
+                                    remote, op.src.remote_path, op.src.name, 0, op.src.size
                                 )
                             copied = True
                             break
