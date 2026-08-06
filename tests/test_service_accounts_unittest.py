@@ -1510,6 +1510,34 @@ class ClSyncPlacementTest(unittest.TestCase):
         self.assertEqual(sync.get_eligible_remotes(1), ["dst101:"])
         self.assertEqual(sync._cached_free["dst102:"], 100)
 
+    def test_backup_progress_escapes_percent_in_filename(self):
+        class FormattingBar(object):
+            def __init__(self, *_args, **_kwargs):
+                self.message = ""
+
+            def next(self):
+                self.message % {"index": 1, "max": 1, "percent": 100, "elapsed_td": "0", "eta_td": "0"}
+
+            def finish(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            local_file = os.path.join(tmp, "game-100%_complete.gg")
+            with open(local_file, "w") as fp:
+                fp.write("synthetic game")
+            sync = clsync.ClSync.__new__(clsync.ClSync)
+            sync._show_progress = True
+            sync._compare_method = "size"
+            sync._ClSync__exclusion_list = None
+            sync._ClSync__exclude_regex = None
+            sync.ls_shallow = lambda _path, **_kwargs: {}
+            sync.get_eligible_remotes = lambda _size: ["dst101:"]
+            sync.copy = lambda *_args: None
+            sync.mark_remote_used = lambda *_args: None
+
+            with mock.patch.object(clsync, "Bar", FormattingBar):
+                sync.backup(tmp, delete_files=False, dry_run=False)
+
     def test_backup_retries_add_on_next_eligible_remote(self):
         with tempfile.TemporaryDirectory() as tmp:
             local_file = os.path.join(tmp, "movie.mkv")

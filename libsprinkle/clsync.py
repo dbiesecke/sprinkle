@@ -904,7 +904,8 @@ class ClSync:
                 bar_title = op.src.name.ljust(25, '.')
                 if len(bar_title) > 25:
                     bar_title = bar_title[0:25]
-                bar.message = 'file:' + bar_title
+                # progress formats ``message`` with %-interpolation on every update.
+                bar.message = 'file:' + bar_title.replace('%', '%%')
             if op.src.is_dir and op.operation != operation.Operation.REMOVE:
                 logging.debug('skipping directory ' + op.src.path)
             else:
