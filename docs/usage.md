@@ -150,6 +150,8 @@ failure handling. Fix the reported remote or quota error and rerun the backup.
 
 When rclone returns Google `storageQuotaExceeded`, Sprinkle records `free=0` for that remote in memory
 and the service-account quota cache, then tries the next eligible remote for a new file.
+Other RC transfer failures do not falsify the quota cache: Sprinkle excludes the failed remote only for
+the current backup run, preventing repeated attempts for every later file. A later run checks it again.
 
 After a successful clustered add or update, Sprinkle confirms the visible target file before applying its
 actual size delta to SQLite. Successful file deletion releases the known former file size. A failed target

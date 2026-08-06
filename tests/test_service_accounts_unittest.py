@@ -1,4 +1,5 @@
 import json
+import io
 import os
 import shutil
 import stat
@@ -405,6 +406,21 @@ class RCloneQuotaTest(unittest.TestCase):
         )
         self.assertIn("credentials rejected", friendly)
         self.assertIn("one@example.test", friendly)
+
+    def test_rc_http_error_preserves_quota_error_body(self):
+        response = io.BytesIO(json.dumps({
+            "error": "googleapi: Error 403: storageQuotaExceeded",
+        }).encode("utf-8"))
+        failure = rclone.urllib_error.HTTPError(
+            "https://rc.example.test/sync/move", 500, "Internal Server Error", None, response
+        )
+        rc = rclone.RClone(rc_url="https://rc.example.test")
+
+        with mock.patch.object(rclone.urllib_request, "urlopen", side_effect=failure):
+            with self.assertRaisesRegex(Exception, "storageQuotaExceeded") as raised:
+                rc.move("/source/movie.mkv", "dst101:/movies")
+
+        self.assertIn("HTTP 500", str(raised.exception))
 
     def test_lsjson_ignores_rclone_progress_output(self):
         old_execute = common.execute
@@ -1479,6 +1495,21 @@ class ClSyncPlacementTest(unittest.TestCase):
         self.assertEqual(sync._known_free_for_remote("dst101:"), 100)
         self.assertEqual(len(calls), 2)
 
+    def test_generic_transfer_failure_excludes_remote_only_for_current_run(self):
+        sync = clsync.ClSync.__new__(clsync.ClSync)
+        sync._distribution_type = "mas"
+        sync._cached_free = {"dst102:": 100, "dst101:": 100}
+        sync._run_unavailable_remotes = {}
+        sync._large_file_threshold_bytes = 1024
+        sync._large_file_min_free_bytes = 100
+        sync._large_file_min_free_percent = 10
+        sync.get_remotes = lambda: ["dst102:", "dst101:"]
+
+        sync.mark_remote_unavailable_for_run("dst102:", "rclone RC sync/move failed: HTTP 500")
+
+        self.assertEqual(sync.get_eligible_remotes(1), ["dst101:"])
+        self.assertEqual(sync._cached_free["dst102:"], 100)
+
     def test_backup_retries_add_on_next_eligible_remote(self):
         with tempfile.TemporaryDirectory() as tmp:
             local_file = os.path.join(tmp, "movie.mkv")
@@ -1556,7 +1587,7 @@ class ClSyncPlacementTest(unittest.TestCase):
             def copy(_src, _dst, remote):
                 copied.append(remote)
                 if remote == "dst102:":
-                    raise Exception("googleapi: Error 403, storageQuotaExceeded")
+                    raise Exception("rclone RC sync/move failed: HTTP 500: googleapi: Error 403, storageQuotaExceeded")
 
             sync.copy = copy
             sync.mark_remote_used = lambda _remote, _size: None

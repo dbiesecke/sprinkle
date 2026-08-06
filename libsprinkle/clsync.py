@@ -52,6 +52,7 @@ class ClSync:
             self._distribution_type = 'mas'
         if self._distribution_type == 'mas':
             self._cached_free = {}
+        self._run_unavailable_remotes = {}
         self._sa_registry = None
         self._sa_refresh = config.get('sa_refresh', service_accounts.DEFAULT_REFRESH_MODE)
         self._large_file_threshold_bytes = int(config.get(
@@ -423,6 +424,8 @@ class ClSync:
         )
         candidates = []
         for remote in self.get_remotes():
+            if remote in getattr(self, '_run_unavailable_remotes', {}):
+                continue
             size = self._known_free_for_remote(remote)
             logging.debug('free of ' + remote + ' is ' + str(size))
             if size is not None and required_size <= size:
@@ -504,6 +507,20 @@ class ClSync:
             self._frees[remote] = 0
         if self._sa_registry is not None:
             self._sa_registry.mark_remote_quota_exhausted(remote)
+
+    def mark_remote_unavailable_for_run(self, remote, error):
+        """Avoid retrying a failed remote for every later ADD in this backup run."""
+        unavailable = getattr(self, '_run_unavailable_remotes', None)
+        if unavailable is None:
+            unavailable = {}
+            self._run_unavailable_remotes = unavailable
+        if remote not in unavailable:
+            unavailable[remote] = str(error)[:300]
+            logging.warning(
+                'excluding %s for the remainder of this backup run after transfer failure: %s',
+                remote,
+                unavailable[remote],
+            )
 
     def _is_storage_quota_exceeded(self, error):
         text = str(error).lower()
@@ -921,6 +938,8 @@ class ClSync:
                                     self.mark_remote_quota_exhausted(remote)
                                     logging.warning('copy to ' + remote + ' failed: storage quota exceeded; marking remote full')
                                 else:
+                                    if target_remote is None:
+                                        self.mark_remote_unavailable_for_run(remote, e)
                                     logging.warning('copy to ' + remote + ' failed: ' + str(e))
                                 continue
                             if target_remote is None:

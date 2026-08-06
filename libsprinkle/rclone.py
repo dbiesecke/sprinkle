@@ -221,7 +221,22 @@ class RClone:
             with urllib_request.urlopen(request, timeout=self._rc_timeout_seconds) as response:
                 result = json.loads(response.read().decode('utf-8'))
         except urllib_error.HTTPError as exc:
-            raise Exception('rclone RC {} failed: HTTP {}'.format(endpoint, exc.code))
+            detail = ''
+            try:
+                body = exc.read(4096).decode('utf-8', errors='replace').strip()
+                if body:
+                    try:
+                        parsed = json.loads(body)
+                        if isinstance(parsed, dict):
+                            body = str(parsed.get('error') or parsed.get('message') or body)
+                    except ValueError:
+                        pass
+                    detail = ' ' + ' '.join(body.split())[:300]
+            except Exception:
+                pass
+            finally:
+                exc.close()
+            raise Exception('rclone RC {} failed: HTTP {}{}'.format(endpoint, exc.code, detail))
         except urllib_error.URLError as exc:
             raise Exception('rclone RC {} failed: {}'.format(endpoint, getattr(exc, 'reason', 'network error')))
         except Exception as exc:

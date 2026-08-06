@@ -54,7 +54,9 @@ or quota problem and rerun the backup; already completed files are not uploaded 
 Before clustered backups, Sprinkle only generates remotes for active service accounts with a successful,
 positive free-space quota. `sa-stats` refreshes quota data without recursively listing the Drive contents.
 If rclone reports Google `storageQuotaExceeded` during a copy, Sprinkle marks that remote as full and
-immediately falls back to the next capacity-qualified remote.
+stores `free=0` in the quota cache before immediately trying the next eligible remote. A different RC transfer error
+only excludes that remote for the current backup run, so repeated files do not retry it indefinitely; a
+new Sprinkle run considers it again after its normal quota check.
 
 After a successful clustered add or update, Sprinkle confirms the target file and applies its observed
 size delta to cached `used` and `free` values. Successful file deletions release their known old size.
