@@ -85,8 +85,36 @@ sa_delete_account_not_found=false
 rclone_env_file=~/.sprinkle/rclone.env
 ```
 
-Service-account JSON contains secrets. Do not print, log, or commit it. Imports with unknown quota or
-failed rclone validation are quarantined by default.
+## Optional rclone RC transport
+
+Set an RC URL to run listings, quota queries, transfers, and deletions through the RC server instead of
+starting local rclone processes:
+
+```ini
+rclone_rc_url=https://rclone.example.invalid
+rclone_rc_user=quota-reader
+rclone_rc_password=store-this-outside-version-control
+rclone_rc_timeout_seconds=30
+sa_stats_workers=4
+# Use pre-provisioned RC destinations directly for backup placement.
+rclone_rc_remotes=dst101,dst102
+# Map literal backup paths to this local remote on the RC host.
+rclone_rc_local_remote=mylocal
+```
+
+The corresponding command-line options are `--rclone-rc-url`, `--rclone-rc-user`,
+`--rclone-rc-password`, `--rclone-rc-timeout-seconds`, and `--sa-stats-workers`. RC never falls back to
+local rclone after an error. The server must already expose the same stable `dst101`, `dst102`, … account
+mapping as Sprinkle. `rclone_rc_local_remote` maps a literal path such as `/srv/media` to
+`mylocal:/srv/media` on the RC host, so the source files must be present there. Keep the RC server private and
+protected by TLS plus authentication; do not commit
+credentials. Set `rclone_rc_remotes` to use pre-provisioned RC destinations directly and skip local
+service-account rclone-config generation. Prefer the `SPRINKLE_RCLONE_RC_PASSWORD` environment variable over
+storing an RC password in a config file.
+
+Service-account JSON contains secrets. Do not print, log, or commit it. Duplicate account JSON is counted and
+skipped without adding a managed file or SQLite account record. Imports with unknown quota or failed rclone
+validation are quarantined by default.
 
 Use `--sa-delete-account-not-found` only when source JSON files should be removed after the exact Google
 error `Invalid grant: account not found`. Other quota and credential errors never trigger this deletion.
@@ -107,6 +135,11 @@ failure handling. Fix the reported remote or quota error and rerun the backup.
 
 When rclone returns Google `storageQuotaExceeded`, Sprinkle records `free=0` for that remote in memory
 and the service-account quota cache, then tries the next eligible remote for a new file.
+
+After a successful clustered add or update, Sprinkle confirms the visible target file before applying its
+actual size delta to SQLite. Successful file deletion releases the known former file size. A failed target
+confirmation leaves quota values unchanged and makes the backup fail clearly rather than storing a guessed
+capacity value.
 
 ## Explicit classic rclone targets
 

@@ -23,6 +23,11 @@ import sys
 import traceback
 import os
 import tempfile
+import base64
+import json
+from concurrent.futures import ThreadPoolExecutor
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 try:
     from filelock import Timeout, FileLock
 except:
@@ -186,6 +191,12 @@ OPTIONS:
     --no-cache                   turn off caching
     --rclone-conf {config file}  rclone configuration (default:None)
     --rclone-env-file {file}     file with environment variables for rclone
+    --rclone-rc-url {url}        rclone RC URL used for all rclone operations
+    --rclone-rc-user {user}      optional rclone RC Basic Auth user
+    --rclone-rc-password {pass}  optional rclone RC Basic Auth password
+    --rclone-rc-timeout-seconds {num} RC request timeout (default:30)
+    --rclone-rc-remotes {names}  comma-separated RC remotes for clustered backups
+    --rclone-rc-local-remote {name} map literal backup paths to this RC-host local remote
     --rclone-sa-dir {dir}        build rclone config from service accounts
     --rclone-sa-count {num}      limit number of service accounts used
     --drive-id {id}              Google Drive folder ID for rclone config
@@ -196,6 +207,7 @@ OPTIONS:
     --sa-clean-invalid {mode}    invalid SA cleanup [none|quarantine|delete] (default:quarantine)
     --sa-delete-account-not-found delete SA JSON files after a confirmed account-not-found error
     --sa-group-size {num}        preferred SA grouping size for generated operator configs
+    --sa-stats-workers {num}     parallel SA quota requests (default:4)
     --rclone-exe {rclone_exe}    rclone executable (default:rclone)
     --rclone-move                use 'rclone move' instead of 'rclone copy' (default:false)
     --restore-duplicates         restore files if duplicates are found (default:false)
@@ -599,6 +611,13 @@ def read_args(argv):
     global __sa_group_size
     global __rclone_sa_dir
     global __rclone_sa_count
+    global __rclone_rc_url
+    global __rclone_rc_user
+    global __rclone_rc_password
+    global __rclone_rc_timeout_seconds
+    global __rclone_rc_remotes
+    global __rclone_rc_local_remote
+    global __sa_stats_workers
 
     __configfile = None
     __cmd_debug = None
@@ -644,6 +663,13 @@ def read_args(argv):
     __sa_group_size = None
     __rclone_sa_dir = None
     __rclone_sa_count = None
+    __rclone_rc_url = None
+    __rclone_rc_user = None
+    __rclone_rc_password = None
+    __rclone_rc_timeout_seconds = None
+    __rclone_rc_remotes = None
+    __rclone_rc_local_remote = None
+    __sa_stats_workers = None
 
     try:
         opts, args = getopt.getopt(argv, "dvhc:s:",
@@ -657,6 +683,12 @@ def read_args(argv):
                                     "rclone-exe=",
                                     "rclone-conf=",
                                     "rclone-env-file=",
+                                    "rclone-rc-url=",
+                                    "rclone-rc-user=",
+                                    "rclone-rc-password=",
+                                    "rclone-rc-timeout-seconds=",
+                                    "rclone-rc-remotes=",
+                                    "rclone-rc-local-remote=",
                                     "rclone-sa-dir=",
                                     "rclone-sa-count=",
                                     "drive-id=",
@@ -667,6 +699,7 @@ def read_args(argv):
                                     "sa-clean-invalid=",
                                     "sa-delete-account-not-found",
                                     "sa-group-size=",
+                                    "sa-stats-workers=",
                                     "stats=",
                                     "display-unit=",
                                     "rclone-retries=",
@@ -722,6 +755,18 @@ def read_args(argv):
             __rclone_conf = arg
         elif opt in ("--rclone-env-file"):
             __rclone_env_file = arg
+        elif opt in ("--rclone-rc-url"):
+            __rclone_rc_url = arg
+        elif opt in ("--rclone-rc-user"):
+            __rclone_rc_user = arg
+        elif opt in ("--rclone-rc-password"):
+            __rclone_rc_password = arg
+        elif opt in ("--rclone-rc-timeout-seconds"):
+            __rclone_rc_timeout_seconds = int(arg)
+        elif opt in ("--rclone-rc-remotes"):
+            __rclone_rc_remotes = arg
+        elif opt in ("--rclone-rc-local-remote"):
+            __rclone_rc_local_remote = arg
         elif opt in ("--rclone-sa-dir"):
             __rclone_sa_dir = arg
         elif opt in ("--rclone-sa-count"):
@@ -747,6 +792,8 @@ def read_args(argv):
             __sa_delete_account_not_found = True
         elif opt in ("--sa-group-size"):
             __sa_group_size = int(arg)
+        elif opt in ("--sa-stats-workers"):
+            __sa_stats_workers = int(arg)
         elif opt in ("--display-unit"):
             if arg != 'G' and arg != 'M' and arg != 'K' and arg != 'B':
                 logging.error('invalid UNIT ' + arg + ', only [G|M|K|B] accepted')
@@ -833,6 +880,12 @@ def configure(config_file):
         "rclone_retries": '1',
         "drive_id": None,
         "rclone_env_file": default_rclone_env_path(),
+        "rclone_rc_url": None,
+        "rclone_rc_user": None,
+        "rclone_rc_password": os.environ.get('SPRINKLE_RCLONE_RC_PASSWORD'),
+        "rclone_rc_timeout_seconds": 30,
+        "rclone_rc_remotes": None,
+        "rclone_rc_local_remote": None,
         "rclone_sa_dir": None,
         "rclone_sa_count": None,
         "log_file": None,
@@ -850,6 +903,7 @@ def configure(config_file):
         "sa_clean_invalid": service_accounts.DEFAULT_CLEAN_INVALID,
         "sa_delete_account_not_found": False,
         "sa_group_size": 50,
+        "sa_stats_workers": 4,
         "large_file_threshold_bytes": clsync.DEFAULT_LARGE_FILE_THRESHOLD_BYTES,
         "large_file_min_free_bytes": clsync.DEFAULT_LARGE_FILE_MIN_FREE_BYTES,
         "large_file_min_free_percent": clsync.DEFAULT_LARGE_FILE_MIN_FREE_PERCENT
@@ -887,6 +941,24 @@ def configure(config_file):
 
     if __rclone_env_file is not None:
         __config['rclone_env_file'] = __rclone_env_file
+
+    if __rclone_rc_url is not None:
+        __config['rclone_rc_url'] = __rclone_rc_url
+
+    if __rclone_rc_user is not None:
+        __config['rclone_rc_user'] = __rclone_rc_user
+
+    if __rclone_rc_password is not None:
+        __config['rclone_rc_password'] = __rclone_rc_password
+
+    if __rclone_rc_timeout_seconds is not None:
+        __config['rclone_rc_timeout_seconds'] = __rclone_rc_timeout_seconds
+
+    if __rclone_rc_remotes is not None:
+        __config['rclone_rc_remotes'] = __rclone_rc_remotes
+
+    if __rclone_rc_local_remote is not None:
+        __config['rclone_rc_local_remote'] = __rclone_rc_local_remote
 
     if __drive_id is not None:
         __config['drive_id'] = __drive_id
@@ -991,6 +1063,9 @@ def configure(config_file):
     if __sa_group_size is not None:
         __config['sa_group_size'] = __sa_group_size
 
+    if __sa_stats_workers is not None:
+        __config['sa_stats_workers'] = __sa_stats_workers
+
     apply_rclone_env_file(__config.get('rclone_env_file'))
     if __rclone_verbose is True:
         os.environ["RCLONE_VERBOSE"] = "1"
@@ -1016,6 +1091,8 @@ def normalize_config_types(config_values):
         'daemon_interval',
         'sa_cache_ttl_hours',
         'sa_group_size',
+        'sa_stats_workers',
+        'rclone_rc_timeout_seconds',
         'rclone_sa_count',
         'large_file_threshold_bytes',
         'large_file_min_free_bytes',
@@ -1027,6 +1104,9 @@ def normalize_config_types(config_values):
     for field in int_fields:
         if field in config_values and config_values[field] not in (None, ''):
             config_values[field] = int(config_values[field])
+    for field in ('sa_stats_workers', 'rclone_rc_timeout_seconds'):
+        if int(config_values[field]) < 1:
+            raise ValueError('{} must be a positive integer'.format(field))
 
 
 def _parse_bool(value):
@@ -1036,7 +1116,10 @@ def _parse_bool(value):
 
 
 def verify_configuration():
-    logging.debug('verifying configuration ' + str(__config))
+    config_for_log = dict(__config)
+    if config_for_log.get('rclone_rc_password') not in (None, ''):
+        config_for_log['rclone_rc_password'] = '<redacted>'
+    logging.debug('verifying configuration ' + str(config_for_log))
     if __config['smtp_enable'] is True:
         if 'smtp_from' not in __config:
             raise Exception('smtp_from value is None')
@@ -1062,7 +1145,17 @@ def verify_configuration():
 
 def prepare_rclone_sa_config():
     global __rclone_conf
-    if len(__args) > 2 and __args[0] == 'backup' and _is_rclone_remote_target(__args[2]):
+    if (len(__args) > 2 and __args[0] == 'backup' and _is_rclone_remote_target(__args[2])
+            and not _is_sprinkle_service_account_target(__args[2])):
+        return
+    if __config.get('rclone_rc_url') not in (None, '') and __config.get('rclone_rc_remotes') not in (None, ''):
+        remotes = [remote.strip().rstrip(':') + ':'
+                   for remote in str(__config['rclone_rc_remotes']).split(',') if remote.strip()]
+        if not remotes:
+            raise Exception('rclone_rc_remotes must contain at least one remote name')
+        __config['cluster_remotes'] = remotes
+        __config['rclone_config'] = None
+        __rclone_conf = None
         return
     rclone_sa_dir = __config.get('rclone_sa_dir')
     if rclone_sa_dir in (None, ''):
@@ -1110,11 +1203,28 @@ def prepare_rclone_sa_config():
             account for account in registry.active_accounts()
             if account['managed_path'] and os.path.abspath(account['managed_path']) in imported_paths
         ]
+    remote_names = None
+    if __config.get('rclone_rc_url') not in (None, ''):
+        selected_account_ids = set(account['id'] for account in accounts)
+        registry.assign_stable_remote_names()
+        accounts = [account for account in registry.active_accounts()
+                    if account['id'] in selected_account_ids]
+        remote_names = dict((os.path.abspath(account['managed_path']), account['remote_name'])
+                            for account in accounts if account['managed_path'] and account['remote_name'])
     if len(__args) > 0 and __args[0] == 'backup':
         accounts = _backup_accounts_with_free_space(registry, accounts)
     selected_files = [account['managed_path'] for account in accounts if account['managed_path']]
     if len(selected_files) == 0:
         raise Exception("no valid service accounts with known free space found in " + rclone_sa_dir)
+    if __config.get('rclone_rc_url') not in (None, ''):
+        try:
+            os.unlink(tmp_conf)
+        except OSError:
+            pass
+        __config['cluster_remotes'] = [account['remote_name'] + ':' for account in accounts]
+        __rclone_conf = None
+        __config['rclone_config'] = None
+        return
     config_text, entries = rclone.generate_rclone_config_from_files(
         selected_files,
         tmp_conf,
@@ -1123,6 +1233,7 @@ def prepare_rclone_sa_config():
         return_entries=True,
         shuffle=False,
         base_config_file=base_config_file,
+        remote_names=remote_names,
     )
     registry.assign_remote_names(entries)
     __config['cluster_remotes'] = [entry['remote'] + ':' for entry in entries]
@@ -1132,6 +1243,11 @@ def prepare_rclone_sa_config():
 
 def _is_rclone_remote_target(target):
     return target not in (None, '') and ':' in target and not target.startswith('/')
+
+
+def _is_sprinkle_service_account_target(target):
+    remote = str(target).split(':', 1)[0]
+    return remote.startswith('dst') and remote[3:].isdigit()
 
 
 def command_needs_rclone_config():
@@ -1300,6 +1416,18 @@ rclone_move={rclone_move}
 # Lines starting with # are ignored. The default file is created on first use.
 rclone_env_file=~/.sprinkle/rclone.env
 
+# Optional rclone RC server used for all rclone operations.
+# The server must contain the same stable dst101, dst102, ... account mapping.
+# In RC mode local paths refer to the RC host, not this client; credentials are optional Basic Auth values.
+# rclone_rc_url=https://rclone.example.invalid
+# rclone_rc_user=
+# rclone_rc_password=
+rclone_rc_timeout_seconds=30
+# Use already-provisioned RC remotes and skip local SA config generation.
+# rclone_rc_remotes=dst101,dst102
+# Maps ordinary absolute backup paths to an RC-server local remote, for example mylocal:/srv/backups.
+# rclone_rc_local_remote=mylocal
+
 # delete_files: delete files after 1-way sync
 # delete_files=false (leave files not locally present on remote drives)
 # delete_files=true (delete files not locally present from remote drives) (default)
@@ -1321,6 +1449,7 @@ sa_clean_invalid={sa_clean_invalid}
 # Delete managed and source JSON only after "Invalid grant: account not found".
 sa_delete_account_not_found=false
 sa_group_size=50
+sa_stats_workers=4
 ls_stop_first=true
 
 # Large-file upload selection keeps enough headroom on small Google Drive accounts.
@@ -1656,16 +1785,38 @@ def sa_import():
 
 def sa_stats():
     registry = _service_account_registry()
+    if __config.get('rclone_rc_url') not in (None, ''):
+        registry.assign_stable_remote_names()
     refresh_mode = __config['sa_refresh']
     if globals().get('__sa_refresh') is None and refresh_mode == service_accounts.DEFAULT_REFRESH_MODE:
         refresh_mode = 'stale'
     refreshed = 0
-    for account in registry.active_accounts():
+    accounts = registry.active_accounts()
+    refresh_accounts = []
+    for account in accounts:
         quota_row = registry.quota_by_account_id(account['id'])
         if registry.should_refresh(quota_row, refresh_mode):
-            quota, error = _refresh_service_account_quota(account)
+            refresh_accounts.append(account)
+
+    results = {}
+    if refresh_accounts:
+        worker_count = min(__config['sa_stats_workers'], len(refresh_accounts))
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = dict((account['id'], executor.submit(_refresh_service_account_quota, account))
+                           for account in refresh_accounts)
+            for account in refresh_accounts:
+                try:
+                    results[account['id']] = futures[account['id']].result()
+                except Exception as exc:
+                    results[account['id']] = (None, str(exc))
+
+    for account in accounts:
+        if account['id'] in results:
+            quota, error = results[account['id']]
             registry.update_quota(account['id'], quota, error)
             refreshed += 1
+            quota_row = registry.quota_by_account_id(account['id'])
+        else:
             quota_row = registry.quota_by_account_id(account['id'])
         quota_error = None if quota_row is None else quota_row['last_error']
         if _handle_account_not_found(registry, account, quota_error):
@@ -1747,6 +1898,17 @@ def sa_stats():
 
 
 def _refresh_service_account_quota(account):
+    if __config.get('rclone_rc_url') not in (None, ''):
+        remote_name = account['remote_name']
+        if remote_name in (None, ''):
+            return None, 'rclone rc remote mapping missing for service account'
+        quota, error = _rclone_rc_about(remote_name + ':')
+        if error is not None:
+            return None, error
+        unknown_reason = _quota_unknown_reason(quota)
+        if unknown_reason is not None:
+            return None, unknown_reason
+        return quota, None
     if account['managed_path'] is None:
         return None, 'missing managed service account file'
     fd, tmp_conf = tempfile.mkstemp(prefix="rclone-sa-", suffix=".conf")
@@ -1776,6 +1938,33 @@ def _refresh_service_account_quota(account):
             os.unlink(tmp_conf)
         except Exception:
             pass
+
+
+def _rclone_rc_about(remote):
+    """Query one already-configured RC remote without exposing credentials."""
+    url = str(__config.get('rclone_rc_url')).rstrip('/') + '/operations/about'
+    payload = json.dumps({'fs': remote}).encode('utf-8')
+    headers = {'Content-Type': 'application/json'}
+    user = __config.get('rclone_rc_user')
+    if user not in (None, ''):
+        password = __config.get('rclone_rc_password') or ''
+        token = base64.b64encode((str(user) + ':' + str(password)).encode('utf-8')).decode('ascii')
+        headers['Authorization'] = 'Basic ' + token
+    request = urllib_request.Request(url, data=payload, headers=headers, method='POST')
+    try:
+        with urllib_request.urlopen(request, timeout=__config['rclone_rc_timeout_seconds']) as response:
+            result = json.loads(response.read().decode('utf-8'))
+    except urllib_error.HTTPError as exc:
+        return None, 'rclone rc about failed: HTTP {}'.format(exc.code)
+    except urllib_error.URLError as exc:
+        return None, 'rclone rc about failed: {}'.format(getattr(exc, 'reason', 'network error'))
+    except (ValueError, UnicodeDecodeError) as exc:
+        return None, 'rclone rc about returned invalid json: {}'.format(exc.__class__.__name__)
+    except Exception as exc:
+        return None, 'rclone rc about failed: {}'.format(exc.__class__.__name__)
+    if not isinstance(result, dict):
+        return None, 'rclone rc about returned invalid json object'
+    return result, None
 
 
 def _backup_accounts_with_free_space(registry, accounts):

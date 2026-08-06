@@ -13,6 +13,9 @@ import logging
 import json
 import os
 import random
+import base64
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 from libsprinkle import common
 from libsprinkle import exceptions
 
@@ -107,7 +110,8 @@ def generate_rclone_config_from_files(
         start_index=101,
         return_entries=False,
         shuffle=True,
-        base_config_file=None):
+        base_config_file=None,
+        remote_names=None):
     """Generate an rclone configuration from explicit service account files."""
     files = [os.path.abspath(path) for path in json_files]
     if shuffle:
@@ -130,7 +134,9 @@ def generate_rclone_config_from_files(
     entries = []
     for filename in files:
         count += 1
-        remote = "{}{}".format(prefix, count)
+        remote = None if remote_names is None else remote_names.get(filename)
+        if remote is None:
+            remote = "{}{}".format(prefix, count)
         lines.extend([
             "[{}]".format(remote),
             "type = drive",
@@ -178,21 +184,63 @@ def generate_rclone_combine_config(upstreams, output_file, group_size=50, prefix
 
 class RClone:
 
-    def __init__(self, config_file=None, rclone_exe="rclone", rclone_retries="1"):
+    def __init__(self, config_file=None, rclone_exe="rclone", rclone_retries="1",
+                 rc_url=None, rc_user=None, rc_password=None, rc_timeout_seconds=30):
         logging.debug('constructing RClone')
-        if config_file is not None and not common.is_file(config_file):
+        if rc_url in (None, '') and config_file is not None and not common.is_file(config_file):
             logging.error("configuration file " + str(config_file) + " not found. Cannot continue!")
             raise Exception("Configuration file " + str(config_file) + " not found")
-        if rclone_exe != "rclone" and not common.is_file(rclone_exe):
+        if rc_url in (None, '') and rclone_exe != "rclone" and not common.is_file(rclone_exe):
             #logging.error("rclone executable " + str(rclone_exe) + " not found. Cannot continue!")
             common.print_line('RCLONE.EXE not in PATH. Put it in PATH or modify libsprinkle.conf to point to it.')
             raise Exception("rclone executable " + str(rclone_exe) + " not found")
         self._config_file = config_file
         self._rclone_exe = rclone_exe
         self._rclone_retries = rclone_retries
+        self._rc_url = None if rc_url in (None, '') else str(rc_url).rstrip('/')
+        self._rc_user = rc_user
+        self._rc_password = rc_password
+        self._rc_timeout_seconds = int(rc_timeout_seconds)
+
+    def _rc_call(self, endpoint, payload=None):
+        if self._rc_url is None:
+            raise Exception('rclone RC transport is not configured')
+        headers = {'Content-Type': 'application/json'}
+        if self._rc_user not in (None, ''):
+            token = base64.b64encode(
+                (str(self._rc_user) + ':' + str(self._rc_password or '')).encode('utf-8')
+            ).decode('ascii')
+            headers['Authorization'] = 'Basic ' + token
+        request = urllib_request.Request(
+            self._rc_url + '/' + endpoint.lstrip('/'),
+            data=json.dumps(payload or {}).encode('utf-8'),
+            headers=headers,
+            method='POST',
+        )
+        try:
+            with urllib_request.urlopen(request, timeout=self._rc_timeout_seconds) as response:
+                result = json.loads(response.read().decode('utf-8'))
+        except urllib_error.HTTPError as exc:
+            raise Exception('rclone RC {} failed: HTTP {}'.format(endpoint, exc.code))
+        except urllib_error.URLError as exc:
+            raise Exception('rclone RC {} failed: {}'.format(endpoint, getattr(exc, 'reason', 'network error')))
+        except Exception as exc:
+            raise Exception('rclone RC {} failed: {}'.format(endpoint, exc.__class__.__name__))
+        if not isinstance(result, dict):
+            raise Exception('rclone RC {} returned invalid json'.format(endpoint))
+        if result.get('error') not in (None, '', False):
+            raise Exception('rclone RC {} failed: {}'.format(endpoint, str(result['error'])[:300]))
+        return result
+
+    def _rc_file_system(self, path):
+        """Return an RC fs reference; local absolute paths are RC-host paths."""
+        return path
 
     def get_remotes(self, extra_args=[]):
         logging.debug('listing remotes')
+        if self._rc_url is not None:
+            remotes = self._rc_call('config/listremotes').get('remotes', [])
+            return [remote if remote.endswith(':') else remote + ':' for remote in remotes]
         command_with_args = []
         command_with_args.append(self._rclone_exe)
         command_with_args.append("listremotes")
@@ -217,6 +265,22 @@ class RClone:
 
     def lsjson(self, remote, directory, extra_args=[], no_error=False):
         logging.debug('running lsjson for ' + remote + directory)
+        if self._rc_url is not None:
+            options = {
+                'recurse': '--recursive' in extra_args,
+                'showOrigIDs': True,
+            }
+            try:
+                result = self._rc_call('operations/list', {
+                    'fs': remote,
+                    'remote': directory.lstrip('/'),
+                    'opt': options,
+                })
+                return json.dumps(result.get('list', []))
+            except Exception as exc:
+                if no_error:
+                    return '[]'
+                raise
         command_with_args = []
         command_with_args.append(self._rclone_exe)
         command_with_args.append("lsjson")
@@ -243,6 +307,17 @@ class RClone:
 
     def md5sum(self, remote, directory, extra_args=[], no_error=False):
         logging.debug('running lsjson for ' + remote + directory)
+        if self._rc_url is not None:
+            try:
+                result = self._rc_call('operations/hashsum', {
+                    'fs': remote + directory,
+                    'hashType': 'MD5',
+                })
+                return '\n'.join(result.get('hashsum', []))
+            except Exception:
+                if no_error:
+                    return ''
+                raise
         command_with_args = []
         command_with_args.append(self._rclone_exe)
         command_with_args.append("md5sum")
@@ -270,6 +345,11 @@ class RClone:
 
     def get_about_json_with_error(self, remote):
         logging.debug('running about for ' + remote)
+        if self._rc_url is not None:
+            try:
+                return self._rc_call('operations/about', {'fs': remote}), None
+            except Exception as exc:
+                return None, str(exc)
         command_with_args = []
         command_with_args.append(self._rclone_exe)
         command_with_args.append("about")
@@ -311,6 +391,9 @@ class RClone:
 
     def mkdir(self, remote, directory):
         logging.debug('running mkdir for ' + remote + ":" + directory)
+        if self._rc_url is not None:
+            self._rc_call('operations/mkdir', {'fs': remote, 'remote': directory.lstrip('/')})
+            return []
         command_with_args = []
         command_with_args.append(self._rclone_exe)
         command_with_args.append("mkdir")
@@ -323,15 +406,18 @@ class RClone:
         command_with_args.append(remote + directory)
         result = common.execute(command_with_args)
         logging.debug('result: ' + str(result))
-        if result['error'] != '':
+        if result.get('code', 0) != 0:
             logging.error('error getting remotes objects')
-            raise Exception('error getting remote object. ' + result['error'])
+            raise Exception('error getting remote object. ' + (result.get('error') or result.get('out') or 'rclone mkdir failed'))
         out = result['out'].splitlines()
         logging.debug('returning ' + str(out))
         return out
 
     def rmdir(self, remote, directory):
         logging.debug('running rmdir for ' + remote + ":" + directory)
+        if self._rc_url is not None:
+            self._rc_call('operations/rmdir', {'fs': remote, 'remote': directory.lstrip('/')})
+            return []
         command_with_args = []
         command_with_args.append(self._rclone_exe)
         command_with_args.append("rmdir")
@@ -353,6 +439,8 @@ class RClone:
 
     def get_version(self):
         logging.debug('running version')
+        if self._rc_url is not None:
+            return [json.dumps(self._rc_call('core/version'))]
         command_with_args = [self._rclone_exe, "version"]
         result = common.execute(command_with_args)
         logging.debug('result: ' + str(result))
@@ -365,6 +453,8 @@ class RClone:
 
     def touch(self, remote, file):
         logging.debug('running touch for ' + remote + ":" + file)
+        if self._rc_url is not None:
+            raise Exception('rclone RC transport does not support touch')
         command_with_args = []
         command_with_args.append(self._rclone_exe)
         command_with_args.append("touch")
@@ -386,6 +476,9 @@ class RClone:
 
     def delete_file(self, remote, file):
         logging.debug('running deleteFile for ' + remote + ":" + file)
+        if self._rc_url is not None:
+            self._rc_call('operations/deletefile', {'fs': remote, 'remote': file.lstrip('/')})
+            return []
         command_with_args = []
         command_with_args.append(self._rclone_exe)
         command_with_args.append("deletefile")
@@ -407,6 +500,9 @@ class RClone:
 
     def delete(self, remote, file):
         logging.debug('running delete for ' + remote + ":" + file)
+        if self._rc_url is not None:
+            self._rc_call('operations/delete', {'fs': remote + file})
+            return []
         command_with_args = []
         command_with_args.append(self._rclone_exe)
         command_with_args.append("delete")
@@ -428,6 +524,14 @@ class RClone:
 
     def copy(self, src, dst, extra_args=[], no_error=False):
         logging.debug('running copy from ' + src + " to " + dst)
+        if self._rc_url is not None:
+            try:
+                self._rc_call('sync/copy', {'srcFs': self._rc_file_system(src), 'dstFs': self._rc_file_system(dst)})
+                return []
+            except Exception:
+                if no_error:
+                    return []
+                raise
         command_with_args = []
         command_with_args.append(self._rclone_exe)
         command_with_args.append("copy")
@@ -447,16 +551,19 @@ class RClone:
         logging.debug('command args: ' + str(command_with_args))
         result = common.execute(command_with_args, no_error)
         logging.debug('result: ' + str(result))
-        if result['error'] != '':
+        if result.get('code', 0) != 0:
             if no_error is False:
                 logging.error('error getting remotes objects')
-                raise Exception('error getting remote object. ' + result['error'])
+                raise Exception('error getting remote object. ' + (result.get('error') or result.get('out') or 'rclone copy failed'))
         out = result['out'].splitlines()
         logging.debug('returning ' + str(out))
         return out
 
     def move(self, src, dst, extra_args=[]):
         logging.debug('running move from ' + src + " to " + dst)
+        if self._rc_url is not None:
+            self._rc_call('sync/move', {'srcFs': self._rc_file_system(src), 'dstFs': self._rc_file_system(dst)})
+            return []
         command_with_args = []
         command_with_args.append(self._rclone_exe)
         command_with_args.append("move")
@@ -475,9 +582,9 @@ class RClone:
         command_with_args.append(dst)
         result = common.execute(command_with_args)
         logging.debug('result: ' + str(result))
-        if result['error'] != '':
+        if result.get('code', 0) != 0:
             logging.error('error getting remotes objects')
-            raise Exception('error getting remote object. ' + result['error'])
+            raise Exception('error getting remote object. ' + (result.get('error') or result.get('out') or 'rclone move failed'))
         out = result['out'].splitlines()
         logging.debug('returning ' + str(out))
         return out
@@ -498,6 +605,9 @@ class RClone:
 
     def sync(self, src, dst, extra_args=[]):
         logging.debug('running sync from ' + src + " to " + dst)
+        if self._rc_url is not None:
+            self._rc_call('sync/sync', {'srcFs': self._rc_file_system(src), 'dstFs': self._rc_file_system(dst)})
+            return []
         command_with_args = []
         command_with_args.append(self._rclone_exe)
         command_with_args.append("sync")

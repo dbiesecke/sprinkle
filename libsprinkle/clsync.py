@@ -103,10 +103,20 @@ class ClSync:
             self._cache_invalidation_max = 1
 
         if 'rclone_exe' not in self._config:
-            self._rclone = rclone.RClone(rclone_config)
+            self._rclone = rclone.RClone(
+                rclone_config,
+                rc_url=self._config.get('rclone_rc_url'),
+                rc_user=self._config.get('rclone_rc_user'),
+                rc_password=self._config.get('rclone_rc_password'),
+                rc_timeout_seconds=self._config.get('rclone_rc_timeout_seconds', 30),
+            )
         else:
             self._rclone = rclone.RClone(
-                rclone_config, self._config['rclone_exe'], self._rclone_retries
+                rclone_config, self._config['rclone_exe'], self._rclone_retries,
+                self._config.get('rclone_rc_url'),
+                self._config.get('rclone_rc_user'),
+                self._config.get('rclone_rc_password'),
+                self._config.get('rclone_rc_timeout_seconds', 30),
             )
 
         if 'rclone_move' in config:
@@ -453,10 +463,39 @@ class ClSync:
                 self._cached_free[remote] = max(0, self._cached_free[remote] - int(size))
             if self._frees is not None and remote in self._frees and self._frees[remote] is not None:
                 self._frees[remote] = max(0, self._frees[remote] - int(size))
-        if self._sa_registry is not None:
+        if getattr(self, '_sa_registry', None) is not None:
             self._sa_registry.adjust_quota_for_remote(remote, int(size))
             self._sa_registry.invalidate_ls_cache_for_remote(remote)
         self._clear_memory_ls_cache()
+
+    def _confirmed_target_file_size(self, remote, directory, name):
+        try:
+            rows = self._rclone.lsjson(remote, directory, ['--fast-list'], True)
+            if isinstance(rows, str):
+                rows = json.loads(rows)
+        except Exception as exc:
+            raise Exception('quota cache verification failed: {}'.format(exc))
+        if not isinstance(rows, list):
+            return None
+        for row in rows:
+            if row.get('Name') == name and not row.get('IsDir'):
+                return row.get('Size')
+        return None
+
+    def _record_confirmed_transfer(self, remote, directory, name, previous_size, expected_size):
+        if getattr(self, '_sa_registry', None) is None:
+            self.mark_remote_used(remote, int(expected_size) - int(previous_size))
+            return
+        confirmed_size = self._confirmed_target_file_size(remote, directory, name)
+        if confirmed_size is None:
+            raise Exception('quota cache verification failed: target file not found after transfer')
+        self.mark_remote_used(remote, int(confirmed_size) - int(previous_size))
+
+    def _ensure_target_directory(self, remote, directory):
+        """Create the destination before a transfer, retaining it after a failed copy."""
+        mkdir = getattr(getattr(self, '_rclone', None), 'mkdir', None)
+        if mkdir is not None:
+            mkdir(remote, directory)
 
     def mark_remote_quota_exhausted(self, remote):
         """Exclude a remote after Google confirms that its quota is exhausted."""
@@ -677,7 +716,7 @@ class ClSync:
                         local_clfile.remote_path = remote_path
                         local_clfile.remote = current_remote
                         op = operation.Operation(operation.Operation.UPDATE,
-                                                 local_clfile, None)
+                                                 local_clfile, remote_clfile)
                         operations.append(op)
                 elif self._compare_method == 'md5':
                     local_md5 = local_clfile.md5
@@ -690,7 +729,7 @@ class ClSync:
                         local_clfile.remote_path = remote_path
                         local_clfile.remote = current_remote
                         op = operation.Operation(operation.Operation.UPDATE,
-                                                 local_clfile, None)
+                                                 local_clfile, remote_clfile)
                         operations.append(op)
                 else:
                     logging.error('compare_method: ' + self._compare_method + ' not valid!')
@@ -746,6 +785,15 @@ class ClSync:
         logging.debug('backing up directory ' + local_dir)
         source_remote, source_path = self.parse_backup_target(local_dir)
         source_is_remote = source_remote is not None
+        if not source_is_remote and getattr(getattr(self, '_rclone', None), '_rc_url', None) is not None:
+            rc_local_remote = self._config.get('rclone_rc_local_remote')
+            if rc_local_remote in (None, ''):
+                raise Exception(
+                    'rclone_rc_local_remote is required for a local-path backup through rclone RC'
+                )
+            source_remote = str(rc_local_remote).rstrip(':') + ':'
+            source_path = local_dir
+            source_is_remote = True
         if source_is_remote and self._compare_method == 'md5':
             raise Exception("rclone remote source backup supports compare_method=size")
         if not source_is_remote and not common.is_dir(local_dir):
@@ -839,11 +887,8 @@ class ClSync:
                                 copied = True
                                 break
                             try:
+                                self._ensure_target_directory(remote, op.src.remote_path)
                                 self.copy(op.src.path + '/' + op.src.name, op.src.remote_path, remote)
-                                if target_remote is None:
-                                    self.mark_remote_used(remote, int(op.src.size))
-                                copied = True
-                                break
                             except Exception as e:
                                 errors.append(e)
                                 if self._is_storage_quota_exceeded(e):
@@ -851,6 +896,13 @@ class ClSync:
                                     logging.warning('copy to ' + remote + ' failed: storage quota exceeded; marking remote full')
                                 else:
                                     logging.warning('copy to ' + remote + ' failed: ' + str(e))
+                                continue
+                            if target_remote is None:
+                                self._record_confirmed_transfer(
+                                    remote, op.src.remote_path, op.src.name, 0, op.src.size
+                                )
+                            copied = True
+                            break
                         if not copied:
                             raise Exception('; '.join(str(error) for error in errors))
                     except Exception as e:
@@ -863,7 +915,17 @@ class ClSync:
                             common.print_line('backing up file ' + op.src.path + '/' + op.src.name +
                                               ' -> ' + op.src.remote + ':' + op.src.remote_path)
                         if dry_run is False:
+                            self._ensure_target_directory(op.src.remote, op.src.remote_path)
                             self.copy(op.src.path + '/' + op.src.name, op.src.remote_path, op.src.remote)
+                            if target_remote is None:
+                                previous_size = 0 if op.dst is None or op.dst.size is None else op.dst.size
+                                self._record_confirmed_transfer(
+                                    op.src.remote,
+                                    op.src.remote_path,
+                                    op.src.name,
+                                    previous_size,
+                                    op.src.size,
+                                )
                     except Exception as e:
                         if self._is_storage_quota_exceeded(e):
                             self.mark_remote_quota_exhausted(op.src.remote)
@@ -877,6 +939,8 @@ class ClSync:
                                 self.rmdir(op.src.path, op.src.remote)
                             else:
                                 self.delete_file(op.src.path, op.src.remote)
+                                if target_remote is None:
+                                    self.mark_remote_used(op.src.remote, -int(op.src.size or 0))
                     except Exception as e:
                         record_failure(op, e, [op.src.remote])
             if self._show_progress:

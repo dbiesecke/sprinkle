@@ -242,17 +242,6 @@ class ServiceAccountRegistry(object):
             return
         if duplicate is not None:
             result.duplicates += 1
-            self._record_account(
-                account_key=account_key,
-                payload=payload,
-                content_hash=content_hash,
-                source_path=path,
-                managed_path=duplicate["managed_path"],
-                status="duplicate",
-                invalid_reason=None,
-                duplicate_of=duplicate["id"],
-                now=now,
-            )
             if duplicate["managed_path"]:
                 result.selected_files.append(duplicate["managed_path"])
             self._emit_status(progress, index, result.total, path, "duplicate", None)
@@ -491,6 +480,16 @@ class ServiceAccountRegistry(object):
                     WHERE status='active' AND managed_path=?
                     """,
                     (remote, now, managed_path),
+                )
+
+    def assign_stable_remote_names(self, prefix="dst", start_index=101):
+        """Assign deterministic names used by a shared rclone RC server."""
+        now = self._utcnow()
+        with self._connect() as conn:
+            for index, account in enumerate(self.active_accounts(), start_index):
+                conn.execute(
+                    "UPDATE accounts SET remote_name=?, updated_at=? WHERE id=?",
+                    ("{}{}".format(prefix, index), now, account["id"]),
                 )
 
     def quota_by_remote(self, remote):
@@ -765,8 +764,10 @@ class ServiceAccountRegistry(object):
         used = row["used"]
         if free is not None:
             free = max(0, free - int(byte_delta))
+            if row["total"] is not None:
+                free = min(row["total"], free)
         if used is not None:
-            used = used + int(byte_delta)
+            used = max(0, used + int(byte_delta))
         with self._connect() as conn:
             conn.execute("""
                 UPDATE quota_cache

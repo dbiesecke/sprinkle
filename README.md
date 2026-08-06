@@ -25,7 +25,7 @@ $ ./sprinkle/sprinkle.py -d --drive-id YouDriveID backup /Users/user/workspace/M
 
 ```
 
-`sa-import` validates new accounts with `rclone about --json` and prints per-file progress. If rclone returns an error or quota remains unknown, the account is recorded as invalid and quarantined by default.
+`sa-import` validates new accounts with `rclone about --json` and prints per-file progress. Duplicate account JSON is counted and skipped without creating an additional managed file or SQLite account record. If rclone returns an error or quota remains unknown, the account is recorded as invalid and quarantined by default.
 
 For already imported accounts, `--sa-delete-account-not-found` is an explicit cleanup option. It removes
 the managed and source JSON only when Google returns `Invalid grant: account not found`; other validation
@@ -49,6 +49,21 @@ Before clustered backups, Sprinkle only generates remotes for active service acc
 positive free-space quota. `sa-stats` refreshes quota data without recursively listing the Drive contents.
 If rclone reports Google `storageQuotaExceeded` during a copy, Sprinkle marks that remote as full and
 immediately falls back to the next capacity-qualified remote.
+
+After a successful clustered add or update, Sprinkle confirms the target file and applies its observed
+size delta to cached `used` and `free` values. Successful file deletions release their known old size.
+An unconfirmed target leaves the cache unchanged and is reported as an accounting failure.
+
+To run all rclone operations on an existing rclone RC server, configure `rclone_rc_url`, optional
+`rclone_rc_user`/`rclone_rc_password`, `rclone_rc_timeout_seconds=30`, and `sa_stats_workers=4`.
+Sprinkle uses the RC operations and sync endpoints and never falls back to local rclone after an RC failure.
+The server must already contain the same stable `dst101`, `dst102`, … service-account mapping. For an ordinary
+absolute backup path, set `rclone_rc_local_remote=mylocal` (or the server's local remote name): Sprinkle then
+reads `/path` as `mylocal:/path` on the RC host. Keep RC private, protected by TLS and authentication, and never
+commit its credentials. Prefer `SPRINKLE_RCLONE_RC_PASSWORD` over storing the password in a config file.
+
+Set `rclone_rc_remotes=dst101,dst102` when those remotes are already provisioned on the RC server. This
+uses them directly for clustered backups and avoids generating a local service-account rclone config.
 
 * create a home-directory configuration with interactive defaults
 
