@@ -983,6 +983,11 @@ class ClSync:
                 exhausted = getattr(self, '_run_quota_exhausted_remotes', set())
                 candidates = [remote for remote in candidates if remote not in exhausted]
         else:
+            # An explicitly selected target has no fallback.  Do not keep
+            # issuing one failing rclone request per file after Drive has
+            # already confirmed that this target is full.
+            if target_remote in getattr(self, '_run_quota_exhausted_remotes', set()):
+                return False
             candidates = [target_remote]
         if not candidates:
             raise Exception('no remote has enough known free space')
@@ -1177,6 +1182,12 @@ class ClSync:
                 if op.operation == operation.Operation.ADD:
                     candidates = None
                     try:
+                        if (target_remote is not None and
+                                target_remote in getattr(self, '_run_quota_exhausted_remotes', set())):
+                            # The first quota failure is already recorded.  An
+                            # explicit target cannot fall back to another
+                            # remote, so later ADDs must not retry it.
+                            continue
                         if target_remote is None:
                             candidates = self.get_eligible_remotes(int(op.src.size))
                             exhausted = getattr(self, '_run_quota_exhausted_remotes', set())

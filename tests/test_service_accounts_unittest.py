@@ -2197,6 +2197,33 @@ class ClSyncPlacementTest(unittest.TestCase):
             self.assertEqual(copied, ["dst102:", "dst101:"])
             self.assertEqual(sync._cached_free["dst102:"], 0)
 
+    def test_backup_does_not_retry_an_explicit_target_after_quota_exhaustion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("first.mkv", "second.mkv"):
+                with open(os.path.join(tmp, name), "w") as fp:
+                    fp.write("synthetic movie")
+            sync = clsync.ClSync.__new__(clsync.ClSync)
+            sync._show_progress = False
+            sync._compare_method = "size"
+            sync._ClSync__exclusion_list = None
+            sync._ClSync__exclude_regex = None
+            sync._cached_free = {"dst101:": 100}
+            sync._frees = None
+            sync._sa_registry = None
+            sync.ls_shallow = lambda _path, **_kwargs: {}
+            copied = []
+
+            def copy(_src, _dst, remote):
+                copied.append(remote)
+                raise Exception("googleapi: Error 403, storageQuotaExceeded")
+
+            sync.copy = copy
+
+            with self.assertRaisesRegex(Exception, "storageQuotaExceeded"):
+                sync.backup(tmp, delete_files=False, dry_run=False, target="dst101:")
+
+            self.assertEqual(copied, ["dst101:"])
+
     def test_backup_uses_two_parallel_directory_batches(self):
         with tempfile.TemporaryDirectory() as tmp:
             for directory in ("first", "second"):
