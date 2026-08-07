@@ -32,6 +32,34 @@ REQUIRED_FIELDS = [
 ]
 
 
+def has_usable_quota(quota, required_free=1):
+    """Return whether a cached/API quota is safe for capacity placement.
+
+    Google Drive may return usage counters for service accounts without a
+    storage limit.  Those counters are not a capacity signal.
+    """
+    if quota is None:
+        return False
+    try:
+        if quota['last_error'] not in (None, ''):
+            return False
+    except (KeyError, IndexError):
+        pass
+    try:
+        total = quota['total']
+        free = quota['free']
+    except (KeyError, IndexError):
+        return False
+    if total is None or free is None:
+        return False
+    try:
+        total = int(total)
+        free = int(free)
+    except (TypeError, ValueError):
+        return False
+    return total >= 0 and free >= int(required_free) and free <= total
+
+
 class ImportResult(object):
     def __init__(self):
         self.total = 0
@@ -51,6 +79,7 @@ class ServiceAccountRegistry(object):
         self.db_path = os.path.abspath(os.path.expanduser(db_path or DEFAULT_DB_PATH))
         self.store_dir = os.path.abspath(os.path.expanduser(store_dir or DEFAULT_STORE_DIR))
         self.quarantine_dir = os.path.join(self.store_dir, "quarantine")
+        self.service_deactivated_dir = os.path.join(self.store_dir, "service-deactivated")
         self.cache_ttl_hours = int(cache_ttl_hours)
         self._ensure_dirs()
         self._init_db()
@@ -63,8 +92,10 @@ class ServiceAccountRegistry(object):
                 os.chmod(db_dir, 0o700)
         os.makedirs(self.store_dir, mode=0o700, exist_ok=True)
         os.makedirs(self.quarantine_dir, mode=0o700, exist_ok=True)
+        os.makedirs(self.service_deactivated_dir, mode=0o700, exist_ok=True)
         os.chmod(self.store_dir, 0o700)
         os.chmod(self.quarantine_dir, 0o700)
+        os.chmod(self.service_deactivated_dir, 0o700)
 
     @contextmanager
     def _connect(self):
@@ -233,6 +264,7 @@ class ServiceAccountRegistry(object):
             validation_workers=1):
         if clean_invalid not in ("none", "quarantine", "delete"):
             raise ValueError("invalid service account cleanup mode: {}".format(clean_invalid))
+        self.remove_missing_file_accounts()
         result = ImportResult()
         json_paths = []
         for path in paths:
@@ -331,7 +363,9 @@ class ServiceAccountRegistry(object):
             return conn.execute("""
                 SELECT a.*, q.total, q.used, q.free, q.last_about_at, q.last_error
                 FROM accounts a JOIN quota_cache q ON q.account_id=a.id
-                WHERE a.status='active' AND q.free IS NOT NULL AND q.free>=?
+                WHERE a.status='active' AND q.last_error IS NULL
+                  AND q.total IS NOT NULL AND q.total>=0
+                  AND q.free IS NOT NULL AND q.free>=? AND q.free<=q.total
                   AND NOT EXISTS (SELECT 1 FROM rc_slots s WHERE s.account_id=a.id)
                 ORDER BY q.free DESC, a.id ASC LIMIT 1
             """, (int(required_free),)).fetchone()
@@ -348,16 +382,24 @@ class ServiceAccountRegistry(object):
 
     def _iter_json_files(self, path):
         path = os.path.abspath(os.path.expanduser(path))
+        if self._is_excluded_store_path(path):
+            return
         if os.path.isfile(path):
             if path.endswith(".json"):
                 yield path
             return
         if not os.path.isdir(path):
             raise ValueError("service account path not found: {}".format(path))
-        for root, _, files in os.walk(path):
+        for root, dirs, files in os.walk(path):
+            dirs[:] = [name for name in dirs if not self._is_excluded_store_path(os.path.join(root, name))]
             for filename in files:
                 if filename.endswith(".json"):
                     yield os.path.join(root, filename)
+
+    def _is_excluded_store_path(self, path):
+        path = os.path.abspath(path)
+        return path == self.quarantine_dir or path.startswith(self.quarantine_dir + os.sep) or \
+            path == self.service_deactivated_dir or path.startswith(self.service_deactivated_dir + os.sep)
 
     def _import_file(
             self,
@@ -587,7 +629,7 @@ class ServiceAccountRegistry(object):
 
     def _managed_path(self, account_key):
         digest = hashlib.sha256(account_key.encode("utf-8")).hexdigest()
-        return os.path.join(self.store_dir, "sa-{}.json".format(digest[:24]))
+        return os.path.join(self.store_dir, "unknown-{}.json".format(digest[:24]))
 
     def _quarantine(self, source_path, content_hash, raw):
         filename = "invalid-{}-{}".format(content_hash[:24], os.path.basename(source_path))
@@ -656,7 +698,7 @@ class ServiceAccountRegistry(object):
                     a.id AS account_id,
                     a.remote_name,
                     q.total, q.used, q.free, q.trashed, q.other, q.objects,
-                    q.last_about_at, q.last_error
+                    q.last_about_at, q.last_error, q.updated_at
                 FROM accounts a
                 LEFT JOIN quota_cache q ON q.account_id = a.id
                 WHERE a.status='active' AND a.remote_name=?
@@ -676,7 +718,14 @@ class ServiceAccountRegistry(object):
             return False
         if mode == "all":
             return True
-        if quota_row is None or quota_row["last_about_at"] is None:
+        if quota_row is None:
+            return mode in ("missing", "stale")
+        # Unknown/error results are cached as an explicit non-capacity state.
+        # Retry only once that result has become stale; otherwise every backup
+        # would repeat the same failing rclone about request.
+        if quota_row["last_error"] not in (None, ""):
+            return mode == "stale" and self.is_stale(quota_row["updated_at"])
+        if quota_row["last_about_at"] is None:
             return mode in ("missing", "stale")
         if mode == "missing":
             return False
@@ -879,6 +928,110 @@ class ServiceAccountRegistry(object):
             except FileNotFoundError:
                 pass
         return True
+
+    def remove_service_deactivated_account(self, account_id, reason):
+        """Quarantine an API-disabled account, then remove its active DB record.
+
+        A disabled Drive API is a project-level configuration failure rather than
+        a malformed credential.  Keep every known JSON copy for later recovery,
+        but do not leave the account or its quota in the active SQLite registry.
+        """
+        with self._connect() as conn:
+            account = conn.execute(
+                "SELECT source_path, managed_path, content_hash FROM accounts WHERE id=? AND status='active'",
+                (account_id,),
+            ).fetchone()
+        if account is None:
+            return False
+
+        paths = sorted(set(path for path in (account['managed_path'], account['source_path']) if path))
+        for index, path in enumerate(paths, 1):
+            if not os.path.isfile(path):
+                continue
+            filename = "service-deactivated-{}-{}-{}".format(
+                account['content_hash'][:24], index, os.path.basename(path),
+            )
+            destination = os.path.join(self.service_deactivated_dir, filename)
+            if os.path.abspath(path) == destination:
+                continue
+            shutil.move(path, destination)
+            os.chmod(destination, stat.S_IRUSR | stat.S_IWUSR)
+
+        with self._connect() as conn:
+            # Clear live slot bindings before removing the row.  Cache tables
+            # are explicitly cleared even when SQLite foreign keys are disabled.
+            conn.execute("UPDATE rc_slots SET account_id=NULL, updated_at=? WHERE account_id=?",
+                         (self._utcnow(), account_id))
+            conn.execute("DELETE FROM quota_cache WHERE account_id=?", (account_id,))
+            conn.execute("DELETE FROM ls_cache WHERE account_id=?", (account_id,))
+            conn.execute("DELETE FROM accounts WHERE id=? AND status='active'", (account_id,))
+        logging.warning('quarantined service account with disabled Google Drive API: %s', reason)
+        return True
+
+    def remove_missing_file_accounts(self):
+        """Remove active records when either tracked service-account file is gone.
+
+        ``source_path`` reflects an operator-managed service-account directory;
+        ``managed_path`` is Sprinkle's private copy.  Removing either file is an
+        explicit request to stop using that account, so retain no stale account,
+        quota, cache, or RC-slot reference in SQLite.
+        """
+        self._rename_managed_files_with_gclone_prefix()
+        with self._connect() as conn:
+            accounts = conn.execute(
+                "SELECT id, client_email, account_key, source_path, managed_path FROM accounts WHERE status='active'"
+            ).fetchall()
+        missing = [account for account in accounts if
+                   not account['managed_path'] or not os.path.isfile(account['managed_path']) or
+                   not account['source_path'] or not os.path.isfile(account['source_path'])]
+        if not missing:
+            return []
+        now = self._utcnow()
+        ids = [account['id'] for account in missing]
+        marks = ','.join('?' for _ in ids)
+        with self._connect() as conn:
+            conn.execute("UPDATE rc_slots SET account_id=NULL, updated_at=? WHERE account_id IN ({})".format(marks),
+                         tuple([now] + ids))
+            conn.execute("DELETE FROM quota_cache WHERE account_id IN ({})".format(marks), ids)
+            conn.execute("DELETE FROM ls_cache WHERE account_id IN ({})".format(marks), ids)
+            conn.execute("DELETE FROM accounts WHERE id IN ({}) AND status='active'".format(marks), ids)
+        for account in missing:
+            logging.warning(
+                'removed SQLite record for missing service account file: %s',
+                account['client_email'] or account['account_key'] or account['id'],
+            )
+        return ids
+
+    def _rename_managed_files_with_gclone_prefix(self):
+        """Use unknown-* until quota is known, otherwise gclone-* for managed files."""
+        with self._connect() as conn:
+            accounts = conn.execute(
+                "SELECT a.id, a.source_path, a.managed_path, q.last_about_at FROM accounts a "
+                "LEFT JOIN quota_cache q ON q.account_id=a.id "
+                "WHERE a.status='active' AND a.managed_path IS NOT NULL"
+            ).fetchall()
+        for account in accounts:
+            source = account['managed_path']
+            basename = os.path.basename(source)
+            prefix = 'gclone-' if account['last_about_at'] is not None else 'unknown-'
+            if basename.startswith(prefix) or not os.path.isfile(source):
+                continue
+            for old_prefix in ('gclone-', 'unknown-', 'sa-'):
+                if basename.startswith(old_prefix):
+                    basename = basename[len(old_prefix):]
+                    break
+            destination = os.path.join(os.path.dirname(source), prefix + basename)
+            if os.path.exists(destination):
+                logging.warning('cannot rename managed service account file; destination exists: %s', destination)
+                continue
+            os.rename(source, destination)
+            os.chmod(destination, stat.S_IRUSR | stat.S_IWUSR)
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE accounts SET managed_path=?, "
+                    "source_path=CASE WHEN source_path=? THEN ? ELSE source_path END, updated_at=? WHERE id=?",
+                    (destination, source, destination, self._utcnow(), account['id']),
+                )
 
     def mark_active_account_invalid(self, account_id, reason):
         """Disable a confirmed invalid account without removing its JSON files."""

@@ -161,6 +161,10 @@ Known invalid accounts are skipped during later backups, avoiding repeated `rclo
 Only active accounts with a successful quota check and positive known free space are included; file-size
 placement still applies its normal per-upload capacity check. `sa-stats` refreshes account quotas only and
 does not recursively list every Drive file, so it remains suitable for very large Drive folders.
+An `about` response that omits `total` or `free` (for example a service account without its own Drive
+storage) is not a zero-byte quota: it is excluded from local backups, RC slots, and writable union batches.
+For a shared My Drive folder, use an account with a real quota or Domain-Wide Delegation; Sprinkle never
+guesses capacity from `used=0`.
 
 ## Backup failures
 

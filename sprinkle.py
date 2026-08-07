@@ -1233,6 +1233,7 @@ def prepare_rclone_sa_config():
         __config.get('sa_store'),
         __config.get('sa_cache_ttl_hours', service_accounts.DEFAULT_CACHE_TTL_HOURS),
     )
+    registry.remove_missing_file_accounts()
     source_dir = os.path.abspath(os.path.expanduser(rclone_sa_dir))
     managed_store_dir = os.path.abspath(os.path.expanduser(__config.get('sa_store')))
     if source_dir == managed_store_dir:
@@ -1260,7 +1261,10 @@ def prepare_rclone_sa_config():
         accounts = _backup_accounts_with_free_space(registry, accounts)
     selected_files = [account['managed_path'] for account in accounts if account['managed_path']]
     if len(selected_files) == 0:
-        raise Exception("no valid service accounts with known free space found in " + rclone_sa_dir)
+        raise Exception(
+            "no valid service accounts with known usable quota found in " + rclone_sa_dir +
+            "; accounts without total/free are excluded from backups"
+        )
     if __config.get('rclone_rc_url') not in (None, ''):
         try:
             os.unlink(tmp_conf)
@@ -1669,6 +1673,17 @@ def _union_eligible_accounts(registry, excluded_ids, required_free):
             and (registry.quota_by_account_id(account['id'])['free'] or 0) >= required_free]
 
 
+def _union_batch_has_usable_capacity(registry, batch, required_free):
+    """A persisted writable batch must still be safe before it is resumed."""
+    accounts = registry.union_accounts(json.loads(batch['account_ids']))
+    eligible = _backup_accounts_with_free_space(registry, accounts)
+    eligible_ids = set(account['id'] for account in eligible)
+    return bool(accounts) and len(accounts) == len(eligible_ids) and all(
+        (registry.quota_by_account_id(account_id)['free'] or 0) >= required_free
+        for account_id in eligible_ids
+    )
+
+
 def _union_batch_config(registry, batches, current_batch, union_name):
     """Build a local config with exactly one writable batch and prior read-only ones."""
     account_sets = []
@@ -1756,21 +1771,37 @@ def backup_union():
             # durable account ids for a union batch.
             registry.import_paths([sa_dir], __config.get('sa_clean_invalid', service_accounts.DEFAULT_CLEAN_INVALID),
                                   skip_known_invalid=True)
+    registry.remove_missing_file_accounts()
     run = registry.union_run(_union_source_key(source), target or '')
     batches = registry.union_batches(run['id'])
     active = [batch for batch in batches if batch['status'] == 'active']
     if len(active) > 1:
         raise Exception('union run has multiple active batches; repair its SQLite state before retrying')
     current = active[0] if active else None
+    required_free = _union_required_free(source)
+    if current is not None and not _union_batch_has_usable_capacity(registry, current, required_free):
+        registry.update_union_batch(
+            current['id'], 'unusable',
+            'batch contains a service account without known usable quota',
+        )
+        common.print_line(
+            'union batch {} is no longer capacity-safe; preserving it read-only and rotating...'.format(
+                current['batch_index']
+            )
+        )
+        return backup_union()
     used = set()
     for batch in batches:
         used.update(json.loads(batch['account_ids']))
     if current is None:
-        candidates = _union_eligible_accounts(registry, used, _union_required_free(source))
+        candidates = _union_eligible_accounts(registry, used, required_free)
         count = _optional_int(__config.get('rclone_sa_count')) or len(candidates)
         chosen = random.sample(candidates, min(count, len(candidates)))
         if not chosen:
-            raise Exception('backup-union has no unused active service account with enough known free capacity')
+            raise Exception(
+                'backup-union has no unused active service account with enough known usable quota; '
+                'accounts without total/free are excluded'
+            )
         current = registry.create_union_batch(run['id'], [account['id'] for account in chosen])
         batches = registry.union_batches(run['id'])
     union_name = 'sprinkle_union_' + uuid.uuid4().hex
@@ -1964,6 +1995,13 @@ def _quota_unknown_reason(quota):
             missing.append(field)
     if missing:
         return "rclone about returned unknown quota: missing " + ",".join(missing)
+    try:
+        total = int(quota.get("total"))
+        free = int(quota.get("free"))
+    except (TypeError, ValueError):
+        return "rclone about returned unknown quota: invalid total or free"
+    if total < 0 or free < 0 or free > total:
+        return "rclone about returned unknown quota: invalid total or free"
     return None
 
 
@@ -2034,6 +2072,7 @@ def sa_import():
 
 def sa_stats():
     registry = _service_account_registry()
+    registry.remove_missing_file_accounts()
     refresh_mode = 'all' if __config.get('sa_delete_rc_http_500', False) else __config['sa_refresh']
     if globals().get('__sa_refresh') is None and refresh_mode == service_accounts.DEFAULT_REFRESH_MODE:
         refresh_mode = 'stale'
@@ -2066,6 +2105,8 @@ def sa_stats():
         else:
             quota_row = registry.quota_by_account_id(account['id'])
         quota_error = None if quota_row is None else quota_row['last_error']
+        if _handle_service_deactivated(registry, account, quota_error):
+            continue
         if _handle_account_not_found(registry, account, quota_error):
             continue
 
@@ -2073,6 +2114,7 @@ def sa_stats():
     ls_summary = registry.ls_cache_summary()
     rows = registry.all_account_stats()
     active_rows = [row for row in rows if row['status'] == 'active']
+    visible_active_rows = [row for row in active_rows if row['last_about_at'] is not None]
     stale_count = 0
     error_count = 0
     unknown_count = 0
@@ -2119,7 +2161,7 @@ def sa_stats():
                       ''.join('=' for i in range(20)) + " " +
                       ''.join('=' for i in range(20)))
     display_unit = __config['display_unit']
-    for row in active_rows:
+    for row in visible_active_rows:
         account = row['client_email'] or row['account_key'] or str(row['id'])
         if len(account) > 44:
             account = account[:41] + '...'
@@ -2236,14 +2278,15 @@ def _backup_accounts_with_free_space(registry, accounts):
             registry.update_quota(account['id'], quota, error)
             quota_row = registry.quota_by_account_id(account['id'])
         quota_error = None if quota_row is None else quota_row['last_error']
+        if _handle_service_deactivated(registry, account, quota_error):
+            continue
         if _handle_account_not_found(registry, account, quota_error):
             continue
-        free = None if quota_row is None else quota_row['free']
-        if quota_error is not None or free is None or free <= 0:
+        if not service_accounts.has_usable_quota(quota_row):
             logging.warning(
                 'excluding service account from backup: ' +
                 (account['client_email'] or account['account_key']) +
-                ' has no known free space'
+                ' has no known usable quota (missing total/free or quota error)'
             )
             continue
         eligible.append(account)
@@ -2262,6 +2305,23 @@ def _delete_account_not_found_if_requested(registry, account, error):
             (account['client_email'] or account['account_key'])
         )
     return deleted
+
+
+def _handle_service_deactivated(registry, account, error):
+    """Remove Drive-API-disabled projects from the active account pool.
+
+    The credentials are moved to the managed ``service-deactivated`` directory
+    so an operator can re-enable the API and recover them later.
+    """
+    if not _is_drive_api_service_disabled_error(error):
+        return False
+    removed = registry.remove_service_deactivated_account(account['id'], str(error))
+    if removed:
+        logging.warning(
+            'moved service account with disabled Google Drive API to service-deactivated and removed it from SQLite: ' +
+            (account['client_email'] or account['account_key'])
+        )
+    return removed
 
 
 def _delete_account_rc_http_500_if_requested(registry, account, error):
@@ -2298,6 +2358,18 @@ def _is_account_not_found_error(error):
     if error is None:
         return False
     return 'invalid grant: account not found' in ' '.join(str(error).lower().split())
+
+
+def _is_drive_api_service_disabled_error(error):
+    if error is None:
+        return False
+    text = ' '.join(str(error).lower().split())
+    return (
+        'service_disabled' in text or
+        'accessnotconfigured' in text or
+        'google drive api has not been used' in text or
+        'google drive api is not available for project' in text
+    )
 
 
 def _is_rc_http_500_error(error):

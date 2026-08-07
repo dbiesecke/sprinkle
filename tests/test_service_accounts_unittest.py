@@ -99,7 +99,7 @@ class ServiceAccountRegistryTest(unittest.TestCase):
             active = registry.active_accounts()
             self.assertEqual(len(active), 1)
             self.assertEqual(registry.summary_counts(), {"active": 1, "invalid": 1})
-            self.assertTrue(os.path.basename(active[0]["managed_path"]).startswith("sa-"))
+            self.assertTrue(os.path.basename(active[0]["managed_path"]).startswith("unknown-"))
             self.assertEqual(stat.S_IMODE(os.stat(active[0]["managed_path"]).st_mode), 0o600)
             self.assertEqual(stat.S_IMODE(os.stat(store).st_mode), 0o700)
             self.assertEqual(len(os.listdir(os.path.join(store, "quarantine"))), 1)
@@ -167,6 +167,57 @@ class ServiceAccountRegistryTest(unittest.TestCase):
             self.assertEqual(quota["used"], 60)
             self.assertEqual(quota["free"], 40)
             self.assertEqual(quota["last_error"], "rclone about failed")
+
+    def test_quota_error_cannot_reuse_cached_capacity_or_refresh_before_stale(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "source")
+            os.mkdir(source)
+            write_json(os.path.join(source, "one.json"), make_service_account("one@example.test"))
+            registry = service_accounts.ServiceAccountRegistry(
+                os.path.join(tmp, "sa.sqlite3"), os.path.join(tmp, "store"),
+            )
+            registry.import_paths([source])
+            account = registry.active_accounts()[0]
+            registry.update_quota(account["id"], {"total": 100, "used": 10, "free": 90}, None)
+            registry.update_quota(
+                account["id"], None,
+                "rclone about returned unknown quota: missing total,free",
+            )
+
+            quota = registry.quota_by_account_id(account["id"])
+            self.assertFalse(service_accounts.has_usable_quota(quota))
+            self.assertIsNone(registry.eligible_unbound_account(1))
+            self.assertFalse(registry.should_refresh(quota, "stale"))
+            self.assertFalse(registry.should_refresh(quota, "missing"))
+            with registry._connect() as conn:
+                conn.execute(
+                    "UPDATE quota_cache SET updated_at='2000-01-01T00:00:00Z' WHERE account_id=?",
+                    (account["id"],),
+                )
+            self.assertTrue(registry.should_refresh(registry.quota_by_account_id(account["id"]), "stale"))
+
+    def test_cached_unknown_quota_does_not_call_rclone_before_stale(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "source")
+            os.mkdir(source)
+            write_json(os.path.join(source, "one.json"), make_service_account("one@example.test"))
+            registry = service_accounts.ServiceAccountRegistry(
+                os.path.join(tmp, "sa.sqlite3"), os.path.join(tmp, "store"),
+            )
+            registry.import_paths([source])
+            account = registry.active_accounts()[0]
+            registry.assign_remote_names([{"remote": "dst101", "path": account["managed_path"]}])
+            registry.update_quota(account["id"], None, "rclone about returned unknown quota: missing free")
+            calls = []
+            sync = clsync.ClSync.__new__(clsync.ClSync)
+            sync._sa_registry = registry
+            sync._sa_refresh = "stale"
+            sync._rclone = types.SimpleNamespace(
+                get_about_json_with_error=lambda _remote: calls.append(_remote) or ({"total": 100, "free": 99}, None)
+            )
+
+            self.assertIsNone(sync._get_remote_quota("dst101:"))
+            self.assertEqual(calls, [])
 
     def test_quota_delta_clamps_and_keeps_about_timestamp(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -411,6 +462,106 @@ class ServiceAccountRegistryTest(unittest.TestCase):
             self.assertEqual(rows[0]["status"], "invalid")
             self.assertIn("unknown quota", rows[0]["invalid_reason"])
             self.assertEqual(len(os.listdir(os.path.join(tmp, "store", "quarantine"))), 1)
+
+    def test_drive_api_service_disabled_moves_files_and_removes_sqlite_account(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "source")
+            os.mkdir(source)
+            source_path = os.path.join(source, "disabled.json")
+            write_json(source_path, make_service_account("disabled@example.test"))
+            registry = service_accounts.ServiceAccountRegistry(
+                os.path.join(tmp, "sa.sqlite3"), os.path.join(tmp, "store"),
+            )
+            registry.import_paths([source_path])
+            account = registry.active_accounts()[0]
+            managed_path = account["managed_path"]
+            registry.update_quota(account["id"], {"total": 100, "used": 1, "free": 99}, None)
+
+            error = "googleapi: Error 403, accessNotConfigured: Google Drive API has not been used"
+            self.assertTrue(sprinkle._handle_service_deactivated(registry, account, error))
+
+            self.assertEqual(registry.active_accounts(), [])
+            self.assertEqual(registry.all_account_stats(), [])
+            self.assertFalse(os.path.exists(source_path))
+            self.assertFalse(os.path.exists(managed_path))
+            deactivated_dir = os.path.join(tmp, "store", "service-deactivated")
+            self.assertEqual(len(os.listdir(deactivated_dir)), 2)
+            self.assertTrue(all(name.startswith("service-deactivated-") for name in os.listdir(deactivated_dir)))
+
+    def test_service_deactivated_directory_is_not_reimported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = os.path.join(tmp, "store")
+            registry = service_accounts.ServiceAccountRegistry(os.path.join(tmp, "sa.sqlite3"), store)
+            deactivated = os.path.join(store, "service-deactivated", "disabled.json")
+            write_json(deactivated, make_service_account("disabled@example.test"))
+
+            result = registry.import_paths([store])
+
+            self.assertEqual(result.scanned, 0)
+            self.assertEqual(result.imported, 0)
+            self.assertEqual(registry.active_accounts(), [])
+
+    def test_missing_managed_file_removes_account_and_sqlite_caches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "source")
+            os.mkdir(source)
+            source_path = os.path.join(source, "removed.json")
+            write_json(source_path, make_service_account("removed@example.test"))
+            registry = service_accounts.ServiceAccountRegistry(
+                os.path.join(tmp, "sa.sqlite3"), os.path.join(tmp, "store"),
+            )
+            registry.import_paths([source_path])
+            account = registry.active_accounts()[0]
+            registry.update_quota(account["id"], {"total": 100, "used": 1, "free": 99}, None)
+            registry.ensure_rc_slots(["dst101:"])
+            registry.bind_rc_slot("dst101:", account["id"])
+            os.remove(account["managed_path"])
+
+            self.assertEqual(registry.remove_missing_file_accounts(), [account["id"]])
+
+            self.assertEqual(registry.active_accounts(), [])
+            self.assertEqual(registry.all_account_stats(), [])
+            self.assertEqual(registry.empty_rc_slots(["dst101:"]), ["dst101"])
+
+    def test_missing_source_file_removes_account_from_sqlite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "source")
+            os.mkdir(source)
+            source_path = os.path.join(source, "removed.json")
+            write_json(source_path, make_service_account("removed@example.test"))
+            registry = service_accounts.ServiceAccountRegistry(
+                os.path.join(tmp, "sa.sqlite3"), os.path.join(tmp, "store"),
+            )
+            registry.import_paths([source_path])
+            account = registry.active_accounts()[0]
+            os.remove(source_path)
+
+            self.assertEqual(registry.remove_missing_file_accounts(), [account["id"]])
+            self.assertEqual(registry.active_accounts(), [])
+            self.assertTrue(os.path.isfile(account["managed_path"]))
+
+    def test_existing_unknown_managed_file_is_renamed_to_unknown_prefix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "source")
+            os.mkdir(source)
+            source_path = os.path.join(source, "one.json")
+            write_json(source_path, make_service_account("one@example.test"))
+            registry = service_accounts.ServiceAccountRegistry(
+                os.path.join(tmp, "sa.sqlite3"), os.path.join(tmp, "store"),
+            )
+            registry.import_paths([source_path])
+            account = registry.active_accounts()[0]
+            old_path = os.path.join(os.path.dirname(account["managed_path"]), "sa-legacy.json")
+            os.rename(account["managed_path"], old_path)
+            with registry._connect() as conn:
+                conn.execute("UPDATE accounts SET managed_path=? WHERE id=?", (old_path, account["id"]))
+
+            registry.remove_missing_file_accounts()
+
+            migrated = registry.active_accounts()[0]
+            self.assertTrue(os.path.basename(migrated["managed_path"]).startswith("unknown-"))
+            self.assertTrue(os.path.isfile(migrated["managed_path"]))
+            self.assertFalse(os.path.exists(old_path))
 
 
 class RCloneQuotaTest(unittest.TestCase):
@@ -1229,6 +1380,37 @@ class ClSyncPlacementTest(unittest.TestCase):
                 "/",
             )
             self.assertIsNone(cache_row)
+
+    def test_sa_stats_hides_unknown_quota_account_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "source")
+            store = os.path.join(tmp, "store")
+            db_path = os.path.join(tmp, "sa.sqlite3")
+            os.mkdir(source)
+            write_json(os.path.join(source, "unknown.json"), make_service_account("unknown@example.test"))
+            registry = service_accounts.ServiceAccountRegistry(db_path, store)
+            registry.import_paths([source])
+            account = registry.active_accounts()[0]
+            registry.update_quota(account["id"], None, "rclone about returned unknown quota: missing free")
+            messages = []
+            old_print_line = common.print_line
+
+            try:
+                common.print_line = lambda message="": messages.append(message)
+                sprinkle.read_args([
+                    "--sa-db", db_path,
+                    "--sa-store", store,
+                    "--sa-refresh", "none",
+                    "--rclone-env-file", os.path.join(tmp, "rclone.env"),
+                    "sa-stats",
+                ])
+                sprinkle.configure(None)
+                sprinkle.sa_stats()
+            finally:
+                common.print_line = old_print_line
+
+            self.assertIn("unknown:     1", messages)
+            self.assertFalse(any("unknown@example.test" in message for message in messages))
 
     def test_sa_stats_limits_parallel_refreshes_and_serializes_database_updates(self):
         with tempfile.TemporaryDirectory() as tmp:

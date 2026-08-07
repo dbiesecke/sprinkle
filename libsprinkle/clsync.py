@@ -478,7 +478,7 @@ class ClSync:
                 continue
             bound = self._sa_registry.rc_slot_account(remote)
             free = None if bound is None else bound['free']
-            if free is None or int(free) < int(required_size):
+            if not service_accounts.has_usable_quota(bound, required_size):
                 choices.append((0 if free is None else int(free), remote.rstrip(':')))
         if not choices:
             return False
@@ -504,9 +504,11 @@ class ClSync:
         quota, error = self._rclone.get_about_json_with_error(name + ':')
         if error is not None:
             raise Exception('RC slot {} configured but quota check failed: {}'.format(name, str(error)[:300]))
+        if not service_accounts.has_usable_quota(quota):
+            reason = 'RC slot {} configured but returned unknown quota (missing total/free)'.format(name)
+            self._sa_registry.update_quota(account['id'], None, reason)
+            raise Exception(reason)
         free = self._quota_value(quota, 'free')
-        if free is None:
-            raise Exception('RC slot {} configured but returned unknown free quota'.format(name))
         self._sa_registry.bind_rc_slot(name, account['id'])
         self._sa_registry.update_quota(account['id'], quota, None)
         remote = name + ':'
@@ -634,7 +636,12 @@ class ClSync:
         cached = None
         if self._sa_registry is not None:
             cached = self._sa_registry.quota_by_remote(remote)
-            if cached is not None and not self._sa_registry.should_refresh(cached, self._sa_refresh):
+            if cached is not None and not service_accounts.has_usable_quota(cached):
+                reason = cached['last_error'] or 'rclone about returned unknown quota: missing total,free'
+                if self._sa_refresh == 'none' or not self._sa_registry.should_refresh(cached, self._sa_refresh):
+                    self.mark_remote_quota_error_for_run(remote, reason)
+                    return None
+            elif cached is not None and not self._sa_registry.should_refresh(cached, self._sa_refresh):
                 return self._quota_from_row(cached)
             if cached is not None and self._sa_refresh == 'none':
                 return self._quota_from_row(cached)
@@ -648,18 +655,21 @@ class ClSync:
         except Exception as e:
             quota = None
             quota_error = str(e)
+        if quota_error is None and not service_accounts.has_usable_quota(quota):
+            quota_error = 'rclone about returned unknown quota: missing total,free'
+            quota = None
         if quota_error is not None:
             logging.debug('error refreshing quota for ' + remote + ': ' + str(quota_error))
             self.mark_remote_quota_error_for_run(remote, quota_error)
         if self._sa_registry is not None and cached is not None:
             if quota is None:
-                self._sa_registry.update_quota_for_remote(remote, None, 'rclone about failed')
-                return self._quota_from_row(cached)
+                self._sa_registry.update_quota_for_remote(remote, None, quota_error)
+                return None
             self._sa_registry.update_quota_for_remote(remote, quota, None)
         return quota
 
     def _quota_from_row(self, row):
-        if row is None:
+        if not service_accounts.has_usable_quota(row):
             return None
         quota = {}
         for key in ('total', 'used', 'free', 'trashed', 'other', 'objects'):
