@@ -234,6 +234,7 @@ COMMANDS:
     stats                        display volume statistics
     sa-import                    import Google Drive service account files
     sa-stats                     display imported service account statistics
+    rclone-change-sa             replace one managed rclone RC slot account
     restore                      restore files from clustered drives
     removedups                   removes duplicate files
     """
@@ -527,6 +528,30 @@ EXAMPLES:
     sprinkle.py --sa-cache-ttl-hours=72 --sa-refresh=stale sa-stats
     """
     print(usage_sa_stats.__doc__)
+    print(usage_options.__doc__)
+    print(copyrights.__doc__)
+    print(credits.__doc__)
+
+
+def usage_rclone_change_sa():
+    """
+NAME:
+    sprinkle rclone-change-sa - replace a managed rclone RC slot account
+
+SYNOPSIS:
+    sprinkle.py [options] rclone-change-sa {rclone-remote}
+
+DESCRIPTION:
+    Replaces a configured rclone RC slot with the unbound active service
+    account that has the most known free space. The new account is validated
+    with rclone RC before its registry binding is changed. Failed candidates
+    are rolled back and the next eligible account is tried.
+
+EXAMPLES:
+    sprinkle.py rclone-change-sa dst101
+    sprinkle.py rclone-change-sa dst101:
+    """
+    print(usage_rclone_change_sa.__doc__)
     print(usage_options.__doc__)
     print(copyrights.__doc__)
     print(credits.__doc__)
@@ -1971,6 +1996,115 @@ def _service_account_registry():
     )
 
 
+def _rclone_rc_client():
+    return rclone.RClone(
+        None,
+        __config.get('rclone_exe', 'rclone'),
+        __config.get('rclone_retries', '1'),
+        __config.get('rclone_rc_url'),
+        __config.get('rclone_rc_user'),
+        __config.get('rclone_rc_password'),
+        __config.get('rclone_rc_timeout_seconds', 30),
+        __config.get('drive_id'),
+    )
+
+
+def _configured_rc_slot_names():
+    return [str(remote).strip().rstrip(':') for remote in str(
+        __config.get('rclone_rc_remotes') or ''
+    ).split(',') if str(remote).strip().rstrip(':')]
+
+
+def _read_managed_service_account(account):
+    path = account['managed_path']
+    if path in (None, ''):
+        raise Exception('service account has no managed credential file')
+    try:
+        with open(path, 'r') as fp:
+            credentials = json.load(fp)
+    except Exception as exc:
+        raise Exception('unable to read managed service account credential: {}'.format(
+            exc.__class__.__name__
+        ))
+    if not isinstance(credentials, dict):
+        raise Exception('managed service account credential is invalid')
+    return credentials
+
+
+def _restore_rc_slot(rc, slot, previous_account, previous_credentials):
+    if previous_account is None:
+        rc.delete_rc_remote(slot)
+    else:
+        rc.configure_rc_drive_service_account(
+            slot, previous_credentials, __config.get('drive_id')
+        )
+
+
+def rclone_change_sa():
+    if len(__args) != 2:
+        usage_rclone_change_sa()
+        raise Exception('rclone-change-sa requires exactly one rclone remote')
+    if __config.get('rclone_rc_url') in (None, ''):
+        raise Exception('rclone-change-sa requires rclone_rc_url')
+    slots = _configured_rc_slot_names()
+    if not slots:
+        raise Exception('rclone-change-sa requires rclone_rc_remotes')
+    slot = str(__args[1]).strip().rstrip(':')
+    if not slot or slot not in slots:
+        raise Exception('rclone remote must be one of: ' + ', '.join(slots))
+
+    registry = _service_account_registry()
+    registry.remove_missing_file_accounts()
+    registry.ensure_rc_slots(slots)
+    previous_account = registry.rc_slot_account(slot)
+    previous_credentials = None
+    if previous_account is not None:
+        previous_credentials = _read_managed_service_account(previous_account)
+    rc = _rclone_rc_client()
+    errors = []
+
+    while True:
+        candidate = registry.eligible_unbound_account(1)
+        if candidate is None:
+            break
+        configured = False
+        try:
+            credentials = _read_managed_service_account(candidate)
+            rc.configure_rc_drive_service_account(slot, credentials, __config.get('drive_id'))
+            configured = True
+            quota, error = rc.get_about_json_with_error(slot + ':')
+            if error is not None:
+                raise Exception(_friendly_rclone_error(error, candidate))
+            unknown_reason = _quota_unknown_reason(quota)
+            if unknown_reason is not None:
+                raise Exception(unknown_reason)
+            if not service_accounts.has_usable_quota(quota, 1):
+                raise Exception('rclone about returned no positive free quota')
+            registry.update_quota(candidate['id'], quota, None)
+            registry.bind_rc_slot(slot, candidate['id'])
+            common.print_line(
+                'rclone RC slot {} now uses {} (free: {})'.format(
+                    slot, candidate['client_email'], quota['free']
+                )
+            )
+            return
+        except Exception as exc:
+            reason = str(exc)
+            registry.update_quota(candidate['id'], None, reason)
+            errors.append(reason)
+            if configured:
+                try:
+                    _restore_rc_slot(rc, slot, previous_account, previous_credentials)
+                except Exception as restore_exc:
+                    raise Exception(
+                        'failed to validate replacement account and restore RC slot {}: {}'.format(
+                            slot, restore_exc.__class__.__name__
+                        )
+                    )
+    detail = '; '.join(errors[:3]) or 'no unbound active account has known positive free quota'
+    raise Exception('no usable service account available for RC slot {}: {}'.format(slot, detail))
+
+
 def _format_amount(amount, display_unit):
     if amount is None:
         return 'UNKNOWN'
@@ -2605,6 +2739,8 @@ def main(argv):
             sa_import()
         elif __args[0] == 'sa-stats':
             sa_stats()
+        elif __args[0] == 'rclone-change-sa':
+            rclone_change_sa()
         elif __args[0] == 'removedups':
             remove_duplicates()
         elif __args[0] == 'find':
@@ -2629,6 +2765,8 @@ def main(argv):
                     usage_sa_import()
                 elif __args[1] == 'sa-stats':
                     usage_sa_stats()
+                elif __args[1] == 'rclone-change-sa':
+                    usage_rclone_change_sa()
                 elif __args[1] == 'removedups':
                     usage_removedups()
                 elif __args[1] == 'config':

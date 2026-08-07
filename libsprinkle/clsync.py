@@ -512,7 +512,9 @@ class ClSync:
                 credentials = json.load(fp)
         except Exception as exc:
             raise Exception('unable to read managed service account credential: {}'.format(exc.__class__.__name__))
-        self._rclone.configure_rc_drive_service_account(name, credentials)
+        self._rclone.configure_rc_drive_service_account(
+            name, credentials, self._config.get('drive_id')
+        )
         quota, error = self._rclone.get_about_json_with_error(name + ':')
         if error is not None:
             raise Exception('RC slot {} configured but quota check failed: {}'.format(name, str(error)[:300]))
@@ -524,10 +526,45 @@ class ClSync:
         self._sa_registry.bind_rc_slot(name, account['id'])
         self._sa_registry.update_quota(account['id'], quota, None)
         remote = name + ':'
+        # A slot may have been marked exhausted because of its previous
+        # account.  Its new binding has just passed a live quota check, so it
+        # must re-enter this backup run's candidate set.
+        self._run_quota_exhausted_remotes.discard(remote)
         self._cached_free[remote] = free
         if self._frees is not None:
             self._frees[remote] = free
         logging.info('configured RC slot %s for service account %s', name, account['client_email'])
+
+    def _configure_bound_rc_slots_before_backup(self):
+        """Restore each persisted RC slot credential before a backup run.
+
+        The rclone RC server is process-local state and can have been restarted
+        or changed since the registry was last updated.  Push the persisted
+        binding before planning transfers, without exposing credentials in
+        logs.  A failed slot is excluded for this run so another usable slot
+        can still be selected.
+        """
+        if not getattr(self, '_rc_slot_mode', False):
+            return
+        for remote in self._rc_slots:
+            account = self._sa_registry.rc_slot_account(remote)
+            if account is None:
+                continue
+            try:
+                managed_path = account['managed_path']
+                if not managed_path:
+                    raise Exception('service account has no managed credential file')
+                with open(managed_path, 'r') as fp:
+                    credentials = json.load(fp)
+                if not isinstance(credentials, dict):
+                    raise Exception('managed service account credential is invalid')
+                self._rclone.configure_rc_drive_service_account(
+                    remote.rstrip(':'), credentials, self._config.get('drive_id')
+                )
+            except Exception as exc:
+                self.mark_remote_unavailable_for_run(remote, exc)
+                continue
+            logging.info('restored RC slot %s from its persisted service account binding', remote)
 
     def ensure_remote_has_enough_space(self, remote, requested_size):
         required_size = self._required_free_for_upload(requested_size)
@@ -1070,6 +1107,7 @@ class ClSync:
             logging.error("local source " + local_dir + " not found. Cannot continue!")
             raise Exception("Local source " + local_dir + " not found")
         target_remote, target_path = self.parse_backup_target(target)
+        self._configure_bound_rc_slots_before_backup()
         if target_path is None:
             if source_is_remote:
                 remote_root = self.get_backup_remote_root_for_remote_source(source_remote, source_path)

@@ -2058,6 +2058,62 @@ class ClSyncPlacementTest(unittest.TestCase):
         self.assertEqual(sync.get_eligible_remotes(1), ["dst102:"])
         self.assertEqual(sync._cached_free["dst101:"], 0)
 
+    def test_reconfigured_rc_slot_rejoins_run_after_previous_account_was_full(self):
+        sync = clsync.ClSync.__new__(clsync.ClSync)
+        sync._cached_free = {"dst101:": 0}
+        sync._frees = None
+        sync._config = {"drive_id": "folder-id"}
+        sync._run_quota_exhausted_remotes = {"dst101:"}
+        calls = []
+        sync._sa_registry = types.SimpleNamespace(
+            bind_rc_slot=lambda remote, account_id: calls.append(("bind", remote, account_id)),
+            update_quota=lambda account_id, quota, error: calls.append(("quota", account_id, quota, error)),
+        )
+        sync._rclone = types.SimpleNamespace(
+            configure_rc_drive_service_account=lambda remote, credentials, drive_id: calls.append(
+                ("configure", remote, credentials["client_email"], drive_id)
+            ),
+            get_about_json_with_error=lambda remote: ({"total": 100, "free": 80}, None),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "replacement.json")
+            write_json(path, make_service_account("replacement@example.test"))
+            sync._configure_rc_slot("dst101", {
+                "id": 7,
+                "managed_path": path,
+                "client_email": "replacement@example.test",
+            })
+
+        self.assertNotIn("dst101:", sync._run_quota_exhausted_remotes)
+        self.assertEqual(sync._cached_free["dst101:"], 80)
+        self.assertEqual(calls[0], ("configure", "dst101", "replacement@example.test", "folder-id"))
+
+    def test_backup_preflight_restores_persisted_rc_slot_credentials(self):
+        sync = clsync.ClSync.__new__(clsync.ClSync)
+        sync._rc_slot_mode = True
+        sync._rc_slots = ["dst101:"]
+        sync._config = {"drive_id": "folder-id"}
+        sync._run_unavailable_remotes = {}
+        configured = []
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "bound.json")
+            write_json(path, make_service_account("bound@example.test"))
+            sync._sa_registry = types.SimpleNamespace(
+                rc_slot_account=lambda remote: {
+                    "managed_path": path,
+                    "client_email": "bound@example.test",
+                } if remote == "dst101:" else None,
+            )
+            sync._rclone = types.SimpleNamespace(
+                configure_rc_drive_service_account=lambda remote, credentials, drive_id: configured.append(
+                    (remote, credentials["client_email"], drive_id)
+                )
+            )
+            sync._configure_bound_rc_slots_before_backup()
+
+        self.assertEqual(configured, [("dst101", "bound@example.test", "folder-id")])
+        self.assertEqual(sync._run_unavailable_remotes, {})
+
     def test_quota_query_failure_is_attempted_once_per_backup_run(self):
         sync = clsync.ClSync.__new__(clsync.ClSync)
         sync._distribution_type = "mas"
@@ -2340,6 +2396,134 @@ class ClSyncPlacementTest(unittest.TestCase):
 
 
 class ServiceAccountCliTest(unittest.TestCase):
+    def test_rclone_change_sa_rejects_remote_outside_configured_slots(self):
+        old_config = getattr(sprinkle, "__config", None)
+        old_args = getattr(sprinkle, "__args", None)
+        try:
+            setattr(sprinkle, "__config", {
+                "rclone_rc_url": "http://rc.example.test",
+                "rclone_rc_remotes": "dst101,dst102",
+            })
+            setattr(sprinkle, "__args", ["rclone-change-sa", "dst999:"])
+            with self.assertRaisesRegex(Exception, "dst101, dst102"):
+                sprinkle.rclone_change_sa()
+        finally:
+            setattr(sprinkle, "__config", old_config)
+            setattr(sprinkle, "__args", old_args)
+
+    def test_rclone_change_sa_rebinds_slot_to_largest_free_unbound_account(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "source")
+            os.mkdir(source)
+            for name, email in (("old", "old@example.test"), ("low", "low@example.test"),
+                                ("high", "high@example.test")):
+                write_json(os.path.join(source, name + ".json"), make_service_account(email, name))
+            registry = service_accounts.ServiceAccountRegistry(
+                os.path.join(tmp, "sa.sqlite3"), os.path.join(tmp, "store")
+            )
+            quotas = iter((
+                ({"total": 100, "free": 10}, None),
+                ({"total": 100, "free": 30}, None),
+                ({"total": 100, "free": 80}, None),
+            ))
+            registry.import_paths([source], validator=lambda _path, _payload: next(quotas))
+            accounts = dict((account["client_email"], account) for account in registry.active_accounts())
+            registry.ensure_rc_slots(["dst101:"])
+            registry.bind_rc_slot("dst101:", accounts["old@example.test"]["id"])
+            calls = []
+
+            class FakeRC(object):
+                def configure_rc_drive_service_account(self, slot, credentials, drive_id):
+                    calls.append(("configure", slot, credentials["client_email"], drive_id))
+
+                def get_about_json_with_error(self, slot):
+                    calls.append(("about", slot))
+                    return {"total": 100, "free": 75}, None
+
+            old_config = getattr(sprinkle, "__config", None)
+            old_args = getattr(sprinkle, "__args", None)
+            old_client = sprinkle._rclone_rc_client
+            old_print_line = common.print_line
+            messages = []
+            try:
+                setattr(sprinkle, "__config", {
+                    "sa_db": registry.db_path, "sa_store": registry.store_dir,
+                    "sa_cache_ttl_hours": 24, "rclone_rc_url": "http://rc.example.test",
+                    "rclone_rc_remotes": "dst101,dst102", "drive_id": "folder-id",
+                })
+                setattr(sprinkle, "__args", ["rclone-change-sa", "dst101:"])
+                sprinkle._rclone_rc_client = lambda: FakeRC()
+                common.print_line = lambda message="": messages.append(message)
+                sprinkle.rclone_change_sa()
+            finally:
+                setattr(sprinkle, "__config", old_config)
+                setattr(sprinkle, "__args", old_args)
+                sprinkle._rclone_rc_client = old_client
+                common.print_line = old_print_line
+
+            self.assertEqual(registry.rc_slot_account("dst101:")["client_email"], "high@example.test")
+            self.assertEqual(calls, [
+                ("configure", "dst101", "high@example.test", "folder-id"),
+                ("about", "dst101:"),
+            ])
+            self.assertTrue(any("high@example.test" in message for message in messages))
+
+    def test_rclone_change_sa_restores_slot_and_tries_next_account_after_failed_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "source")
+            os.mkdir(source)
+            for name, email in (("old", "old@example.test"), ("first", "first@example.test"),
+                                ("second", "second@example.test")):
+                write_json(os.path.join(source, name + ".json"), make_service_account(email, name))
+            registry = service_accounts.ServiceAccountRegistry(
+                os.path.join(tmp, "sa.sqlite3"), os.path.join(tmp, "store")
+            )
+            quotas = iter((
+                ({"total": 100, "free": 10}, None),
+                ({"total": 100, "free": 80}, None),
+                ({"total": 100, "free": 70}, None),
+            ))
+            registry.import_paths([source], validator=lambda _path, _payload: next(quotas))
+            accounts = dict((account["client_email"], account) for account in registry.active_accounts())
+            registry.ensure_rc_slots(["dst101:"])
+            registry.bind_rc_slot("dst101:", accounts["old@example.test"]["id"])
+            configured = []
+
+            class FakeRC(object):
+                def configure_rc_drive_service_account(self, _slot, credentials, _drive_id):
+                    configured.append(credentials["client_email"])
+
+                def get_about_json_with_error(self, _slot):
+                    if configured[-1] == "first@example.test":
+                        return None, "rclone RC timeout"
+                    return {"total": 100, "free": 60}, None
+
+            old_config = getattr(sprinkle, "__config", None)
+            old_args = getattr(sprinkle, "__args", None)
+            old_client = sprinkle._rclone_rc_client
+            old_print_line = common.print_line
+            try:
+                setattr(sprinkle, "__config", {
+                    "sa_db": registry.db_path, "sa_store": registry.store_dir,
+                    "sa_cache_ttl_hours": 24, "rclone_rc_url": "http://rc.example.test",
+                    "rclone_rc_remotes": "dst101", "drive_id": "folder-id",
+                })
+                setattr(sprinkle, "__args", ["rclone-change-sa", "dst101"])
+                sprinkle._rclone_rc_client = lambda: FakeRC()
+                common.print_line = lambda _message="": None
+                sprinkle.rclone_change_sa()
+            finally:
+                setattr(sprinkle, "__config", old_config)
+                setattr(sprinkle, "__args", old_args)
+                sprinkle._rclone_rc_client = old_client
+                common.print_line = old_print_line
+
+            self.assertEqual(configured, [
+                "first@example.test", "old@example.test", "second@example.test",
+            ])
+            self.assertEqual(registry.rc_slot_account("dst101:")["client_email"], "second@example.test")
+            self.assertIn("timeout", registry.quota_by_account_id(accounts["first@example.test"]["id"])["last_error"])
+
     def test_sprinkle_service_account_target_is_not_treated_as_external_remote(self):
         self.assertTrue(sprinkle._is_sprinkle_service_account_target("dst101:/"))
         self.assertTrue(sprinkle._is_sprinkle_service_account_target("dst136:/roms"))
