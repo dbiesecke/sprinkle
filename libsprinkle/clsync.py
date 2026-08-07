@@ -98,10 +98,11 @@ class ClSync:
         self._sizes = None
         self._frees = None
         self._show_progress = config['show_progress']
-        # Keep only two active upload streams.  More streams provide little
-        # benefit for the small service-account quotas and make full-account
-        # recovery harder to reason about.
-        self._backup_transfer_workers = BACKUP_TRANSFER_WORKERS
+        # Limit concurrent upload streams while allowing operators to tune the
+        # setting for their rclone RC server and available Drive accounts.
+        self._backup_transfer_workers = max(
+            1, int(config.get('backup_transfer_workers', BACKUP_TRANSFER_WORKERS))
+        )
         self._backup_transfer_lock = threading.Lock()
         self._reserved_free = {}
 
@@ -1158,7 +1159,7 @@ class ClSync:
             add_batches = self._directory_add_batches(ops)
             common.print_line(
                 'dry-run plan: {} operation(s), {} directory batch(es), {} transfer worker(s)'.format(
-                    len(ops), len(add_batches), BACKUP_TRANSFER_WORKERS
+                    len(ops), len(add_batches), getattr(self, '_backup_transfer_workers', 1)
                 )
             )
             if self._show_progress:
@@ -1186,7 +1187,7 @@ class ClSync:
 
         parallel_add_ids = set()
         worker_count = getattr(self, '_backup_transfer_workers', 1)
-        if (not dry_run and not self._show_progress and worker_count == BACKUP_TRANSFER_WORKERS):
+        if not dry_run and worker_count > 1:
             directory_batches = self._directory_add_batches(ops)
             if directory_batches:
                 parallel_add_ids = set(id(op) for batch in directory_batches for op in batch)
@@ -1198,7 +1199,7 @@ class ClSync:
                         except Exception as exc:
                             record_failure(add_op, exc)
 
-                with ThreadPoolExecutor(max_workers=BACKUP_TRANSFER_WORKERS) as executor:
+                with ThreadPoolExecutor(max_workers=worker_count) as executor:
                     futures = [executor.submit(copy_batch, batch) for batch in directory_batches]
                     for future in futures:
                         future.result()

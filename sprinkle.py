@@ -539,17 +539,18 @@ NAME:
     sprinkle rclone-change-sa - replace a managed rclone RC slot account
 
 SYNOPSIS:
-    sprinkle.py [options] rclone-change-sa {rclone-remote}
+    sprinkle.py [options] rclone-change-sa {rclone-remote...}
 
 DESCRIPTION:
-    Replaces a configured rclone RC slot with the unbound active service
-    account that has the most known free space. The new account is validated
-    with rclone RC before its registry binding is changed. Failed candidates
-    are rolled back and the next eligible account is tried.
+    Replaces one or more configured rclone RC slots with unbound active
+    service accounts that have the most known free space. Each new account is
+    validated with rclone RC before its registry binding is changed. Failed
+    candidates are rolled back and the next eligible account is tried.
 
 EXAMPLES:
     sprinkle.py rclone-change-sa dst101
     sprinkle.py rclone-change-sa dst101:
+    sprinkle.py rclone-change-sa dst101 dst102
     """
     print(usage_rclone_change_sa.__doc__)
     print(usage_options.__doc__)
@@ -824,7 +825,6 @@ def read_args(argv):
             __rclone_sa_count = int(arg)
         elif opt in ("--drive-id"):
             __drive_id = arg
-            __ls_stop_first = True
         elif opt in ("--sa-db"):
             __sa_db = arg
         elif opt in ("--sa-store"):
@@ -943,7 +943,7 @@ def configure(config_file):
         "rclone_sa_count": None,
         "log_file": None,
         "single_instance": False,
-        "ls_stop_first": True,
+        "ls_stop_first": False,
         "check_prereq": False,
         "daemon_type": 'interval',
         "daemon_mode": False,
@@ -958,6 +958,7 @@ def configure(config_file):
         "sa_delete_rc_http_500": False,
         "sa_group_size": 50,
         "sa_stats_workers": 4,
+        "backup_transfer_workers": clsync.BACKUP_TRANSFER_WORKERS,
         "large_file_threshold_bytes": clsync.DEFAULT_LARGE_FILE_THRESHOLD_BYTES,
         "large_file_min_free_bytes": clsync.DEFAULT_LARGE_FILE_MIN_FREE_BYTES,
         "large_file_min_free_percent": clsync.DEFAULT_LARGE_FILE_MIN_FREE_PERCENT
@@ -1150,6 +1151,7 @@ def normalize_config_types(config_values):
         'sa_cache_ttl_hours',
         'sa_group_size',
         'sa_stats_workers',
+        'backup_transfer_workers',
         'rclone_rc_timeout_seconds',
         'rclone_sa_count',
         'large_file_threshold_bytes',
@@ -1162,7 +1164,7 @@ def normalize_config_types(config_values):
     for field in int_fields:
         if field in config_values and config_values[field] not in (None, ''):
             config_values[field] = int(config_values[field])
-    for field in ('sa_stats_workers', 'rclone_rc_timeout_seconds'):
+    for field in ('sa_stats_workers', 'rclone_rc_timeout_seconds', 'backup_transfer_workers'):
         if int(config_values[field]) < 1:
             raise ValueError('{} must be a positive integer'.format(field))
 
@@ -1502,6 +1504,10 @@ rclone_rc_timeout_seconds=30
 # Maps ordinary absolute backup paths to an RC-server local remote, for example mylocal:/srv/backups.
 # rclone_rc_local_remote=mylocal
 
+# Number of concurrent file-transfer workers during backup. Set to 1 to disable
+# parallel transfers. The default is 2, which is appropriate for small Drive quotas.
+backup_transfer_workers=2
+
 # delete_files: delete files after 1-way sync
 # delete_files=false (leave files not locally present on remote drives)
 # delete_files=true (delete files not locally present from remote drives) (default)
@@ -1526,7 +1532,7 @@ sa_delete_rc_http_500=false
 sa_delete_account_not_found=false
 sa_group_size=50
 sa_stats_workers=4
-ls_stop_first=true
+ls_stop_first=false
 
 # Large-file upload selection keeps enough headroom on small Google Drive accounts.
 # Defaults require an extra 512 MiB or 5%, whichever is larger, for files >= 1 GiB.
@@ -2040,27 +2046,11 @@ def _restore_rc_slot(rc, slot, previous_account, previous_credentials):
         )
 
 
-def rclone_change_sa():
-    if len(__args) != 2:
-        usage_rclone_change_sa()
-        raise Exception('rclone-change-sa requires exactly one rclone remote')
-    if __config.get('rclone_rc_url') in (None, ''):
-        raise Exception('rclone-change-sa requires rclone_rc_url')
-    slots = _configured_rc_slot_names()
-    if not slots:
-        raise Exception('rclone-change-sa requires rclone_rc_remotes')
-    slot = str(__args[1]).strip().rstrip(':')
-    if not slot or slot not in slots:
-        raise Exception('rclone remote must be one of: ' + ', '.join(slots))
-
-    registry = _service_account_registry()
-    registry.remove_missing_file_accounts()
-    registry.ensure_rc_slots(slots)
+def _change_rc_slot_service_account(registry, rc, slot):
     previous_account = registry.rc_slot_account(slot)
     previous_credentials = None
     if previous_account is not None:
         previous_credentials = _read_managed_service_account(previous_account)
-    rc = _rclone_rc_client()
     errors = []
 
     while True:
@@ -2103,6 +2093,41 @@ def rclone_change_sa():
                     )
     detail = '; '.join(errors[:3]) or 'no unbound active account has known positive free quota'
     raise Exception('no usable service account available for RC slot {}: {}'.format(slot, detail))
+
+
+def rclone_change_sa():
+    if len(__args) < 2:
+        usage_rclone_change_sa()
+        raise Exception('rclone-change-sa requires at least one rclone remote')
+    if __config.get('rclone_rc_url') in (None, ''):
+        raise Exception('rclone-change-sa requires rclone_rc_url')
+    configured_slots = _configured_rc_slot_names()
+    if not configured_slots:
+        raise Exception('rclone-change-sa requires rclone_rc_remotes')
+    requested_slots = []
+    for value in __args[1:]:
+        slot = str(value).strip().rstrip(':')
+        if not slot or slot not in configured_slots:
+            raise Exception('rclone remote must be one of: ' + ', '.join(configured_slots))
+        if slot not in requested_slots:
+            requested_slots.append(slot)
+
+    registry = _service_account_registry()
+    registry.remove_missing_file_accounts()
+    registry.ensure_rc_slots(configured_slots)
+    rc = _rclone_rc_client()
+    failures = []
+    for slot in requested_slots:
+        try:
+            _change_rc_slot_service_account(registry, rc, slot)
+        except Exception as exc:
+            failures.append('{}: {}'.format(slot, str(exc)))
+    if failures:
+        raise Exception(
+            'rclone-change-sa completed with {} failed slot(s): {}'.format(
+                len(failures), ' | '.join(failures)
+            )
+        )
 
 
 def _format_amount(amount, display_unit):

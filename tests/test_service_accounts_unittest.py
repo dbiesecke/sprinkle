@@ -2468,6 +2468,60 @@ class ServiceAccountCliTest(unittest.TestCase):
             ])
             self.assertTrue(any("high@example.test" in message for message in messages))
 
+    def test_rclone_change_sa_accepts_multiple_slots_and_uses_distinct_accounts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "source")
+            os.mkdir(source)
+            for name, email in (("old_one", "old-one@example.test"), ("old_two", "old-two@example.test"),
+                                ("first", "first@example.test"), ("second", "second@example.test")):
+                write_json(os.path.join(source, name + ".json"), make_service_account(email, name))
+            registry = service_accounts.ServiceAccountRegistry(
+                os.path.join(tmp, "sa.sqlite3"), os.path.join(tmp, "store")
+            )
+            quotas = iter((
+                ({"total": 100, "free": 5}, None), ({"total": 100, "free": 6}, None),
+                ({"total": 100, "free": 80}, None), ({"total": 100, "free": 70}, None),
+            ))
+            registry.import_paths([source], validator=lambda _path, _payload: next(quotas))
+            accounts = dict((account["client_email"], account) for account in registry.active_accounts())
+            registry.ensure_rc_slots(["dst101:", "dst102:"])
+            registry.bind_rc_slot("dst101:", accounts["old-one@example.test"]["id"])
+            registry.bind_rc_slot("dst102:", accounts["old-two@example.test"]["id"])
+            configured = []
+
+            class FakeRC(object):
+                def configure_rc_drive_service_account(self, slot, credentials, _drive_id):
+                    configured.append((slot, credentials["client_email"]))
+
+                def get_about_json_with_error(self, _slot):
+                    return {"total": 100, "free": 60}, None
+
+            old_config = getattr(sprinkle, "__config", None)
+            old_args = getattr(sprinkle, "__args", None)
+            old_client = sprinkle._rclone_rc_client
+            old_print_line = common.print_line
+            try:
+                setattr(sprinkle, "__config", {
+                    "sa_db": registry.db_path, "sa_store": registry.store_dir,
+                    "sa_cache_ttl_hours": 24, "rclone_rc_url": "http://rc.example.test",
+                    "rclone_rc_remotes": "dst101,dst102", "drive_id": "folder-id",
+                })
+                setattr(sprinkle, "__args", ["rclone-change-sa", "dst101:", "dst102"])
+                sprinkle._rclone_rc_client = lambda: FakeRC()
+                common.print_line = lambda _message="": None
+                sprinkle.rclone_change_sa()
+            finally:
+                setattr(sprinkle, "__config", old_config)
+                setattr(sprinkle, "__args", old_args)
+                sprinkle._rclone_rc_client = old_client
+                common.print_line = old_print_line
+
+            self.assertEqual(configured, [
+                ("dst101", "first@example.test"), ("dst102", "second@example.test"),
+            ])
+            self.assertEqual(registry.rc_slot_account("dst101:")["client_email"], "first@example.test")
+            self.assertEqual(registry.rc_slot_account("dst102:")["client_email"], "second@example.test")
+
     def test_rclone_change_sa_restores_slot_and_tries_next_account_after_failed_validation(self):
         with tempfile.TemporaryDirectory() as tmp:
             source = os.path.join(tmp, "source")
@@ -2998,9 +3052,10 @@ class ServiceAccountCliTest(unittest.TestCase):
             self.assertIn("sa_cache_ttl_hours=72", content)
             self.assertIn("sa_refresh=stale", content)
             self.assertIn("sa_clean_invalid=quarantine", content)
-            self.assertIn("ls_stop_first=true", content)
+            self.assertIn("ls_stop_first=false", content)
             self.assertIn("rclone_env_file=~/.sprinkle/rclone.env", content)
             self.assertIn("rclone_rc_timeout_seconds=30", content)
+            self.assertIn("backup_transfer_workers=2", content)
             self.assertIn("sa_stats_workers=4", content)
             self.assertIn("large_file_threshold_bytes=1073741824", content)
 
@@ -3133,7 +3188,7 @@ class ServiceAccountCliTest(unittest.TestCase):
                 content = fp.read()
 
             self.assertTrue(getattr(sprinkle, "__config")["debug"])
-            self.assertTrue(getattr(sprinkle, "__config")["ls_stop_first"])
+            self.assertFalse(getattr(sprinkle, "__config")["ls_stop_first"])
             self.assertFalse(getattr(sprinkle, "__config")["delete_files"])
             self.assertEqual(content.count("[dst"), 1)
             self.assertIn("root_folder_id = drive-id", content)
