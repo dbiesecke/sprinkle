@@ -75,6 +75,12 @@ class ClSync:
                 config.get('sa_store'),
                 config.get('sa_cache_ttl_hours', service_accounts.DEFAULT_CACHE_TTL_HOURS),
             )
+        self._rc_slots = [str(remote).rstrip(':') + ':' for remote in str(
+            config.get('rclone_rc_remotes') or ''
+        ).split(',') if str(remote).strip().rstrip(':')]
+        self._rc_slot_mode = bool(config.get('rclone_rc_url') and self._rc_slots and self._sa_registry)
+        if getattr(self, '_rc_slot_mode', False):
+            self._sa_registry.ensure_rc_slots(self._rc_slots)
         if 'compare_method' in config:
             self._compare_method = config['compare_method']
         else:
@@ -424,6 +430,8 @@ class ClSync:
             logging.error('distribution mode ' + self._distribution_type + ' not supported.')
             raise Exception('unsupported distribution mode ' + self._distribution_type)
         required_size = self._required_free_for_upload(requested_size)
+        if getattr(self, '_rc_slot_mode', False):
+            self._bind_empty_rc_slots(required_size)
         logging.debug(
             'selecting remotes with enough available space to store size: ' +
             str(requested_size) + ', required free: ' + str(required_size)
@@ -441,7 +449,71 @@ class ClSync:
             if size is not None and required_size <= size:
                 candidates.append((size, remote))
         candidates.sort(reverse=True)
-        return [remote for _size, remote in candidates]
+        if candidates:
+            return [remote for _size, remote in candidates]
+        if getattr(self, '_rc_slot_mode', False) and self._rotate_rc_slot(required_size):
+            # The new binding has a fresh cached quota; repeat normal filtering.
+            return self.get_eligible_remotes(requested_size)
+        return []
+
+    def _bind_empty_rc_slots(self, required_size):
+        for name in self._sa_registry.empty_rc_slots(self._rc_slots):
+            account = self._sa_registry.eligible_unbound_account(required_size)
+            if account is None:
+                return
+            try:
+                self._configure_rc_slot(name, account)
+            except Exception as exc:
+                self.mark_remote_unavailable_for_run(name + ':', exc)
+                return
+
+    def _rotate_rc_slot(self, required_size):
+        """Replace a full configured slot only when the next file cannot fit."""
+        account = self._sa_registry.eligible_unbound_account(required_size)
+        if account is None:
+            return False
+        choices = []
+        for remote in self._rc_slots:
+            if remote in self._run_unavailable_remotes:
+                continue
+            bound = self._sa_registry.rc_slot_account(remote)
+            free = None if bound is None else bound['free']
+            if free is None or int(free) < int(required_size):
+                choices.append((0 if free is None else int(free), remote.rstrip(':')))
+        if not choices:
+            return False
+        _free, name = sorted(choices)[0]
+        try:
+            self._configure_rc_slot(name, account)
+            return True
+        except Exception as exc:
+            self.mark_remote_unavailable_for_run(name + ':', exc)
+            return False
+
+    def _configure_rc_slot(self, name, account):
+        """Push credentials to RC and bind only after RC reports known quota."""
+        managed_path = account['managed_path']
+        if not managed_path:
+            raise Exception('service account has no managed credential file')
+        try:
+            with open(managed_path, 'r') as fp:
+                credentials = json.load(fp)
+        except Exception as exc:
+            raise Exception('unable to read managed service account credential: {}'.format(exc.__class__.__name__))
+        self._rclone.configure_rc_drive_service_account(name, credentials)
+        quota, error = self._rclone.get_about_json_with_error(name + ':')
+        if error is not None:
+            raise Exception('RC slot {} configured but quota check failed: {}'.format(name, str(error)[:300]))
+        free = self._quota_value(quota, 'free')
+        if free is None:
+            raise Exception('RC slot {} configured but returned unknown free quota'.format(name))
+        self._sa_registry.bind_rc_slot(name, account['id'])
+        self._sa_registry.update_quota(account['id'], quota, None)
+        remote = name + ':'
+        self._cached_free[remote] = free
+        if self._frees is not None:
+            self._frees[remote] = free
+        logging.info('configured RC slot %s for service account %s', name, account['client_email'])
 
     def ensure_remote_has_enough_space(self, remote, requested_size):
         required_size = self._required_free_for_upload(requested_size)

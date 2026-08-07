@@ -48,6 +48,21 @@ The first command copies `movie.mkv` to `hidrive:/movie.mkv`. The second copies 
 `hidrive:/roms/`; the third copies its contents beneath `hidrive:/archive/`. Single-file backups never
 delete unrelated objects from the target directory.
 
+## Rotating service-account union backups
+
+`backup-union` is an opt-in clustered backup mode that writes each batch through an rclone Union remote:
+
+```bash
+python3 sprinkle.py --drive-id DRIVE_ID --rclone-sa-count 20 backup-union /local/roms
+```
+
+Only active service accounts with a known usable quota are selected. On a confirmed Google
+`storageQuotaExceeded` response, Sprinkle closes that batch and continues with one fresh random batch.
+Completed batches remain read-only union upstreams, so a later invocation sees files already stored by
+earlier batches. Batch metadata (account IDs, order, status, and timestamps) is kept in `sa_db`; credentials
+are never stored there. `--rclone-move`, `--dry-run`, `--delete-files`, explicit targets, Drive roots, and
+the large-file free-space headroom rule apply as they do for `backup`.
+
 ## Rclone configuration isolation
 
 Sprinkle ignores `RCLONE_CONFIG` from both the process environment and `rclone_env_file`. This avoids
@@ -105,12 +120,12 @@ Set an RC URL to run listings, quota queries, transfers, and deletions through t
 starting local rclone processes:
 
 ```ini
-rclone_rc_url=https://rclone.example.invalid
+rclone_rc_url=http://rclone.example.invalid
 rclone_rc_user=quota-reader
 rclone_rc_password=store-this-outside-version-control
 rclone_rc_timeout_seconds=30
 sa_stats_workers=4
-# Use pre-provisioned RC destinations directly for backup placement.
+# Use reusable RC Drive slots for backup placement.
 rclone_rc_remotes=dst101,dst102
 # Map literal backup paths to this local remote on the RC host.
 rclone_rc_local_remote=mylocal
@@ -118,21 +133,23 @@ rclone_rc_local_remote=mylocal
 
 The corresponding command-line options are `--rclone-rc-url`, `--rclone-rc-user`,
 `--rclone-rc-password`, `--rclone-rc-timeout-seconds`, and `--sa-stats-workers`. RC never falls back to
-local rclone after an error. The server must already expose the same stable `dst101`, `dst102`, … account
-mapping as Sprinkle. `rclone_rc_local_remote` maps a literal path such as `/srv/media` to
-`mylocal:/srv/media` on the RC host, so the source files must be present there. Keep the RC server private and
-protected by TLS plus authentication; do not commit
-credentials. Set `rclone_rc_remotes` to use pre-provisioned RC destinations directly and skip local
-service-account rclone-config generation. Prefer the `SPRINKLE_RCLONE_RC_PASSWORD` environment variable over
+local rclone after an error. `rclone_rc_remotes` names a fixed pool of reusable RC Drive slots; Sprinkle installs
+the selected credential immediately before a slot is used and rotates it only after the current account cannot
+fit the next upload. `rclone_rc_local_remote` maps a literal path such as `/srv/media` to
+`mylocal:/srv/media` on the RC host, so the source files must be present there. HTTP and HTTPS RC endpoints are
+both supported; authenticate the server when it is reachable by other hosts and do not commit credentials.
+Set `rclone_rc_remotes` to use reusable RC Drive slots and skip local service-account rclone-config generation.
+Prefer the `SPRINKLE_RCLONE_RC_PASSWORD` environment variable over
 storing an RC password in a config file.
 For clustered Google Drive backups, `drive_id` is required even in RC mode. Sprinkle passes it as rclone's
 per-remote `root_folder_id` override for every configured `dst*` destination, while leaving `mylocal:` and
 explicit non-cluster remotes unchanged.
 
 Service-account JSON contains secrets. Do not print, log, or commit it. Duplicate account JSON is counted and
-skipped without adding a managed file or SQLite account record. When RC is configured, `sa-import` validates the
-candidate through `operations/about` on its prospective stable `dstNNN` remote; provision the identical mapping on
-the RC server first. Imports with unknown quota or failed validation are quarantined by default.
+skipped without adding a managed file or SQLite account record. `sa-import` always validates candidates locally;
+with RC configured, it validates in parallel using `sa_stats_workers`. Imports with unknown quota or failed
+validation are quarantined by default. RC configuration errors are reported separately and do not quarantine a
+credential that validated locally.
 
 Use `--sa-delete-account-not-found` only when source JSON files should be removed after the exact Google
 error `Invalid grant: account not found`. Other quota and credential errors never trigger this deletion.

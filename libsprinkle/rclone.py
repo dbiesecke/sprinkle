@@ -14,15 +14,24 @@ import json
 import os
 import random
 import base64
+import re
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 from libsprinkle import common
 from libsprinkle import exceptions
 
 
+def _safe_rc_error_detail(value):
+    """Keep RC diagnostics useful without allowing config payloads into logs."""
+    text = ' '.join(str(value).split())
+    if re.search(r'(?i)(private_key|service_account_credentials)', text):
+        return 'service account credentials redacted'
+    return re.sub(r'(?i)(password|secret|token)\s*[=:]\s*[^,\s}]+', r'\1=<redacted>', text)[:300]
+
+
 def default_rclone_config_file():
-    if os.environ.get("RCLONE_CONFIG") not in (None, ""):
-        return os.path.expanduser(os.environ.get("RCLONE_CONFIG"))
+    # Sprinkle owns the generated service-account config.  Do not inherit an
+    # unrelated process-level RCLONE_CONFIG when selecting a classic base file.
     return os.path.join(os.path.expanduser("~"), ".config", "rclone", "rclone.conf")
 
 
@@ -182,6 +191,27 @@ def generate_rclone_combine_config(upstreams, output_file, group_size=50, prefix
         conf_fp.write(config_text)
     return config_text
 
+
+def append_union_config(output_file, union_name, writable_remotes, readonly_remotes):
+    """Append a union remote without putting credentials in its upstream list."""
+    upstreams = [str(name).rstrip(':') + ':' for name in writable_remotes]
+    # ``remote::ro`` is rclone's root-path read-only upstream notation.
+    upstreams.extend(str(name).rstrip(':') + '::ro' for name in readonly_remotes)
+    if not upstreams:
+        raise ValueError('union requires at least one upstream')
+    lines = [
+        '[{}]'.format(union_name.rstrip(':')),
+        'type = union',
+        'upstreams = ' + ' '.join(upstreams),
+        'create_policy = mfs',
+        # A stable search order makes the read view reproducible between retries.
+        'search_policy = ff',
+        '',
+    ]
+    with open(output_file, 'a') as conf_fp:
+        conf_fp.write('\n' + '\n'.join(lines))
+    return '\n'.join(lines)
+
 class RClone:
 
     def __init__(self, config_file=None, rclone_exe="rclone", rclone_retries="1",
@@ -236,7 +266,7 @@ class RClone:
                             body = str(parsed.get('error') or parsed.get('message') or body)
                     except ValueError:
                         pass
-                    detail = ' ' + ' '.join(body.split())[:300]
+                    detail = ' ' + _safe_rc_error_detail(body)
             except Exception:
                 pass
             finally:
@@ -249,8 +279,72 @@ class RClone:
         if not isinstance(result, dict):
             raise Exception('rclone RC {} returned invalid json'.format(endpoint))
         if result.get('error') not in (None, '', False):
-            raise Exception('rclone RC {} failed: {}'.format(endpoint, str(result['error'])[:300]))
+            raise Exception('rclone RC {} failed: {}'.format(endpoint, _safe_rc_error_detail(result['error'])))
         return result
+
+    def configure_rc_drive_service_account(self, remote, credentials, root_folder_id=None):
+        """Install one service account into an explicitly managed RC slot.
+
+        ``credentials`` is deliberately accepted in-memory: it must never be
+        written to a local rclone config or included in diagnostic logging.
+        """
+        name = str(remote).rstrip(':')
+        if not name:
+            raise ValueError('rclone RC slot name is empty')
+        if not isinstance(credentials, dict):
+            raise ValueError('service account credentials are invalid')
+        parameters = {
+            'type': 'drive',
+            'service_account_credentials': json.dumps(credentials, separators=(',', ':')),
+            'service_account_file': '',
+            'env_auth': 'false',
+        }
+        if root_folder_id not in (None, ''):
+            parameters['root_folder_id'] = str(root_folder_id)
+        return self._rc_call('config/update', {
+            'name': name,
+            'parameters': parameters,
+            'opt': {'noOutput': True},
+        })
+
+    def configure_rc_union(self, remote, writable_remotes, readonly_remotes):
+        name = str(remote).rstrip(':')
+        upstreams = [str(item).rstrip(':') + ':' for item in writable_remotes]
+        upstreams.extend(str(item).rstrip(':') + '::ro' for item in readonly_remotes)
+        if not name or not upstreams:
+            raise ValueError('rclone RC union requires a name and upstreams')
+        return self._rc_call('config/update', {
+            'name': name,
+            'parameters': {
+                'type': 'union', 'upstreams': ' '.join(upstreams),
+                'create_policy': 'mfs', 'search_policy': 'ff',
+            },
+            'opt': {'noOutput': True},
+        })
+
+    def delete_rc_remote(self, remote):
+        return self._rc_call('config/delete', {'name': str(remote).rstrip(':'), 'opt': {'noOutput': True}})
+
+    def transfer(self, src, dst, move=False, delete_files=False, dry_run=False):
+        """Transfer a whole source tree; used by durable union batches."""
+        operation = 'move' if move else ('sync' if delete_files else 'copy')
+        if self._rc_url is not None:
+            if dry_run:
+                return []
+            endpoint = 'sync/' + operation
+            self._rc_call(endpoint, {'srcFs': self._rc_file_system(src), 'dstFs': self._rc_file_system(dst)})
+            return []
+        command = [self._rclone_exe, operation]
+        if self._config_file is not None:
+            command.extend(['--config', self._config_file])
+        command.extend(['--auto-confirm', '--retries', self._rclone_retries])
+        if dry_run:
+            command.append('--dry-run')
+        command.extend([src, dst])
+        result = common.execute(command)
+        if result.get('code', 0) != 0:
+            raise Exception(result.get('error') or result.get('out') or 'rclone {} failed'.format(operation))
+        return result.get('out', '').splitlines()
 
     def _rc_file_system(self, path):
         """Return an RC fs reference; local absolute paths are RC-host paths."""

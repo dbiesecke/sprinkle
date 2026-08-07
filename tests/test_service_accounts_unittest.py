@@ -122,6 +122,30 @@ class ServiceAccountRegistryTest(unittest.TestCase):
             self.assertEqual(registry.summary_counts(), {"active": 1})
             self.assertEqual(len(registry.all_account_stats()), 1)
 
+    def test_rc_slots_reuse_configured_remote_for_next_eligible_account(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, 'source')
+            os.mkdir(source)
+            first = os.path.join(source, 'first.json')
+            second = os.path.join(source, 'second.json')
+            write_json(first, make_service_account('first@example.test', 'first-key'))
+            write_json(second, make_service_account('second@example.test', 'second-key'))
+            registry = service_accounts.ServiceAccountRegistry(
+                os.path.join(tmp, 'sa.sqlite3'), os.path.join(tmp, 'store')
+            )
+            quotas = iter(({'total': 100, 'free': 20}, {'total': 100, 'free': 80}))
+            registry.import_paths([first, second], validator=lambda _path, _payload: (next(quotas), None))
+            accounts = registry.active_accounts()
+
+            registry.ensure_rc_slots(['dst101:'])
+            registry.bind_rc_slot('dst101:', accounts[0]['id'])
+            self.assertEqual(registry.rc_slot_account('dst101:')['id'], accounts[0]['id'])
+            self.assertEqual(registry.eligible_unbound_account(50)['id'], accounts[1]['id'])
+
+            registry.bind_rc_slot('dst101:', accounts[1]['id'])
+            self.assertEqual(registry.rc_slot_account('dst101:')['id'], accounts[1]['id'])
+            self.assertEqual(registry.eligible_unbound_account(50), None)
+
     def test_quota_error_preserves_cached_values(self):
         with tempfile.TemporaryDirectory() as tmp:
             source = os.path.join(tmp, "source")
@@ -1292,7 +1316,7 @@ class ClSyncPlacementTest(unittest.TestCase):
         self.assertTrue(request.get_header("Authorization").startswith("Basic "))
         self.assertEqual(timeout, 12)
 
-    def test_rc_sa_import_validator_uses_prospective_stable_remote(self):
+    def test_rc_sa_import_validator_stays_local_when_rc_is_configured(self):
         with tempfile.TemporaryDirectory() as tmp:
             source = os.path.join(tmp, "source")
             store = os.path.join(tmp, "store")
@@ -1306,19 +1330,58 @@ class ClSyncPlacementTest(unittest.TestCase):
             registry = service_accounts.ServiceAccountRegistry(db_path, store)
             registry.import_paths([existing_path])
             previous_config = sprinkle.__dict__.get("__config")
-            calls = []
             try:
                 sprinkle.__dict__["__config"] = {"rclone_rc_url": "https://rc.example.test"}
-                old_about = sprinkle._rclone_rc_about
-                sprinkle._rclone_rc_about = lambda remote: (calls.append(remote) or ({"total": 100, "free": 80}, None))
-                quota, error = sprinkle._service_account_live_validator(candidate_path, candidate, registry)
+                with mock.patch.object(
+                        sprinkle.rclone.RClone, 'get_about_json_with_error',
+                        return_value=({"total": 100, "free": 80}, None)) as about:
+                    quota, error = sprinkle._service_account_live_validator(candidate_path, candidate, registry)
             finally:
-                sprinkle._rclone_rc_about = old_about
                 sprinkle.__dict__["__config"] = previous_config
 
             self.assertIsNone(error)
             self.assertEqual(quota["free"], 80)
-            self.assertEqual(calls, ["dst102:"])
+            self.assertEqual(about.call_args[0][0], "sa_import1:")
+
+    def test_import_validation_workers_run_candidates_concurrently(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, 'source')
+            os.mkdir(source)
+            for index in range(3):
+                write_json(os.path.join(source, '{}.json'.format(index)), make_service_account(
+                    'worker{}@example.test'.format(index), 'worker-key-{}'.format(index)
+                ))
+            registry = service_accounts.ServiceAccountRegistry(
+                os.path.join(tmp, 'sa.sqlite3'), os.path.join(tmp, 'store')
+            )
+            active = [0]
+            peak = [0]
+            lock = threading.Lock()
+
+            def validator(_path, _payload):
+                with lock:
+                    active[0] += 1
+                    peak[0] = max(peak[0], active[0])
+                time.sleep(0.05)
+                with lock:
+                    active[0] -= 1
+                return {"total": 100, "free": 80}, None
+
+            result = registry.import_paths([source], validator=validator, validation_workers=3)
+            self.assertEqual(result.imported, 3)
+            self.assertGreaterEqual(peak[0], 2)
+
+    def test_rc_drive_slot_update_keeps_credentials_out_of_logs(self):
+        rc = rclone.RClone(rc_url='http://rc.example.test')
+        calls = []
+        rc._rc_call = lambda endpoint, payload: calls.append((endpoint, payload)) or {}
+        credential = make_service_account('slot@example.test')
+        rc.configure_rc_drive_service_account('dst102:', credential)
+        endpoint, payload = calls[0]
+        self.assertEqual(endpoint, 'config/update')
+        self.assertEqual(payload['name'], 'dst102')
+        self.assertEqual(json.loads(payload['parameters']['service_account_credentials'])['client_email'], 'slot@example.test')
+        self.assertNotIn('private_key', str({'name': payload['name'], 'opt': payload['opt']}))
 
     def test_rclone_transport_routes_operations_through_rc(self):
         calls = []
@@ -1440,22 +1503,44 @@ class ClSyncPlacementTest(unittest.TestCase):
         self.assertEqual(logged["rclone_rc_password"], "<redacted>")
         self.assertEqual(logged["smtp_password"], "<redacted>")
 
-    def test_rc_refresh_requires_a_mapped_remote_without_cli_fallback(self):
+    def test_rc_refresh_uses_local_validation_for_an_unbound_account(self):
         previous_config = sprinkle.__dict__.get("__config")
         try:
             sprinkle.__dict__["__config"] = {
                 "rclone_rc_url": "https://rc.example.test",
                 "rclone_rc_timeout_seconds": 30,
             }
-            quota, error = sprinkle._refresh_service_account_quota({
-                "remote_name": None,
-                "managed_path": "/does/not/matter.json",
-            })
+            with mock.patch.object(sprinkle, '_refresh_service_account_file_cache', return_value=({"total": 100, "free": 80}, None)) as refresh:
+                quota, error = sprinkle._refresh_service_account_quota({
+                    "remote_name": None,
+                    "managed_path": "/does/not/matter.json",
+                })
         finally:
             sprinkle.__dict__["__config"] = previous_config
 
-        self.assertIsNone(quota)
-        self.assertEqual(error, "rclone rc remote mapping missing for service account")
+        self.assertEqual(quota["free"], 80)
+        self.assertIsNone(error)
+        refresh.assert_called_once()
+
+    def test_unbound_rc_quota_refresh_uses_about_not_lsjson(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            credential = os.path.join(tmp, 'account.json')
+            write_json(credential, make_service_account('quota@example.test'))
+            previous_config = sprinkle.__dict__.get('__config')
+            fake = mock.Mock()
+            fake.get_about_json_with_error.return_value = ({'total': 100, 'free': 80}, None)
+            try:
+                sprinkle.__dict__['__config'] = {'drive_id': 'drive-id', 'rclone_exe': 'rclone', 'rclone_retries': '1'}
+                with mock.patch.object(rclone, 'RClone', return_value=fake):
+                    quota, error = sprinkle._refresh_service_account_file_cache({
+                        'managed_path': credential, 'client_email': 'quota@example.test', 'project_id': 'project',
+                    })
+            finally:
+                sprinkle.__dict__['__config'] = previous_config
+            self.assertEqual(quota['free'], 80)
+            self.assertIsNone(error)
+            fake.get_about_json_with_error.assert_called_once_with('sa_files1:')
+            self.assertFalse(hasattr(fake, 'lsjson') and fake.lsjson.called)
 
     def test_rc_remotes_skip_local_service_account_config_generation(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2054,6 +2139,8 @@ class ServiceAccountCliTest(unittest.TestCase):
                 db_path,
                 "--sa-store",
                 store,
+                "--rclone-conf",
+                os.path.join(tmp, "empty-rclone.conf"),
                 "stats",
             ])
             sprinkle.configure(None)
@@ -2424,6 +2511,7 @@ class ServiceAccountCliTest(unittest.TestCase):
                     "rclone_env_file=" + os.path.join(tmp, "rclone.env"),
                     "sa_db=" + db_path,
                     "sa_store=" + store,
+                    "rclone_config=" + os.path.join(tmp, "empty-rclone.conf"),
                 ]))
 
             sprinkle.read_args(["-c", config_path, "stats"])

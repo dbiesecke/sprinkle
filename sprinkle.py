@@ -25,6 +25,8 @@ import os
 import tempfile
 import base64
 import json
+import random
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from urllib import error as urllib_error
 from urllib import request as urllib_request
@@ -224,6 +226,7 @@ def usage_commands():
     """
 COMMANDS:
     backup                       backup files to clustered drives
+    backup-union                 backup through rotating service-account union batches
     config                       create ~/.sprinkle/sprinkle.conf
     help                         displays the help fot the specific command
     ls                           list files
@@ -384,6 +387,23 @@ EXAMPLES:
     print(usage_options.__doc__)
     print(copyrights.__doc__)
     print(credits.__doc__)
+
+
+def usage_backup_union():
+    """
+NAME:
+    sprinkle backup-union - batch backup through rotating Google Drive service accounts
+
+SYNOPSIS:
+    sprinkle.py [options] backup-union {source} [remote[:path]]
+
+DESCRIPTION:
+    Uses temporary rclone union remotes.  Each batch writes to randomly selected
+    accounts with known free capacity; completed batches remain read-only so a
+    later invocation can see already uploaded files.
+    """
+    print(usage_backup_union.__doc__)
+    print(usage_options.__doc__)
 
 
 def usage_restore():
@@ -1163,6 +1183,9 @@ def _config_for_log(config_values):
 
 def prepare_rclone_sa_config():
     global __rclone_conf
+    if __args and __args[0] == 'backup-union':
+        # backup-union creates one purpose-built config per persisted batch.
+        return
     if (len(__args) > 2 and __args[0] == 'backup' and _is_rclone_remote_target(__args[2])
             and not _is_sprinkle_service_account_target(__args[2])):
         return
@@ -1277,7 +1300,7 @@ def command_needs_rclone_config():
         return True
     if len(__args) < 1:
         return False
-    return __args[0] in ('ls', 'lsmd5', 'backup', 'restore', 'stats', 'removedups', 'find')
+    return __args[0] in ('ls', 'lsmd5', 'backup', 'backup-union', 'restore', 'stats', 'removedups', 'find')
 
 
 def _optional_int(value):
@@ -1597,6 +1620,205 @@ def backup():
     __cl_sync.backup(local_dir, __config['delete_files'], __config['dry_run'], target)
 
 
+def _union_source_key(source):
+    return source if ':' in source else os.path.abspath(os.path.expanduser(source))
+
+
+def _union_target_path(source, target):
+    """Mirror backup's useful target-root rules while keeping the union internal."""
+    is_remote_source = ':' in source
+    is_file = not is_remote_source and os.path.isfile(source)
+    if target not in (None, ''):
+        _remote, path = clsync.ClSync.parse_backup_target(None, target)
+        if path not in (None, ''):
+            return path
+    if is_file:
+        return ''
+    if is_remote_source:
+        remote, path = source.split(':', 1)
+        path = path.strip('/')
+        return '/' + (os.path.basename(path) if path else remote)
+    return '/' + os.path.basename(os.path.abspath(source))
+
+
+def _union_safe_error(error):
+    text = ' '.join(str(error).split())
+    text = __import__('re').sub(r'(?i)(password|secret|token|private_key)\s*[=:]\s*[^,\s}]+', r'\1=<redacted>', text)
+    return text[:300]
+
+
+def _union_required_free(source):
+    if ':' in source or not os.path.exists(source):
+        return 1
+    if os.path.isfile(source):
+        largest = os.path.getsize(source)
+    else:
+        largest = max((os.path.getsize(os.path.join(root, name))
+                       for root, _dirs, names in os.walk(source) for name in names), default=0)
+    threshold = int(__config.get('large_file_threshold_bytes', clsync.DEFAULT_LARGE_FILE_THRESHOLD_BYTES))
+    if largest < threshold:
+        return largest
+    margin = max(int(__config.get('large_file_min_free_bytes', clsync.DEFAULT_LARGE_FILE_MIN_FREE_BYTES)),
+                 int(largest * int(__config.get('large_file_min_free_percent', clsync.DEFAULT_LARGE_FILE_MIN_FREE_PERCENT)) / 100))
+    return largest + margin
+
+
+def _union_eligible_accounts(registry, excluded_ids, required_free):
+    accounts = _backup_accounts_with_free_space(registry, registry.active_accounts())
+    return [account for account in accounts if account['id'] not in excluded_ids
+            and (registry.quota_by_account_id(account['id'])['free'] or 0) >= required_free]
+
+
+def _union_batch_config(registry, batches, current_batch, union_name):
+    """Build a local config with exactly one writable batch and prior read-only ones."""
+    account_sets = []
+    for batch in batches:
+        ids = json.loads(batch['account_ids'])
+        accounts = registry.union_accounts(ids)
+        if not accounts:
+            raise Exception('persisted union batch has no active service accounts')
+        account_sets.append((batch, accounts))
+    fd, path = tempfile.mkstemp(prefix='sprinkle-union-', suffix='.conf')
+    os.close(fd)
+    files, names = [], {}
+    for batch, accounts in account_sets:
+        for account in accounts:
+            managed = account['managed_path']
+            if not managed:
+                raise Exception('service account has no managed credential file')
+            remote = 'sprinkle_union_{}_{}'.format(batch['id'], account['id'])
+            files.append(managed)
+            names[os.path.abspath(managed)] = remote
+    base = __config.get('rclone_config') or rclone.default_rclone_config_file()
+    _text, entries = rclone.generate_rclone_config_from_files(
+        files, path, __config.get('drive_id'), shuffle=False, base_config_file=base,
+        remote_names=names, return_entries=True,
+    )
+    by_path = dict((entry['path'], entry['remote']) for entry in entries)
+    writable, readonly = [], []
+    for batch, accounts in account_sets:
+        remotes = [by_path[os.path.abspath(account['managed_path'])] for account in accounts]
+        if batch['id'] == current_batch['id']:
+            writable.extend(remotes)
+        else:
+            readonly.extend(remotes)
+    rclone.append_union_config(path, union_name, writable, readonly)
+    return path
+
+
+def _union_rc_setup(registry, batches, current_batch, union_name):
+    rc = rclone.RClone(
+        None, __config.get('rclone_exe', 'rclone'), __config.get('rclone_retries', '1'),
+        __config.get('rclone_rc_url'), __config.get('rclone_rc_user'),
+        __config.get('rclone_rc_password'), __config.get('rclone_rc_timeout_seconds', 30),
+    )
+    created, writable, readonly = [], [], []
+    try:
+        for batch in batches:
+            for account in registry.union_accounts(json.loads(batch['account_ids'])):
+                name = 'sprinkle_union_{}_{}'.format(union_name, account['id'])
+                with open(account['managed_path'], 'r') as fp:
+                    credentials = json.load(fp)
+                # Names include a UUID, so cleanup is confined to this run even
+                # if RC applies a config update before reporting an error.
+                created.append(name)
+                rc.configure_rc_drive_service_account(name, credentials, __config.get('drive_id'))
+                (writable if batch['id'] == current_batch['id'] else readonly).append(name)
+        created.append(union_name)
+        rc.configure_rc_union(union_name, writable, readonly)
+        return rc, created
+    except Exception:
+        for name in reversed(created):
+            try:
+                rc.delete_rc_remote(name)
+            except Exception:
+                pass
+        raise
+
+
+def backup_union():
+    if len(__args) < 2:
+        usage_backup_union()
+        raise Exception('backup-union requires a source')
+    if __config.get('drive_id') in (None, ''):
+        raise Exception('backup-union requires --drive-id <folder-id>')
+    source = common.remove_ending_slash(__args[1])
+    target = common.remove_ending_slash(__args[2]) if len(__args) > 2 else None
+    if ':' not in source and not os.path.exists(source):
+        raise Exception('local source {} not found'.format(source))
+    registry = _service_account_registry()
+    sa_dir = __config.get('rclone_sa_dir')
+    if sa_dir not in (None, ''):
+        source_dir = os.path.abspath(os.path.expanduser(sa_dir))
+        store_dir = os.path.abspath(os.path.expanduser(__config.get('sa_store')))
+        if source_dir != store_dir:
+            # Preserve --rclone-sa-dir's normal import behavior before choosing
+            # durable account ids for a union batch.
+            registry.import_paths([sa_dir], __config.get('sa_clean_invalid', service_accounts.DEFAULT_CLEAN_INVALID),
+                                  skip_known_invalid=True)
+    run = registry.union_run(_union_source_key(source), target or '')
+    batches = registry.union_batches(run['id'])
+    active = [batch for batch in batches if batch['status'] == 'active']
+    if len(active) > 1:
+        raise Exception('union run has multiple active batches; repair its SQLite state before retrying')
+    current = active[0] if active else None
+    used = set()
+    for batch in batches:
+        used.update(json.loads(batch['account_ids']))
+    if current is None:
+        candidates = _union_eligible_accounts(registry, used, _union_required_free(source))
+        count = _optional_int(__config.get('rclone_sa_count')) or len(candidates)
+        chosen = random.sample(candidates, min(count, len(candidates)))
+        if not chosen:
+            raise Exception('backup-union has no unused active service account with enough known free capacity')
+        current = registry.create_union_batch(run['id'], [account['id'] for account in chosen])
+        batches = registry.union_batches(run['id'])
+    union_name = 'sprinkle_union_' + uuid.uuid4().hex
+    destination = union_name + ':' + _union_target_path(source, target)
+    common.print_line('backing up {} through union batch {}...'.format(source, current['batch_index']))
+    local_config = None
+    cleanup = []
+    rc = None
+    rotate_after_cleanup = False
+    try:
+        if __config.get('rclone_rc_url') not in (None, ''):
+            rc, cleanup = _union_rc_setup(registry, batches, current, union_name)
+        else:
+            local_config = _union_batch_config(registry, batches, current, union_name)
+            rc = rclone.RClone(local_config, __config.get('rclone_exe', 'rclone'), __config.get('rclone_retries', '1'))
+        rc.transfer(source, destination, move=__config.get('rclone_move', False),
+                    delete_files=__config.get('delete_files', False), dry_run=__config.get('dry_run', False))
+    except Exception as exc:
+        detail = _union_safe_error(exc)
+        if 'storagequotaexceeded' in detail.lower() or 'drive storage quota has been exceeded' in detail.lower():
+            for account_id in json.loads(current['account_ids']):
+                registry.mark_account_quota_exhausted(account_id)
+            registry.update_union_batch(current['id'], 'exhausted', detail)
+            # A single quota failure closes this batch.  The next iteration
+            # creates exactly one fresh random batch; previous data is read-only.
+            rotate_after_cleanup = True
+        if not rotate_after_cleanup:
+            registry.update_union_batch(current['id'], 'active', detail)
+            raise
+    else:
+        registry.update_union_batch(current['id'], 'completed')
+    finally:
+        if local_config is not None:
+            try:
+                os.unlink(local_config)
+            except OSError:
+                pass
+        for name in reversed(cleanup):
+            try:
+                if rc is not None:
+                    rc.delete_rc_remote(name)
+            except Exception:
+                logging.warning('could not remove temporary RC union remote %s', name)
+    if rotate_after_cleanup:
+        common.print_line('union batch {} reached its quota; rotating to the next batch...'.format(current['batch_index']))
+        return backup_union()
+
+
 def restore():
     global __cl_sync
     if __cl_sync is None:
@@ -1703,17 +1925,8 @@ def _sa_import_progress(event):
 
 
 def _service_account_live_validator(path, payload, registry=None):
-    if __config.get('rclone_rc_url') not in (None, ''):
-        if registry is None:
-            return None, 'rclone rc service account validation requires a registry'
-        remote = _rc_remote_name_for_candidate(registry, payload)
-        quota, error = _rclone_rc_about(remote + ':')
-        if error is not None:
-            return None, error
-        unknown_reason = _quota_unknown_reason(quota)
-        if unknown_reason is not None:
-            return None, unknown_reason
-        return quota, None
+    # Validation intentionally runs locally.  RC slots are reusable transport
+    # endpoints, not a source of truth about an unimported credential.
     fd, tmp_conf = tempfile.mkstemp(prefix="rclone-sa-import-", suffix=".conf")
     os.close(fd)
     try:
@@ -1799,16 +2012,13 @@ def sa_import():
         usage_sa_import()
         sys.exit(-1)
     registry = _service_account_registry()
-    if __config.get('rclone_rc_url') not in (None, ''):
-        registry.assign_stable_remote_names()
     result = registry.import_paths(
         __args[1:],
         __config['sa_clean_invalid'],
         validator=lambda path, payload: _service_account_live_validator(path, payload, registry),
         progress=_sa_import_progress,
+        validation_workers=__config.get('sa_stats_workers', 4),
     )
-    if __config.get('rclone_rc_url') not in (None, ''):
-        registry.assign_stable_remote_names()
     common.print_line('service account import complete')
     common.print_line('scanned:      ' + str(result.scanned))
     common.print_line('validated:    ' + str(result.validated))
@@ -1824,8 +2034,6 @@ def sa_import():
 
 def sa_stats():
     registry = _service_account_registry()
-    if __config.get('rclone_rc_url') not in (None, ''):
-        registry.assign_stable_remote_names()
     refresh_mode = 'all' if __config.get('sa_delete_rc_http_500', False) else __config['sa_refresh']
     if globals().get('__sa_refresh') is None and refresh_mode == service_accounts.DEFAULT_REFRESH_MODE:
         refresh_mode = 'stale'
@@ -1939,15 +2147,17 @@ def sa_stats():
 def _refresh_service_account_quota(account):
     if __config.get('rclone_rc_url') not in (None, ''):
         remote_name = account['remote_name']
-        if remote_name in (None, ''):
-            return None, 'rclone rc remote mapping missing for service account'
-        quota, error = _rclone_rc_about(remote_name + ':')
-        if error is not None:
-            return None, error
-        unknown_reason = _quota_unknown_reason(quota)
-        if unknown_reason is not None:
-            return None, unknown_reason
-        return quota, None
+        if remote_name not in (None, ''):
+            quota, error = _rclone_rc_about(remote_name + ':')
+            if error is not None:
+                return None, error
+            unknown_reason = _quota_unknown_reason(quota)
+            if unknown_reason is not None:
+                return None, unknown_reason
+            return quota, None
+        # Unbound accounts are deliberately not installed into an RC slot just
+        # for stats.  Validate their cached capacity locally instead.
+        return _refresh_service_account_file_cache(account)
     if account['managed_path'] is None:
         return None, 'missing managed service account file'
     fd, tmp_conf = tempfile.mkstemp(prefix="rclone-sa-", suffix=".conf")
@@ -2098,6 +2308,7 @@ def _is_rc_http_500_error(error):
 
 
 def _refresh_service_account_file_cache(account):
+    """Refresh an unbound RC-mode account locally without using an RC slot."""
     if account['managed_path'] is None:
         return None, 'missing managed service account file'
     fd, tmp_conf = tempfile.mkstemp(prefix="rclone-sa-files-", suffix=".conf")
@@ -2113,7 +2324,13 @@ def _refresh_service_account_file_cache(account):
         rclone_exe = __config.get('rclone_exe', 'rclone')
         rclone_retries = __config.get('rclone_retries', '1')
         rc = rclone.RClone(tmp_conf, rclone_exe, rclone_retries)
-        return rc.lsjson("sa_files1:", "/", ['--recursive', '--fast-list'], True), None
+        quota, error = rc.get_about_json_with_error("sa_files1:")
+        if error is not None:
+            return None, _friendly_rclone_error(error, account)
+        unknown_reason = _quota_unknown_reason(quota)
+        if unknown_reason is not None:
+            return None, unknown_reason
+        return quota, None
     except Exception as e:
         return None, _friendly_rclone_error(e, account)
     finally:
@@ -2253,6 +2470,8 @@ def main(argv):
                                           '\n\nExamine logs for additional information')
                         email.send()
                     raise e
+        elif __args[0] == 'backup-union':
+            backup_union()
         elif __args[0] == 'restore':
             restore()
         elif __args[0] == 'stats':
@@ -2275,6 +2494,8 @@ def main(argv):
                     usage_lsmd5()
                 elif __args[1] == 'backup':
                     usage_backup()
+                elif __args[1] == 'backup-union':
+                    usage_backup_union()
                 elif __args[1] == 'restore':
                     usage_restore()
                 elif __args[1] == 'stats':

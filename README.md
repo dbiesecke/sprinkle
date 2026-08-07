@@ -25,9 +25,12 @@ $ ./sprinkle/sprinkle.py -d --drive-id YouDriveID backup /Users/user/workspace/M
 $ ./sprinkle.py backup /local/movie.mkv hidrive:
 $ ./sprinkle.py backup /local/roms hidrive:
 
+# rotate service-account batches through an rclone Union read view
+$ ./sprinkle.py --drive-id XXXXX --rclone-sa-count 20 backup-union /local/roms
+
 ```
 
-`sa-import` validates new accounts with `rclone about --json` and prints per-file progress. With RC configured it instead uses `operations/about` on the candidate's prospective stable `dstNNN` remote; the RC server must provision that same mapping first. Duplicate account JSON is counted and skipped without creating an additional managed file or SQLite account record. If validation fails or quota remains unknown, the account is quarantined by default.
+`sa-import` validates new accounts locally with `rclone about --json` and prints per-file progress. Validation uses the existing `sa_stats_workers` setting (default: 4), while registry writes and progress remain ordered. Duplicate account JSON is counted and skipped without creating an additional managed file or SQLite account record. If validation fails or quota remains unknown, the account is quarantined by default.
 
 An explicit rclone target accepts both `remote:path` and a bare `remote:`. A local file sent to `hidrive:`
 lands in the remote root. A local directory sent to `hidrive:` lands under a same-named folder, while
@@ -69,15 +72,17 @@ An unconfirmed target leaves the cache unchanged and is reported as an accountin
 To run all rclone operations on an existing rclone RC server, configure `rclone_rc_url`, optional
 `rclone_rc_user`/`rclone_rc_password`, `rclone_rc_timeout_seconds=30`, and `sa_stats_workers=4`.
 Sprinkle uses the RC operations and sync endpoints and never falls back to local rclone after an RC failure.
-The server must already contain the same stable `dst101`, `dst102`, … service-account mapping. For an ordinary
+For an ordinary
 absolute backup path, set `rclone_rc_local_remote=mylocal` (or the server's local remote name): Sprinkle then
-reads `/path` as `mylocal:/path` on the RC host. Keep RC private, protected by TLS and authentication, and never
+reads `/path` as `mylocal:/path` on the RC host. Keep RC private and authenticated, and never
 commit its credentials. Prefer `SPRINKLE_RCLONE_RC_PASSWORD` over storing the password in a config file.
 
-Set `rclone_rc_remotes=dst101,dst102` when those remotes are already provisioned on the RC server. This
-mode still requires `drive_id`: Sprinkle applies it as rclone's `root_folder_id` override to each clustered
-destination, so backup data stays under that Drive folder even if the server remote has a different root.
-uses them directly for clustered backups and avoids generating a local service-account rclone config.
+Set `rclone_rc_remotes=dst101,dst102` to define a fixed pool of reusable Drive slots. Before a slot is used,
+Sprinkle sends the selected service-account credential to the RC server with `config/update`; it rotates a slot
+only when its account cannot fit the next upload with the configured headroom. This mode still requires
+`drive_id`: Sprinkle applies it as rclone's `root_folder_id` override to each clustered destination. The RC
+endpoint may use either `http://` or `https://`; authentication is recommended whenever it is reachable by
+other hosts.
 
 * create a home-directory configuration with interactive defaults
 
