@@ -216,7 +216,7 @@ class RClone:
 
     def __init__(self, config_file=None, rclone_exe="rclone", rclone_retries="1",
                  rc_url=None, rc_user=None, rc_password=None, rc_timeout_seconds=30,
-                 rc_drive_id=None, rc_drive_remotes=None):
+                 rc_drive_id=None, rc_drive_remotes=None, transfers=2):
         logging.debug('constructing RClone')
         if rc_url in (None, '') and config_file is not None and not common.is_file(config_file):
             logging.error("configuration file " + str(config_file) + " not found. Cannot continue!")
@@ -228,6 +228,7 @@ class RClone:
         self._config_file = config_file
         self._rclone_exe = rclone_exe
         self._rclone_retries = rclone_retries
+        self._transfers = max(1, int(transfers))
         self._rc_url = None if rc_url in (None, '') else str(rc_url).rstrip('/')
         self._rc_user = rc_user
         self._rc_password = rc_password
@@ -338,6 +339,7 @@ class RClone:
         if self._config_file is not None:
             command.extend(['--config', self._config_file])
         command.extend(['--auto-confirm', '--retries', self._rclone_retries])
+        command.extend(['--transfers', str(self._transfers)])
         if dry_run:
             command.append('--dry-run')
         command.extend([src, dst])
@@ -697,6 +699,8 @@ class RClone:
         command_with_args.append("6h")
         command_with_args.append("--retries")
         command_with_args.append(self._rclone_retries)
+        command_with_args.append("--transfers")
+        command_with_args.append(str(self._transfers))
         command_with_args.append(src)
         command_with_args.append(dst)
         logging.debug('command args: ' + str(command_with_args))
@@ -736,6 +740,8 @@ class RClone:
         command_with_args.append("6h")
         command_with_args.append("--retries")
         command_with_args.append(self._rclone_retries)
+        command_with_args.append("--transfers")
+        command_with_args.append(str(self._transfers))
         command_with_args.append(src)
         command_with_args.append(dst)
         result = common.execute(command_with_args)

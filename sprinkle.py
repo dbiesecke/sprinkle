@@ -1667,19 +1667,66 @@ def _union_required_free(source):
     return largest + margin
 
 
+def _union_accounts_with_free_space(registry, accounts, required_free):
+    """Return Union candidates, using a cached 15 GiB assumption when needed.
+
+    This deliberately does not share normal backup's strict confirmed-quota
+    selector: it must be possible to start a Union transfer without an About
+    request for every unconfirmed service account.
+    """
+    eligible = []
+    for account in accounts:
+        quota_row = registry.quota_by_account_id(account['id'])
+        state = None if quota_row is None else quota_row['quota_state']
+        timestamp = None if quota_row is None else quota_row['updated_at']
+        if state in (service_accounts.QUOTA_STATE_UNKNOWN_ASSUMED,
+                     service_accounts.QUOTA_STATE_UNKNOWN_FULL) and registry.is_stale(timestamp):
+            quota, error = _refresh_service_account_quota(account)
+            registry.update_quota(account['id'], quota, error)
+            quota_row = registry.quota_by_account_id(account['id'])
+            state = None if quota_row is None else quota_row['quota_state']
+        elif state == service_accounts.QUOTA_STATE_KNOWN and registry.is_stale(quota_row['last_about_at']):
+            quota, error = _refresh_service_account_quota(account)
+            registry.update_quota(account['id'], quota, error)
+            quota_row = registry.quota_by_account_id(account['id'])
+            state = None if quota_row is None else quota_row['quota_state']
+
+        quota_error = None if quota_row is None else quota_row['last_error']
+        if _handle_service_deactivated(registry, account, quota_error):
+            continue
+        if _handle_account_not_found(registry, account, quota_error):
+            continue
+        if state == service_accounts.QUOTA_STATE_UNKNOWN_FULL:
+            continue
+        if state != service_accounts.QUOTA_STATE_KNOWN:
+            # No confirmed capacity (including a cache made by older Sprinkle
+            # versions): record the bounded Union-only assumption immediately.
+            registry.assume_unknown_quota_for_union(account['id'])
+            quota_row = registry.quota_by_account_id(account['id'])
+            state = quota_row['quota_state']
+        if state == service_accounts.QUOTA_STATE_KNOWN:
+            # A confirmed full/too-small account must remain excluded; it is
+            # never eligible for the 15 GiB UNKNOWN fallback.
+            if not service_accounts.has_usable_quota(quota_row, required_free):
+                continue
+        elif quota_row['free'] < required_free:
+            continue
+        eligible.append(account)
+    return eligible
+
+
 def _union_eligible_accounts(registry, excluded_ids, required_free):
-    accounts = _backup_accounts_with_free_space(registry, registry.active_accounts())
-    return [account for account in accounts if account['id'] not in excluded_ids
-            and (registry.quota_by_account_id(account['id'])['free'] or 0) >= required_free]
+    accounts = _union_accounts_with_free_space(registry, registry.active_accounts(), required_free)
+    return [account for account in accounts if account['id'] not in excluded_ids]
 
 
 def _union_batch_has_usable_capacity(registry, batch, required_free):
     """A persisted writable batch must still be safe before it is resumed."""
     accounts = registry.union_accounts(json.loads(batch['account_ids']))
-    eligible = _backup_accounts_with_free_space(registry, accounts)
+    eligible = _union_accounts_with_free_space(registry, accounts, required_free)
     eligible_ids = set(account['id'] for account in eligible)
     return bool(accounts) and len(accounts) == len(eligible_ids) and all(
-        (registry.quota_by_account_id(account_id)['free'] or 0) >= required_free
+        registry.quota_by_account_id(account_id)['free'] >= required_free
         for account_id in eligible_ids
     )
 
@@ -1799,8 +1846,7 @@ def backup_union():
         chosen = random.sample(candidates, min(count, len(candidates)))
         if not chosen:
             raise Exception(
-                'backup-union has no unused active service account with enough known usable quota; '
-                'accounts without total/free are excluded'
+                'backup-union has no unused active service account with enough usable quota'
             )
         current = registry.create_union_batch(run['id'], [account['id'] for account in chosen])
         batches = registry.union_batches(run['id'])
@@ -1811,26 +1857,26 @@ def backup_union():
     cleanup = []
     rc = None
     rotate_after_cleanup = False
+    transfer_started = False
     try:
         if __config.get('rclone_rc_url') not in (None, ''):
             rc, cleanup = _union_rc_setup(registry, batches, current, union_name)
         else:
             local_config = _union_batch_config(registry, batches, current, union_name)
             rc = rclone.RClone(local_config, __config.get('rclone_exe', 'rclone'), __config.get('rclone_retries', '1'))
+        transfer_started = True
         rc.transfer(source, destination, move=__config.get('rclone_move', False),
                     delete_files=__config.get('delete_files', False), dry_run=__config.get('dry_run', False))
     except Exception as exc:
-        detail = _union_safe_error(exc)
-        if 'storagequotaexceeded' in detail.lower() or 'drive storage quota has been exceeded' in detail.lower():
-            for account_id in json.loads(current['account_ids']):
-                registry.mark_account_quota_exhausted(account_id)
-            registry.update_union_batch(current['id'], 'exhausted', detail)
-            # A single quota failure closes this batch.  The next iteration
-            # creates exactly one fresh random batch; previous data is read-only.
-            rotate_after_cleanup = True
-        if not rotate_after_cleanup:
-            registry.update_union_batch(current['id'], 'active', detail)
+        if not transfer_started:
+            # Setup failures are not evidence that this batch lacks capacity.
             raise
+        detail = _union_safe_error(exc)
+        registry.mark_union_unknown_accounts_full(json.loads(current['account_ids']), detail)
+        registry.update_union_batch(current['id'], 'exhausted', detail)
+        # Any failed Union transfer closes this batch: rclone cannot reliably
+        # attribute a union error to an individual writable remote.
+        rotate_after_cleanup = True
     else:
         registry.update_union_batch(current['id'], 'completed')
     finally:
@@ -1846,7 +1892,7 @@ def backup_union():
             except Exception:
                 logging.warning('could not remove temporary RC union remote %s', name)
     if rotate_after_cleanup:
-        common.print_line('union batch {} reached its quota; rotating to the next batch...'.format(current['batch_index']))
+        common.print_line('union batch {} failed; rotating to the next batch...'.format(current['batch_index']))
         return backup_union()
 
 
@@ -2114,25 +2160,31 @@ def sa_stats():
     ls_summary = registry.ls_cache_summary()
     rows = registry.all_account_stats()
     active_rows = [row for row in rows if row['status'] == 'active']
-    visible_active_rows = [row for row in active_rows if row['last_about_at'] is not None]
+    visible_active_rows = [row for row in active_rows
+                           if row['quota_state'] == service_accounts.QUOTA_STATE_KNOWN]
     stale_count = 0
     error_count = 0
     unknown_count = 0
+    unknown_full_count = 0
     total = 0
     used = 0
     free = 0
     for row in active_rows:
-        if row['last_about_at'] is None:
+        state = row['quota_state']
+        if state == service_accounts.QUOTA_STATE_UNKNOWN_FULL:
+            unknown_full_count += 1
+        elif state != service_accounts.QUOTA_STATE_KNOWN:
             unknown_count += 1
-        elif registry.is_stale(row['last_about_at']):
+        if state == service_accounts.QUOTA_STATE_KNOWN and registry.is_stale(row['last_about_at']):
             stale_count += 1
         if row['last_error'] is not None:
             error_count += 1
-        if row['total'] is not None:
+        # Assumed Union capacity is deliberately not a confirmed fleet total.
+        if state == service_accounts.QUOTA_STATE_KNOWN and row['total'] is not None:
             total += row['total']
-        if row['used'] is not None:
+        if state == service_accounts.QUOTA_STATE_KNOWN and row['used'] is not None:
             used += row['used']
-        if row['free'] is not None:
+        if state == service_accounts.QUOTA_STATE_KNOWN and row['free'] is not None:
             free += row['free']
 
     common.print_line('SERVICE ACCOUNT SUMMARY')
@@ -2145,6 +2197,7 @@ def sa_stats():
     common.print_line('errors:      ' + str(error_count))
     common.print_line('stale:       ' + str(stale_count))
     common.print_line('unknown:     ' + str(unknown_count))
+    common.print_line('unknown-full:' + str(unknown_full_count))
     common.print_line('')
     common.print_line('ACCOUNT'.ljust(44) + " " +
                       'SIZE'.rjust(12) + " " +

@@ -219,6 +219,168 @@ class ServiceAccountRegistryTest(unittest.TestCase):
             self.assertIsNone(sync._get_remote_quota("dst101:"))
             self.assertEqual(calls, [])
 
+    def test_union_assumes_15_gib_without_about_and_normal_backup_stays_strict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "source")
+            os.mkdir(source)
+            write_json(os.path.join(source, "one.json"), make_service_account("one@example.test"))
+            registry = service_accounts.ServiceAccountRegistry(
+                os.path.join(tmp, "sa.sqlite3"), os.path.join(tmp, "store"),
+            )
+            registry.import_paths([source])
+            account = registry.active_accounts()[0]
+            old_refresh = sprinkle._refresh_service_account_quota
+            old_config = getattr(sprinkle, "__config", None)
+            try:
+                setattr(sprinkle, "__config", {"sa_refresh": "none", "sa_delete_rc_http_500": False})
+                sprinkle._refresh_service_account_quota = lambda _account: self.fail("fresh unknown Union quota must not About")
+                self.assertEqual(sprinkle._backup_accounts_with_free_space(registry, [account]), [])
+                self.assertEqual(sprinkle._union_accounts_with_free_space(registry, [account], 1), [account])
+            finally:
+                sprinkle._refresh_service_account_quota = old_refresh
+                setattr(sprinkle, "__config", old_config)
+
+            quota = registry.quota_by_account_id(account["id"])
+            self.assertEqual(quota["quota_state"], service_accounts.QUOTA_STATE_UNKNOWN_ASSUMED)
+            self.assertEqual(quota["total"], 15 * 1024 ** 3)
+            self.assertEqual(quota["free"], 15 * 1024 ** 3)
+
+    def test_stale_union_unknown_states_are_rechecked_but_fresh_full_is_not(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "source")
+            os.mkdir(source)
+            write_json(os.path.join(source, "one.json"), make_service_account("one@example.test"))
+            registry = service_accounts.ServiceAccountRegistry(
+                os.path.join(tmp, "sa.sqlite3"), os.path.join(tmp, "store"), cache_ttl_hours=1,
+            )
+            registry.import_paths([source])
+            account = registry.active_accounts()[0]
+            registry.assume_unknown_quota_for_union(account["id"])
+            registry.mark_union_unknown_accounts_full([account["id"]], "any transfer failure")
+            calls = []
+            old_refresh = sprinkle._refresh_service_account_quota
+            try:
+                sprinkle._refresh_service_account_quota = lambda _account: calls.append(1) or ({"total": 100, "used": 1, "free": 99}, None)
+                self.assertEqual(sprinkle._union_accounts_with_free_space(registry, [account], 1), [])
+                self.assertEqual(calls, [])
+                with registry._connect() as conn:
+                    conn.execute("UPDATE quota_cache SET updated_at='2000-01-01T00:00:00Z' WHERE account_id=?", (account["id"],))
+                self.assertEqual(sprinkle._union_accounts_with_free_space(registry, [account], 1), [account])
+            finally:
+                sprinkle._refresh_service_account_quota = old_refresh
+            quota = registry.quota_by_account_id(account["id"])
+            self.assertEqual(calls, [1])
+            self.assertEqual(quota["quota_state"], service_accounts.QUOTA_STATE_KNOWN)
+
+    def test_union_transfer_failure_marks_only_assumed_accounts_unknown_full(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "source")
+            os.mkdir(source)
+            write_json(os.path.join(source, "known.json"), make_service_account("known@example.test", "known"))
+            write_json(os.path.join(source, "unknown.json"), make_service_account("unknown@example.test", "unknown"))
+            registry = service_accounts.ServiceAccountRegistry(
+                os.path.join(tmp, "sa.sqlite3"), os.path.join(tmp, "store"),
+            )
+            registry.import_paths([source])
+            known, unknown = registry.active_accounts()
+            registry.update_quota(known["id"], {"total": 100, "used": 20, "free": 80})
+            registry.assume_unknown_quota_for_union(unknown["id"])
+
+            self.assertEqual(registry.mark_union_unknown_accounts_full(
+                [known["id"], unknown["id"]], "temporary transfer error"), 1)
+            known_quota = registry.quota_by_account_id(known["id"])
+            unknown_quota = registry.quota_by_account_id(unknown["id"])
+            self.assertEqual((known_quota["quota_state"], known_quota["free"]),
+                             (service_accounts.QUOTA_STATE_KNOWN, 80))
+            self.assertEqual((unknown_quota["quota_state"], unknown_quota["free"]),
+                             (service_accounts.QUOTA_STATE_UNKNOWN_FULL, 0))
+            self.assertTrue(unknown_quota["last_error"].startswith("UNKNOWN-FULL:"))
+
+    def test_backup_union_rotates_after_any_transfer_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source_dir = os.path.join(tmp, "source")
+            accounts_dir = os.path.join(tmp, "accounts")
+            os.mkdir(source_dir)
+            os.mkdir(accounts_dir)
+            with open(os.path.join(source_dir, "rom.bin"), "wb") as fp:
+                fp.write(b"test")
+            write_json(os.path.join(accounts_dir, "first.json"), make_service_account("first@example.test", "first"))
+            write_json(os.path.join(accounts_dir, "second.json"), make_service_account("second@example.test", "second"))
+            db_path = os.path.join(tmp, "sa.sqlite3")
+            store = os.path.join(tmp, "store")
+            registry = service_accounts.ServiceAccountRegistry(db_path, store)
+            registry.import_paths([accounts_dir])
+            old_config = getattr(sprinkle, "__config", None)
+            old_args = getattr(sprinkle, "__args", None)
+            old_rclone = sprinkle.rclone.RClone
+            old_sample = sprinkle.random.sample
+
+            class FakeRClone(object):
+                attempts = 0
+
+                def __init__(self, *_args, **_kwargs):
+                    pass
+
+                def configure_rc_drive_service_account(self, *_args, **_kwargs):
+                    pass
+
+                def configure_rc_union(self, *_args, **_kwargs):
+                    pass
+
+                def delete_rc_remote(self, *_args, **_kwargs):
+                    pass
+
+                def transfer(self, *_args, **_kwargs):
+                    FakeRClone.attempts += 1
+                    if FakeRClone.attempts == 1:
+                        raise Exception("temporary union transfer failure")
+
+            try:
+                setattr(sprinkle, "__config", {
+                    "drive_id": "synthetic-drive", "rclone_sa_dir": None,
+                    "sa_db": db_path, "sa_store": store, "sa_cache_ttl_hours": 72,
+                    "rclone_sa_count": 1, "rclone_rc_url": "http://rc.test",
+                    "rclone_rc_user": None, "rclone_rc_password": None,
+                    "rclone_rc_timeout_seconds": 1, "rclone_exe": "rclone",
+                    "rclone_retries": "1", "rclone_move": False,
+                    "delete_files": False, "dry_run": True,
+                })
+                setattr(sprinkle, "__args", ["backup-union", source_dir])
+                sprinkle.rclone.RClone = FakeRClone
+                sprinkle.random.sample = lambda candidates, count: candidates[:count]
+                sprinkle.backup_union()
+            finally:
+                sprinkle.rclone.RClone = old_rclone
+                sprinkle.random.sample = old_sample
+                setattr(sprinkle, "__config", old_config)
+                setattr(sprinkle, "__args", old_args)
+
+            batches = registry.union_batches(registry.union_run(source_dir, "")["id"])
+            self.assertEqual([batch["status"] for batch in batches], ["exhausted", "completed"])
+            self.assertEqual(FakeRClone.attempts, 2)
+            first, second = registry.active_accounts()
+            self.assertEqual(registry.quota_by_account_id(first["id"])["quota_state"],
+                             service_accounts.QUOTA_STATE_UNKNOWN_FULL)
+            self.assertEqual(registry.quota_by_account_id(second["id"])["quota_state"],
+                             service_accounts.QUOTA_STATE_UNKNOWN_ASSUMED)
+
+    def test_union_never_reassumes_confirmed_full_account(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "source")
+            os.mkdir(source)
+            write_json(os.path.join(source, "one.json"), make_service_account("one@example.test"))
+            registry = service_accounts.ServiceAccountRegistry(
+                os.path.join(tmp, "sa.sqlite3"), os.path.join(tmp, "store"),
+            )
+            registry.import_paths([source])
+            account = registry.active_accounts()[0]
+            registry.update_quota(account["id"], {"total": 100, "used": 100, "free": 0})
+
+            self.assertEqual(sprinkle._union_accounts_with_free_space(registry, [account], 1), [])
+            quota = registry.quota_by_account_id(account["id"])
+            self.assertEqual((quota["quota_state"], quota["free"]),
+                             (service_accounts.QUOTA_STATE_KNOWN, 0))
+
     def test_quota_delta_clamps_and_keeps_about_timestamp(self):
         with tempfile.TemporaryDirectory() as tmp:
             source = os.path.join(tmp, "source")
@@ -1412,6 +1574,18 @@ class ClSyncPlacementTest(unittest.TestCase):
             self.assertIn("unknown:     1", messages)
             self.assertFalse(any("unknown@example.test" in message for message in messages))
 
+            registry.assume_unknown_quota_for_union(account["id"])
+            registry.mark_union_unknown_accounts_full([account["id"]], "storage quota exceeded")
+            messages = []
+            try:
+                common.print_line = lambda message="": messages.append(message)
+                sprinkle.sa_stats()
+            finally:
+                common.print_line = old_print_line
+            self.assertIn("unknown:     0", messages)
+            self.assertIn("unknown-full:1", messages)
+            self.assertFalse(any("unknown@example.test" in message for message in messages))
+
     def test_sa_stats_limits_parallel_refreshes_and_serializes_database_updates(self):
         with tempfile.TemporaryDirectory() as tmp:
             source = os.path.join(tmp, "source")
@@ -2022,6 +2196,50 @@ class ClSyncPlacementTest(unittest.TestCase):
 
             self.assertEqual(copied, ["dst102:", "dst101:"])
             self.assertEqual(sync._cached_free["dst102:"], 0)
+
+    def test_backup_uses_two_parallel_directory_batches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for directory in ("first", "second"):
+                path = os.path.join(tmp, directory)
+                os.mkdir(path)
+                with open(os.path.join(path, "rom.bin"), "wb") as fp:
+                    fp.write(b"synthetic rom")
+            sync = clsync.ClSync.__new__(clsync.ClSync)
+            sync._show_progress = False
+            sync._compare_method = "size"
+            sync._ClSync__exclusion_list = None
+            sync._ClSync__exclude_regex = None
+            sync._distribution_type = "mas"
+            sync._cached_free = {"dst101:": 1000000}
+            sync._frees = None
+            sync._sa_registry = None
+            sync._run_quota_exhausted_remotes = set()
+            sync._run_unavailable_remotes = {}
+            sync._backup_transfer_workers = 2
+            sync._backup_transfer_lock = threading.Lock()
+            sync._reserved_free = {}
+            sync._large_file_threshold_bytes = clsync.DEFAULT_LARGE_FILE_THRESHOLD_BYTES
+            sync._large_file_min_free_bytes = clsync.DEFAULT_LARGE_FILE_MIN_FREE_BYTES
+            sync._large_file_min_free_percent = clsync.DEFAULT_LARGE_FILE_MIN_FREE_PERCENT
+            sync.ls_shallow = lambda _path, **_kwargs: {}
+            sync.get_eligible_remotes = lambda _size: ["dst101:"]
+            sync._ensure_target_directory = lambda *_args: None
+            sync.mark_remote_used = lambda *_args: None
+            active = [0]
+            peak = [0]
+            active_lock = threading.Lock()
+
+            def copy(*_args):
+                with active_lock:
+                    active[0] += 1
+                    peak[0] = max(peak[0], active[0])
+                time.sleep(0.04)
+                with active_lock:
+                    active[0] -= 1
+
+            sync.copy = copy
+            sync.backup(tmp, delete_files=False, dry_run=False)
+            self.assertEqual(peak[0], 2)
 
     def test_backup_continues_when_all_add_candidates_fail(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -20,6 +20,11 @@ DEFAULT_STORE_DIR = os.path.expanduser("~/.sprinkle/service-accounts")
 DEFAULT_CACHE_TTL_HOURS = 72
 DEFAULT_CLEAN_INVALID = "quarantine"
 DEFAULT_REFRESH_MODE = "stale"
+UNION_ASSUMED_QUOTA_BYTES = 15 * 1024 * 1024 * 1024
+
+QUOTA_STATE_KNOWN = "known"
+QUOTA_STATE_UNKNOWN_ASSUMED = "unknown_assumed"
+QUOTA_STATE_UNKNOWN_FULL = "unknown_full"
 
 REQUIRED_FIELDS = [
     "type",
@@ -137,12 +142,22 @@ class ServiceAccountRegistry(object):
                     trashed INTEGER,
                     other INTEGER,
                     objects INTEGER,
+                    quota_state TEXT,
                     last_about_at TEXT,
                     last_error TEXT,
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY(account_id) REFERENCES accounts(id)
                 )
             """)
+            # Migrate caches created before explicit quota states existed.
+            columns = set(row['name'] for row in conn.execute("PRAGMA table_info(quota_cache)").fetchall())
+            if 'quota_state' not in columns:
+                conn.execute("ALTER TABLE quota_cache ADD COLUMN quota_state TEXT")
+            conn.execute("""
+                UPDATE quota_cache SET quota_state=?
+                WHERE quota_state IS NULL AND last_error IS NULL
+                  AND last_about_at IS NOT NULL AND total IS NOT NULL AND free IS NOT NULL
+            """, (QUOTA_STATE_KNOWN,))
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS ls_cache (
                     account_id INTEGER NOT NULL,
@@ -341,7 +356,7 @@ class ServiceAccountRegistry(object):
         name = str(remote).rstrip(":")
         with self._connect() as conn:
             return conn.execute("""
-                SELECT a.*, q.total, q.used, q.free, q.last_about_at, q.last_error
+                SELECT a.*, q.total, q.used, q.free, q.quota_state, q.last_about_at, q.last_error
                 FROM rc_slots s JOIN accounts a ON a.id=s.account_id
                 LEFT JOIN quota_cache q ON q.account_id=a.id
                 WHERE s.remote_name=? AND a.status='active'
@@ -361,7 +376,7 @@ class ServiceAccountRegistry(object):
     def eligible_unbound_account(self, required_free):
         with self._connect() as conn:
             return conn.execute("""
-                SELECT a.*, q.total, q.used, q.free, q.last_about_at, q.last_error
+                SELECT a.*, q.total, q.used, q.free, q.quota_state, q.last_about_at, q.last_error
                 FROM accounts a JOIN quota_cache q ON q.account_id=a.id
                 WHERE a.status='active' AND q.last_error IS NULL
                   AND q.total IS NOT NULL AND q.total>=0
@@ -654,7 +669,7 @@ class ServiceAccountRegistry(object):
                 SELECT
                     a.*,
                     q.total, q.used, q.free, q.trashed, q.other, q.objects,
-                    q.last_about_at, q.last_error
+                    q.quota_state, q.last_about_at, q.last_error
                 FROM accounts a
                 LEFT JOIN quota_cache q ON q.account_id = a.id
                 ORDER BY a.status, a.client_email, a.id
@@ -698,7 +713,7 @@ class ServiceAccountRegistry(object):
                     a.id AS account_id,
                     a.remote_name,
                     q.total, q.used, q.free, q.trashed, q.other, q.objects,
-                    q.last_about_at, q.last_error, q.updated_at
+                    q.quota_state, q.last_about_at, q.last_error, q.updated_at
                 FROM accounts a
                 LEFT JOIN quota_cache q ON q.account_id = a.id
                 WHERE a.status='active' AND a.remote_name=?
@@ -877,8 +892,8 @@ class ServiceAccountRegistry(object):
             conn.execute("""
                 INSERT INTO quota_cache (
                     account_id, total, used, free, trashed, other, objects,
-                    last_about_at, last_error, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    quota_state, last_about_at, last_error, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(account_id) DO UPDATE SET
                     total=excluded.total,
                     used=excluded.used,
@@ -886,6 +901,7 @@ class ServiceAccountRegistry(object):
                     trashed=excluded.trashed,
                     other=excluded.other,
                     objects=excluded.objects,
+                    quota_state=excluded.quota_state,
                     last_about_at=excluded.last_about_at,
                     last_error=excluded.last_error,
                     updated_at=excluded.updated_at
@@ -897,10 +913,43 @@ class ServiceAccountRegistry(object):
                 quota.get("trashed"),
                 quota.get("other"),
                 quota.get("objects"),
+                QUOTA_STATE_KNOWN,
                 last_about_at,
                 error,
                 now,
             ))
+
+    def assume_unknown_quota_for_union(self, account_id):
+        """Cache Union's conservative 15 GiB capacity for an unconfirmed SA."""
+        now = self._utcnow()
+        with self._connect() as conn:
+            conn.execute("""
+                INSERT INTO quota_cache (
+                    account_id, total, used, free, quota_state, last_about_at, last_error, updated_at
+                ) VALUES (?, ?, 0, ?, ?, NULL, NULL, ?)
+                ON CONFLICT(account_id) DO UPDATE SET
+                    total=excluded.total, used=0, free=excluded.free,
+                    quota_state=excluded.quota_state, last_about_at=NULL,
+                    updated_at=excluded.updated_at
+            """, (account_id, UNION_ASSUMED_QUOTA_BYTES, UNION_ASSUMED_QUOTA_BYTES,
+                  QUOTA_STATE_UNKNOWN_ASSUMED, now))
+
+    def mark_union_unknown_accounts_full(self, account_ids, error):
+        """Close only assumed-capacity Union accounts after a batch failure."""
+        ids = [int(account_id) for account_id in account_ids]
+        if not ids:
+            return 0
+        now = self._utcnow()
+        detail = ' '.join(str(error).split())[:260]
+        reason = 'UNKNOWN-FULL' + (': ' + detail if detail else '')
+        marks = ','.join('?' for _ in ids)
+        with self._connect() as conn:
+            cursor = conn.execute("""
+                UPDATE quota_cache
+                SET free=0, quota_state=?, last_error=?, updated_at=?
+                WHERE account_id IN ({}) AND quota_state=?
+            """.format(marks), tuple([QUOTA_STATE_UNKNOWN_FULL, reason, now] + ids + [QUOTA_STATE_UNKNOWN_ASSUMED]))
+            return cursor.rowcount
 
     def delete_active_account(self, account_id, reason):
         """Disable an active account and remove its managed and source JSON files."""
@@ -1055,22 +1104,22 @@ class ServiceAccountRegistry(object):
         with self._connect() as conn:
             conn.execute("""
                 INSERT INTO quota_cache (
-                    account_id, free, last_about_at, last_error, updated_at
-                ) VALUES (?, 0, ?, NULL, ?)
+                    account_id, free, quota_state, last_about_at, last_error, updated_at
+                ) VALUES (?, 0, ?, ?, NULL, ?)
                 ON CONFLICT(account_id) DO UPDATE SET
                     free=0,
                     last_about_at=excluded.last_about_at,
                     last_error=NULL,
                     updated_at=excluded.updated_at
-            """, (account["account_id"], now, now))
+            """, (account["account_id"], QUOTA_STATE_KNOWN, now, now))
 
     def mark_account_quota_exhausted(self, account_id):
         now = self._utcnow()
         with self._connect() as conn:
-            conn.execute("""INSERT INTO quota_cache (account_id, free, last_about_at, last_error, updated_at)
-                         VALUES (?, 0, ?, NULL, ?)
+            conn.execute("""INSERT INTO quota_cache (account_id, free, quota_state, last_about_at, last_error, updated_at)
+                         VALUES (?, 0, ?, ?, NULL, ?)
                          ON CONFLICT(account_id) DO UPDATE SET free=0, last_about_at=excluded.last_about_at,
-                         last_error=NULL, updated_at=excluded.updated_at""", (account_id, now, now))
+                         last_error=NULL, updated_at=excluded.updated_at""", (account_id, QUOTA_STATE_KNOWN, now, now))
 
     def adjust_quota_for_remote(self, remote, byte_delta):
         row = self.quota_by_remote(remote)

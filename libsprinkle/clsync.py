@@ -24,10 +24,14 @@ except:
 import json
 import os
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 DEFAULT_LARGE_FILE_THRESHOLD_BYTES = 1024 * 1024 * 1024
 DEFAULT_LARGE_FILE_MIN_FREE_BYTES = 512 * 1024 * 1024
 DEFAULT_LARGE_FILE_MIN_FREE_PERCENT = 5
+BACKUP_TRANSFER_WORKERS = 2
+BACKUP_DIRECTORY_BATCH_MAX_FILES = 64
 
 class ClSync:
 
@@ -94,6 +98,12 @@ class ClSync:
         self._sizes = None
         self._frees = None
         self._show_progress = config['show_progress']
+        # Keep only two active upload streams.  More streams provide little
+        # benefit for the small service-account quotas and make full-account
+        # recovery harder to reason about.
+        self._backup_transfer_workers = BACKUP_TRANSFER_WORKERS
+        self._backup_transfer_lock = threading.Lock()
+        self._reserved_free = {}
 
         if '__exclusion_list' in config:
             self.__exclusion_list = config['__exclusion_list']
@@ -120,6 +130,7 @@ class ClSync:
                 rc_timeout_seconds=self._config.get('rclone_rc_timeout_seconds', 30),
                 rc_drive_id=self._config.get('drive_id'),
                 rc_drive_remotes=self._config.get('cluster_remotes'),
+                transfers=self._backup_transfer_workers,
             )
         else:
             self._rclone = rclone.RClone(
@@ -130,6 +141,7 @@ class ClSync:
                 self._config.get('rclone_rc_timeout_seconds', 30),
                 self._config.get('drive_id'),
                 self._config.get('cluster_remotes'),
+                self._backup_transfer_workers,
             )
 
         if 'rclone_move' in config:
@@ -934,6 +946,105 @@ class ClSync:
                     remote_clfiles[remote_key] = parent_files[remote_key]
         return remote_clfiles
 
+    def _reserve_backup_capacity(self, remote, size):
+        """Reserve known free space before one of two concurrent transfers starts."""
+        if self._distribution_type != 'mas':
+            return True
+        required = self._required_free_for_upload(size)
+        free = self._known_free_for_remote(remote)
+        if free is None:
+            return False
+        reserved = self._reserved_free.get(remote, 0)
+        if free - reserved < required:
+            return False
+        self._reserved_free[remote] = reserved + required
+        return True
+
+    def _release_backup_capacity(self, remote, size):
+        if self._distribution_type != 'mas':
+            return
+        required = self._required_free_for_upload(size)
+        remaining = max(0, self._reserved_free.get(remote, 0) - required)
+        if remaining:
+            self._reserved_free[remote] = remaining
+        else:
+            self._reserved_free.pop(remote, None)
+
+    def _copy_add_operation(self, op, target_remote, dry_run):
+        """Copy one file with capacity reservation and quota-aware fallback.
+
+        Calls are made by at most two directory-batch workers.  Reserving
+        capacity prevents both workers from selecting the same last free bytes.
+        """
+        candidates = None
+        if target_remote is None:
+            with self._backup_transfer_lock:
+                candidates = self.get_eligible_remotes(int(op.src.size))
+                exhausted = getattr(self, '_run_quota_exhausted_remotes', set())
+                candidates = [remote for remote in candidates if remote not in exhausted]
+        else:
+            candidates = [target_remote]
+        if not candidates:
+            raise Exception('no remote has enough known free space')
+        if dry_run:
+            common.print_line('backing up file ' + op.src.path + '/' + op.src.name +
+                              ' -> ' + candidates[0] + op.src.remote_path)
+            return
+
+        errors = []
+        for remote in candidates:
+            reserved = False
+            if target_remote is None:
+                with self._backup_transfer_lock:
+                    if remote in getattr(self, '_run_quota_exhausted_remotes', set()):
+                        continue
+                    if remote in getattr(self, '_run_unavailable_remotes', {}):
+                        continue
+                    reserved = self._reserve_backup_capacity(remote, int(op.src.size))
+                if not reserved:
+                    continue
+            try:
+                if not self._show_progress:
+                    common.print_line('backing up file ' + op.src.path + '/' + op.src.name +
+                                      ' -> ' + remote + op.src.remote_path)
+                self._ensure_target_directory(remote, op.src.remote_path)
+                self.copy(op.src.path + '/' + op.src.name, op.src.remote_path, remote)
+            except Exception as exc:
+                errors.append(exc)
+                with self._backup_transfer_lock:
+                    if reserved:
+                        self._release_backup_capacity(remote, int(op.src.size))
+                    if self._is_storage_quota_exceeded(exc):
+                        self.mark_remote_quota_exhausted(remote)
+                        logging.warning('copy to %s failed: storage quota exceeded; marking remote full', remote)
+                    elif target_remote is None:
+                        self.mark_remote_unavailable_for_run(remote, exc)
+                continue
+            with self._backup_transfer_lock:
+                if reserved:
+                    self._release_backup_capacity(remote, int(op.src.size))
+                if target_remote is None:
+                    self._record_confirmed_transfer(
+                        remote, op.src.remote_path, op.src.name, 0, op.src.size
+                    )
+            return
+        raise Exception('; '.join(str(error) for error in errors) or
+                        'no remote retained enough free space for this directory batch')
+
+    def _directory_add_batches(self, operations):
+        """Keep folder contents together, splitting large folders into file batches."""
+        batches = {}
+        for op in operations:
+            if op.operation != operation.Operation.ADD or op.src.is_dir:
+                continue
+            batches.setdefault((op.src.path, op.src.remote_path), []).append(op)
+        result = []
+        for key in sorted(batches):
+            files = batches[key]
+            for index in range(0, len(files), BACKUP_DIRECTORY_BATCH_MAX_FILES):
+                result.append(files[index:index + BACKUP_DIRECTORY_BATCH_MAX_FILES])
+        return result
+
     def backup(self, local_dir, delete_files=True, dry_run=False, target=None):
         logging.debug('backing up directory ' + local_dir)
         source_remote, source_path = self.parse_backup_target(local_dir)
@@ -1001,7 +1112,19 @@ class ClSync:
             bar = Bar('Progress', max=len(ops), suffix='%(index)d/%(max)d %(percent)d%% [%(elapsed_td)s/%(eta_td)s]')
         if dry_run is True:
             common.print_line('performing a dry run. no changes are committed')
+            add_batches = self._directory_add_batches(ops)
+            common.print_line(
+                'dry-run plan: {} operation(s), {} directory batch(es), {} transfer worker(s)'.format(
+                    len(ops), len(add_batches), BACKUP_TRANSFER_WORKERS
+                )
+            )
+            if self._show_progress:
+                bar.finish()
+            # Quota selection is intentionally skipped: a dry run never
+            # transfers data, and checking every file made large plans slow.
+            return
         failures = []
+        failure_lock = threading.Lock()
 
         def record_failure(op, error, remotes=None):
             error_text = re.sub(
@@ -1014,8 +1137,28 @@ class ClSync:
             if remotes:
                 detail += ' [' + ', '.join(remotes) + ']'
             detail += ': ' + error_text
-            failures.append(detail)
+            with failure_lock:
+                failures.append(detail)
             logging.error('backup operation failed: ' + detail)
+
+        parallel_add_ids = set()
+        worker_count = getattr(self, '_backup_transfer_workers', 1)
+        if (not dry_run and not self._show_progress and worker_count == BACKUP_TRANSFER_WORKERS):
+            directory_batches = self._directory_add_batches(ops)
+            if directory_batches:
+                parallel_add_ids = set(id(op) for batch in directory_batches for op in batch)
+
+                def copy_batch(batch):
+                    for add_op in batch:
+                        try:
+                            self._copy_add_operation(add_op, target_remote, dry_run)
+                        except Exception as exc:
+                            record_failure(add_op, exc)
+
+                with ThreadPoolExecutor(max_workers=BACKUP_TRANSFER_WORKERS) as executor:
+                    futures = [executor.submit(copy_batch, batch) for batch in directory_batches]
+                    for future in futures:
+                        future.result()
 
         for op in ops:
             logging.debug('operation: ' + op.operation + ", path: " + op.src.path)
@@ -1027,6 +1170,9 @@ class ClSync:
                 bar.message = 'file:' + bar_title.replace('%', '%%')
             if op.src.is_dir and op.operation != operation.Operation.REMOVE:
                 logging.debug('skipping directory ' + op.src.path)
+            elif id(op) in parallel_add_ids:
+                # The directory-batch workers already processed this ADD.
+                pass
             else:
                 if op.operation == operation.Operation.ADD:
                     candidates = None
